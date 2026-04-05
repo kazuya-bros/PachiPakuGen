@@ -15,7 +15,7 @@
 
 ## なぜ See-Through + SAM3 か
 
-[See-Through](https://github.com/shitagaki-lab/see-through) は1枚のイラストから髪・顔・服などのセマンティックレイヤーをPSDとして自動分解するAIです。Qwen-Image-Layered と比べて低VRAMで動作するため、SpriTalk のレイヤーモード用素材が格段に作りやすくなりました。
+[See-Through](https://github.com/shitagaki-lab/see-through)（[ComfyUIノード](https://github.com/jtydhr88/ComfyUI-See-through)）は1枚のイラストから髪・顔・服などのセマンティックレイヤーをPSDとして自動分解するAIです。Qwen-Image-Layered と比べて低VRAMで動作するため、SpriTalk のレイヤーモード用素材が格段に作りやすくなりました。
 
 ただし See-Through 単体では SpriTalk 素材として使う際に以下の問題があります。
 
