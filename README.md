@@ -2,11 +2,11 @@
 
 アニメキャラクターの**素体・目パチ・口パク用フレーム**をパーツ単位でバッチ生成するデスクトップアプリです。
 
-[SpriTalk](https://github.com/kazuya-bros/SpriTalk) などの口パクアプリ向けに、透過PNGレイヤー素材を自動生成できます。
+[SpriTalk](https://github.com/kazuya-bros/SpriTalk) 専用の素材生成ツールです。透過PNGレイヤー素材を自動生成します。
 
 ## 特徴
 
-- **See-Through PSD 入力** -- [See-Through](https://huggingface.co/Divelix/See-Through) で分解済みのPSD（最大22レイヤー）を直接読み込み
+- **See-Through PSD 入力** -- [See-Through](https://github.com/shitagaki-lab/see-through) で分解済みのPSD（最大22レイヤー）を直接読み込み
 - **SAM3 による自動抽出** -- 元画像からSAM3で首・口領域を高精度に自動抽出（Python連携）
 - **素体出力** -- body / hair / hair_back の3パーツを透過PNGで出力。レイヤー並び替え・ON/OFF対応
 - **RIFE フレーム補間** -- 目パチ・口パク用の中間フレームをパーツ単位で自動生成
@@ -19,7 +19,8 @@
 - DirectX 12 対応 GPU（推奨）
 - Node.js 18+
 - Rust 1.75+
-- Python 3.8+（SAM3 使用、必須）
+- Python 3.12+（SAM3 使用、必須）
+- PyTorch 2.7+（SAM3 使用、CUDA 12.6+ 推奨）
 
 ## 処理フロー
 
@@ -52,7 +53,7 @@ RIFE 中間フレーム生成
 
 ## 入力素材
 
-[See-Through](https://huggingface.co/Divelix/See-Through) で分解したPSDファイルと、See-Throughに入力した元画像のペアが必要です。
+[See-Through](https://github.com/shitagaki-lab/see-through) で分解したPSDファイルと、See-Throughに入力した元画像のペアが必要です。
 
 | 入力 | 説明 | 必須 |
 |------|------|------|
@@ -93,7 +94,7 @@ npm run tauri build
 | ファイル | サイズ | 用途 | 配布 |
 |----------|--------|------|------|
 | `rife.onnx` | 23MB | RIFE 補間 | アプリに同梱 |
-| `sam3.pt` | 3.5GB | SAM3 首・口抽出（Python連携） | 別途DL |
+| `sam3.pt` | 約3.2GB | SAM3 首・口抽出（Python連携） | 別途DL |
 
 開発時は `src-tauri/models/` に、インストール済みアプリでは `PachiPakuGen.exe` と同じ階層の `models/` フォルダに配置してください。
 
@@ -108,7 +109,13 @@ src-tauri/models/
   rife.onnx                （自動バンドル済み）
 ```
 
-3. SAM3 Python パッケージをインストール
+3. PyTorch 2.7+ をインストール（未導入の場合）
+
+```bash
+pip install torch==2.10.0 torchvision --index-url https://download.pytorch.org/whl/cu128
+```
+
+4. SAM3 Python パッケージをインストール
 
 ```bash
 git clone https://github.com/facebookresearch/sam3.git
