@@ -2,7 +2,7 @@
 
 アニメキャラクターの**素体・目パチ・口パク用フレーム**をパーツ単位でバッチ生成するデスクトップアプリです。
 
-[SpriTalk](https://github.com/kazuya-bros/SpriTalk) 専用の素材生成ツールです。透過PNGレイヤー素材を自動生成します。
+[SpriTalk](https://kazuyabros.booth.pm/items/8102679) 専用の素材生成ツールです。透過PNGレイヤー素材を自動生成します。
 
 ## 特徴
 
