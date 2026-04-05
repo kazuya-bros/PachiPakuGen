@@ -1,8 +1,8 @@
 # PachiPakuGen
 
-アニメキャラクターの**素体・目パチ・口パク用フレーム**をパーツ単位でバッチ生成するデスクトップアプリです。
+[SpriTalk](https://kazuyabros.booth.pm/items/8102679) 専用の素材生成ツールです。
 
-[SpriTalk](https://kazuyabros.booth.pm/items/8102679) 専用の素材生成ツールです。透過PNGレイヤー素材を自動生成します。
+**RIFE（Real-Time Intermediate Flow Estimation）** によるフレーム補間で、滑らかな口パク・まばたきアニメーションを実現します。See-Through で分解したPSDから、SpriTalk のレイヤーモードに必要な透過PNGパーツを自動生成します。
 
 ## 特徴
 
