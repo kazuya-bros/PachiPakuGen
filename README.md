@@ -13,6 +13,17 @@
 - **口パク5母音対応** -- 口閉じ / 口あ〜お の最大5ペアを一括生成
 - **GPU アクセラレーション** -- ONNX Runtime 2.0 + DirectML によるGPU推論（CPU自動フォールバック）
 
+## なぜ See-Through + SAM3 か
+
+See-Through は Qwen-Image-Layered と比べて低VRAMで動作するため、素材作成の敷居が大きく下がりました。ただし See-Through 単体では以下の問題があります。
+
+- **首**: See-Through はアウトペイント（塗り足し）で首を生成するため、レイヤーの重ね順だけでは不自然な継ぎ目が残る
+- **口**: See-Through の mouth レイヤーは検出範囲が広く、口パク補間時にノイズが入りやすい
+
+PachiPakuGen は **SAM3（Segment Anything Model 3）** を併用することで、元画像から首・口領域を高精度に切り出し、これらの問題を解決します。
+
+> **注意**: SAM3 のモデルファイル（約3.2GB）の別途ダウンロードと、推論用の GPU VRAM が必要です。
+
 ## 動作要件
 
 - Windows 10/11
