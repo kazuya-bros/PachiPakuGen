@@ -15,12 +15,14 @@
 
 ## なぜ See-Through + SAM3 か
 
-See-Through は Qwen-Image-Layered と比べて低VRAMで動作するため、素材作成の敷居が大きく下がりました。ただし See-Through 単体では以下の問題があります。
+[See-Through](https://github.com/shitagaki-lab/see-through) は1枚のイラストから髪・顔・服などのセマンティックレイヤーをPSDとして自動分解するAIです。Qwen-Image-Layered と比べて低VRAMで動作するため、SpriTalk のレイヤーモード用素材が格段に作りやすくなりました。
 
-- **首**: See-Through はアウトペイント（塗り足し）で首を生成するため、レイヤーの重ね順だけでは不自然な継ぎ目が残る
-- **口**: See-Through の mouth レイヤーは検出範囲が広く、口パク補間時にノイズが入りやすい
+ただし See-Through 単体では SpriTalk 素材として使う際に以下の問題があります。
 
-PachiPakuGen は **SAM3（Segment Anything Model 3）** を併用することで、元画像から首・口領域を高精度に切り出し、これらの問題を解決します。
+- **首**: アウトペイント（塗り足し）で生成されるため、レイヤーの重ね順だけでは不自然な継ぎ目が残る
+- **口**: mouth レイヤーの検出範囲が広く、口パク補間時にノイズが入りやすい
+
+PachiPakuGen は **SAM3（Segment Anything Model 3）** を併用し、元画像から首・口領域を高精度に切り出すことでこれらの問題を解決します。
 
 > **注意**: SAM3 のモデルファイル（約3.2GB）の別途ダウンロードと、推論用の GPU VRAM が必要です。
 
