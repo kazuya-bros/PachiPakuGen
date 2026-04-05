@@ -19,18 +19,13 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
-            commands::parts::load_part_preview,
-            commands::parts::load_parts,
-            commands::segmentation::check_model_availability,
-            commands::segmentation::run_segmentation_cmd,
-            commands::segmentation::apply_masks_and_build_pairs,
-            commands::segmentation::get_brush_background_cmd,
-            commands::segmentation::get_target_mask_cmd,
-            commands::segmentation::apply_brush_mask_cmd,
-            commands::segmentation::delete_mask_cmd,
-            commands::generation::generate_frames,
-            commands::generation::get_composite_preview,
-            commands::export::export_frames,
+            commands::parts::load_slot,
+            commands::parts::create_base,
+            commands::parts::create_diff,
+            commands::parts::load_original_image,
+            commands::parts::get_base_preview,
+            commands::parts::get_mapping_preview,
+            commands::parts::render_category,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
