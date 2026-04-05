@@ -6,7 +6,7 @@
 
 ## 特徴
 
-- **See-Through PSD 入力** -- [See-Through](https://github.com/shitagaki-lab/see-through) で分解済みのPSD（最大22レイヤー）を直接読み込み
+- **See-Through PSD 入力** -- [See-Through](https://github.com/shitagaki-lab/see-through) で分解済みのPSDを直接読み込み
 - **SAM3 による自動抽出** -- 元画像からSAM3で首・口領域を高精度に自動抽出（Python連携）
 - **素体出力** -- body / hair / hair_back の3パーツを透過PNGで出力。レイヤー並び替え・ON/OFF対応
 - **RIFE フレーム補間** -- 目パチ・口パク用の中間フレームをパーツ単位で自動生成
