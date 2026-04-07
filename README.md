@@ -113,7 +113,7 @@ npm run tauri build
 
 ### SAM3 のセットアップ
 
-1. [sam3.pt をダウンロード](https://github.com/facebookresearch/sam3)
+1. [sam3.pt をダウンロード](https://huggingface.co/facebook/sam3)
 2. `models/` フォルダに配置
 
 ```
