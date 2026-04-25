@@ -11,7 +11,7 @@
 - **素体出力** -- body / hair / hair_back の3パーツを透過PNGで出力。レイヤー並び替え・ON/OFF対応
 - **RIFE フレーム補間** -- 目パチ・口パク用の中間フレームをパーツ単位で自動生成
 - **口パク5母音対応** -- 口閉じ / 口あ〜お の最大5ペアを一括生成
-- **GPU アクセラレーション** -- ONNX Runtime 2.0 + DirectML によるGPU推論（CPU自動フォールバック）
+- **GPU 前提の高速推論** -- ONNX Runtime 2.0 + DirectML と CUDA 版 PyTorch によるGPU推論
 
 ## なぜ See-Through + SAM3 か
 
@@ -24,16 +24,19 @@
 
 PachiPakuGen は **SAM3（Segment Anything Model 3）** を併用し、元画像から首・口領域を高精度に切り出すことでこれらの問題を解決します。
 
-> **注意**: SAM3 のモデルファイル（約3.2GB）の別途ダウンロードと、推論用の GPU VRAM が必要です。
+> **注意**: このアプリは GPU 搭載環境での利用を前提にしています。CPUでも一部処理は動作する場合がありますが、SAM3/RIFE ともに非常に低速で、通常利用・サポート対象はGPU環境です。SAM3 のモデルファイル（約3.2GB）の別途ダウンロードと、推論用の GPU VRAM が必要です。
 
 ## 動作要件
 
 - Windows 10/11
-- DirectX 12 対応 GPU（推奨）
+- DirectX 12 対応 GPU（必須）
+- NVIDIA GPU + CUDA 対応 PyTorch（SAM3 使用時は強く推奨）
 - Node.js 18+
 - Rust 1.75+
 - Python 3.12+（SAM3 使用、必須）
-- PyTorch 2.7+（SAM3 使用、CUDA 12.6+ 推奨）
+- PyTorch 2.7+（SAM3 使用、CUDA 12.6+ 以上のGPU版を推奨）
+
+> CPU版 PyTorch でもSAM3の互換フォールバックはありますが、実用速度ではありません。素体作成・口パク生成を安定して使う場合は、CUDA対応の PyTorch を入れてください。
 
 ## 処理フロー
 
@@ -122,7 +125,7 @@ src-tauri/models/
   rife.onnx                （自動バンドル済み）
 ```
 
-3. PyTorch 2.7+ をインストール（未導入の場合）
+3. PyTorch 2.7+ の CUDA 版をインストール（未導入の場合）
 
 ```bash
 pip install torch==2.10.0 torchvision --index-url https://download.pytorch.org/whl/cu128

@@ -26,6 +26,7 @@ Requirements:
 import argparse
 import os
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 # Force UTF-8 output on Windows
@@ -102,6 +103,8 @@ def load_sam3(checkpoint_path, device="cpu"):
     from sam3 import build_sam3_image_model
     from sam3.model.sam3_image_processor import Sam3Processor
 
+    patch_sam3_cpu_precompute(device)
+
     # BPE file is inside the sam3 package directory (sam3/assets/)
     sam3_pkg_dir = Path(sam3_pkg.__file__).parent  # sam3/sam3/
     bpe_path = str(sam3_pkg_dir / "assets" / "bpe_simple_vocab_16e6.txt.gz")
@@ -126,6 +129,51 @@ def load_sam3(checkpoint_path, device="cpu"):
 
     processor = Sam3Processor(model, confidence_threshold=0.3)
     return model, processor
+
+
+def patch_sam3_cpu_precompute(device):
+    """Avoid SAM3's CUDA-only positional precompute when running on CPU.
+
+    Some SAM3 releases allocate precomputed positional encodings with
+    device="cuda" even when build_sam3_image_model(device="cpu") is used.
+    That crashes with CPU-only PyTorch before the model can be constructed.
+    Disabling the precompute keeps the same forward path and lets encodings be
+    created lazily on the actual input device.
+    """
+    if device != "cpu":
+        return
+
+    try:
+        from sam3.model.position_encoding import PositionEmbeddingSine
+    except Exception as exc:
+        print(f"WARNING: failed to patch SAM3 CPU precompute: {exc}", file=sys.stderr)
+        return
+
+    if getattr(PositionEmbeddingSine.__init__, "_pachipakugen_cpu_patch", False):
+        return
+
+    original_init = PositionEmbeddingSine.__init__
+
+    def cpu_safe_init(
+        self,
+        num_pos_feats,
+        temperature=10000,
+        normalize=True,
+        scale=None,
+        precompute_resolution=None,
+    ):
+        return original_init(
+            self,
+            num_pos_feats=num_pos_feats,
+            temperature=temperature,
+            normalize=normalize,
+            scale=scale,
+            precompute_resolution=None,
+        )
+
+    cpu_safe_init._pachipakugen_cpu_patch = True
+    PositionEmbeddingSine.__init__ = cpu_safe_init
+    print("Applied SAM3 CPU compatibility patch", file=sys.stderr)
 
 
 def segment_by_text(processor, image, text_prompt):
@@ -213,8 +261,12 @@ def main():
 
     # Load SAM3
     print("SAM3 loading...", file=sys.stderr)
-    autocast_device = "cuda" if device == "cuda" else "cpu"
-    with torch.autocast(autocast_device, dtype=torch.bfloat16):
+    autocast_context = (
+        torch.autocast("cuda", dtype=torch.bfloat16)
+        if device == "cuda"
+        else nullcontext()
+    )
+    with autocast_context:
         model, processor = load_sam3(args.checkpoint, device)
         print("SAM3 loaded", file=sys.stderr)
 
