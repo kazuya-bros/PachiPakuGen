@@ -11,8 +11,23 @@ pub fn extract_mask_with_sam3(
     prompt: &str,
     sam3_checkpoint: Option<&Path>,
 ) -> Result<Vec<u8>, AppError> {
+    let mut masks = extract_masks_with_sam3(image, &[prompt], sam3_checkpoint)?;
+    masks
+        .pop()
+        .ok_or_else(|| AppError::General(format!("SAM3マスクが空です: {}", prompt)))
+}
+
+/// Extract multiple body part masks in a single SAM3 subprocess call.
+pub fn extract_masks_with_sam3(
+    image: &DynamicImage,
+    prompts: &[&str],
+    sam3_checkpoint: Option<&Path>,
+) -> Result<Vec<Vec<u8>>, AppError> {
     let sam3_ckpt = sam3_checkpoint
         .ok_or_else(|| AppError::General("sam3.pt が見つかりません。models/ に配置してください".into()))?;
+    if prompts.is_empty() {
+        return Err(AppError::General("SAM3プロンプトが空です".into()));
+    }
 
     let temp_dir = std::env::temp_dir().join("pachipakugen_sam3");
     std::fs::create_dir_all(&temp_dir)
@@ -46,8 +61,8 @@ pub fn extract_mask_with_sam3(
     let python = find_python()?;
 
     eprintln!(
-        "[PachiPakuGen] SAM3 extraction: prompt='{}', script={}",
-        prompt, script_path.display()
+        "[PachiPakuGen] SAM3 extraction: prompts='{}', script={}",
+        prompts.join(","), script_path.display()
     );
 
     let output = Command::new(&python)
@@ -56,7 +71,7 @@ pub fn extract_mask_with_sam3(
         .arg("--image").arg(&temp_image)
         .arg("--checkpoint").arg(sam3_ckpt)
         .arg("--output-dir").arg(&output_dir)
-        .arg("--prompts").arg(prompt)
+        .arg("--prompts").arg(prompts.join(","))
         .output()
         .map_err(|e| AppError::General(format!("Pythonの実行に失敗: {}", e)))?;
 
@@ -75,22 +90,16 @@ pub fn extract_mask_with_sam3(
         return Err(AppError::General(format!("SAM3出力が不正: {}", stdout)));
     }
 
-    // Read mask: {prompt}_mask.png
-    let mask_path = output_dir.join(format!("{}_mask.png", prompt));
     let w = image.width();
     let h = image.height();
-    let mask = read_grayscale_mask(&mask_path, w, h)?;
+    let mut masks = Vec::with_capacity(prompts.len());
+    for prompt in prompts {
+        let mask_path = output_dir.join(format!("{}_mask.png", prompt));
+        masks.push(read_grayscale_mask(&mask_path, w, h)?);
+    }
 
     let _ = std::fs::remove_dir_all(&temp_dir);
-    Ok(mask)
-}
-
-/// Convenience: extract neck mask
-pub fn extract_neck_mask(
-    image: &DynamicImage,
-    sam3_checkpoint: Option<&Path>,
-) -> Result<Vec<u8>, AppError> {
-    extract_mask_with_sam3(image, "neck", sam3_checkpoint)
+    Ok(masks)
 }
 
 /// Extract mouth mask with extra dilation to cover closed lips.
@@ -167,12 +176,48 @@ fn read_grayscale_mask(path: &Path, target_w: u32, target_h: u32) -> Result<Vec<
 }
 
 fn find_python() -> Result<String, AppError> {
+    if let Ok(path) = std::env::var("PACHIPAKUGEN_PYTHON") {
+        let path = path.trim();
+        if !path.is_empty() {
+            let configured_path = std::path::PathBuf::from(path);
+            let mut candidates = vec![configured_path.clone()];
+
+            if configured_path.is_relative() {
+                if let Ok(current_dir) = std::env::current_dir() {
+                    candidates.push(current_dir.join(&configured_path));
+                }
+
+                let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+                candidates.push(manifest.join(&configured_path));
+                if let Some(root) = manifest.parent() {
+                    candidates.push(root.join(&configured_path));
+                }
+            }
+
+            for candidate in candidates {
+                if let Ok(output) = Command::new(&candidate).arg("--version").output() {
+                    if output.status.success() {
+                        let python = candidate.to_string_lossy().into_owned();
+                        eprintln!("[PachiPakuGen] Using Python from PACHIPAKUGEN_PYTHON: {}", python);
+                        return Ok(python);
+                    }
+                }
+            }
+            return Err(AppError::General(format!(
+                "PACHIPAKUGEN_PYTHON の Python を実行できません: {}",
+                path
+            )));
+        }
+    }
+
     for name in &["python", "python3", "py"] {
         if let Ok(output) = Command::new(name).arg("--version").output() {
             if output.status.success() { return Ok(name.to_string()); }
         }
     }
-    Err(AppError::General("Pythonが見つかりません".into()))
+    Err(AppError::General(
+        "Pythonが見つかりません。SAM3用のPythonをPATHに追加するか、PACHIPAKUGEN_PYTHON に Python 実行ファイルのパスを設定してください".into()
+    ))
 }
 
 fn resolve_script_path() -> Result<std::path::PathBuf, AppError> {

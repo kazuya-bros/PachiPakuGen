@@ -8,13 +8,15 @@ import "./App.css";
 // --- Types ---
 interface AdjustableLayer { name: string; thumbnail: string; default_target: string; }
 interface SlotLoadResult { detected_layers: string[]; adjustable_layers: AdjustableLayer[]; canvas_width: number; canvas_height: number; source_type: string; }
-interface LayerInfo { name: string; thumbnail: string; }
+interface LayerBounds { x: number; y: number; width: number; height: number; }
+interface LayerInfo { name: string; thumbnail: string; bounds: LayerBounds; }
 interface CategoryPreview { target: string; label: string; preview: string; layer_names: string[]; layers: LayerInfo[]; }
 interface MappingPreviewResult { categories: CategoryPreview[]; composite_preview: string; }
 interface RenderCategoryResult { preview: string; }
 interface CreateBaseResult { output_path: string; composite_preview: string; base_eye_slot: string; base_mouth_slot: string; file_count: number; }
 interface CreateDiffResult { output_path: string; pair_name: string; frame_count: number; preview: string; }
 interface ProgressPayload { current: number; total: number; pair_name: string; }
+interface LayerTransform { x: number; y: number; scaleX: number; scaleY: number; }
 
 // Each RIFE pair: closed PSD ↔ open PSD (open = base)
 const EYE_PAIRS = [
@@ -54,7 +56,8 @@ const MOUTH_PAIRS_VOWELS = [
     required: false },
 ];
 
-type Mode = "select" | "base_input" | "hair_edit" | "base_edit" | "interp";
+type Mode = "select" | "base_input" | "neck_extract" | "hair_edit" | "base_edit" | "interp";
+const TRANSFORMABLE_BODY_LAYER = "neck";
 
 function App() {
   const [mode, setMode] = useState<Mode>("select");
@@ -68,6 +71,8 @@ function App() {
   const [loadResult, setLoadResult] = useState<SlotLoadResult | null>(null);
   const [layerMapping, setLayerMapping] = useState<Record<string, string>>({});
   const [originalImagePath, setOriginalImagePath] = useState("");
+  const [neckPromptText, setNeckPromptText] = useState("neck");
+  const [neckPreview, setNeckPreview] = useState("");
 
   // === 素体モード ===
   const [mappingPreview, setMappingPreview] = useState<MappingPreviewResult | null>(null);
@@ -82,6 +87,8 @@ function App() {
   const [bodyPreview, setBodyPreview] = useState("");
   const [enabledLayers, setEnabledLayers] = useState<Record<string, boolean>>({});
   const [layerOrder, setLayerOrder] = useState<string[]>([]);
+  const [layerTransforms, setLayerTransforms] = useState<Record<string, LayerTransform>>({});
+  const [selectedBodyLayer, setSelectedBodyLayer] = useState<string>("");
   const [baseResult, setBaseResult] = useState<CreateBaseResult | null>(null);
 
   // === フレーム補間モード (interp) ===
@@ -101,6 +108,17 @@ function App() {
   const [isPanning, setIsPanning] = useState(false);
   const panStart = useRef({ x: 0, y: 0 });
   const previewRef = useRef<HTMLDivElement>(null);
+  const bodyTransformRef = useRef(layerTransforms);
+  bodyTransformRef.current = layerTransforms;
+  const layerTransformDrag = useRef<{
+    mode: "move" | "resize";
+    corner?: "tl" | "tr" | "bl" | "br";
+    layer: string;
+    startX: number;
+    startY: number;
+    startTransform: LayerTransform;
+    bounds: LayerBounds;
+  } | null>(null);
 
   // Drag reorder (generic — used for body, hair, hair_back)
   type DragTarget = "body" | "hair" | "hair_back";
@@ -122,11 +140,15 @@ function App() {
   }, []);
 
   // --- Category rendering ---
-  async function renderCategory(order: string[], enabled: Record<string, boolean>): Promise<string> {
+  async function renderCategory(
+    order: string[],
+    enabled: Record<string, boolean>,
+    transforms: Record<string, LayerTransform> = {},
+  ): Promise<string> {
     const active = [...order.filter(name => enabled[name] !== false)].reverse();
     try {
       const result = await invoke<RenderCategoryResult>("render_category", {
-        mappingJson: JSON.stringify(layerMapping), target: "body", enabledLayers: active,
+        mappingJson: JSON.stringify(layerMapping), target: "body", enabledLayers: active, layerOffsets: transforms,
       });
       return result.preview;
     } catch (e) { console.error("render error:", e); return ""; }
@@ -141,11 +163,15 @@ function App() {
   }
 
   // --- Body rendering ---
-  async function renderBody(order: string[], enabled: Record<string, boolean>) {
+  async function renderBody(
+    order: string[],
+    enabled: Record<string, boolean>,
+    transforms: Record<string, LayerTransform> = layerTransforms,
+  ) {
     const active = [...order.filter(name => enabled[name] !== false)].reverse();
     try {
       const result = await invoke<RenderCategoryResult>("render_category", {
-        mappingJson: JSON.stringify(layerMapping), target: "body", enabledLayers: active,
+        mappingJson: JSON.stringify(layerMapping), target: "body", enabledLayers: active, layerOffsets: transforms,
       });
       setBodyPreview(result.preview);
     } catch (e) { console.error("render error:", e); }
@@ -155,6 +181,49 @@ function App() {
     const newEnabled = { ...enabledLayers, [name]: checked };
     setEnabledLayers(newEnabled);
     await renderBody(layerOrder, newEnabled);
+  }
+
+  function defaultLayerTransform(): LayerTransform {
+    return { x: 0, y: 0, scaleX: 1, scaleY: 1 };
+  }
+
+  function normalizeLayerTransform(transform: LayerTransform): LayerTransform {
+    return {
+      x: Math.round(transform.x),
+      y: Math.round(transform.y),
+      scaleX: Math.max(0.1, Math.min(4, Number(transform.scaleX.toFixed(3)))),
+      scaleY: Math.max(0.1, Math.min(4, Number(transform.scaleY.toFixed(3)))),
+    };
+  }
+
+  function neckOnlyTransforms(transforms: Record<string, LayerTransform>): Record<string, LayerTransform> {
+    const transform = transforms[TRANSFORMABLE_BODY_LAYER];
+    return transform ? { [TRANSFORMABLE_BODY_LAYER]: transform } : {};
+  }
+
+  async function updateBodyLayerTransform(name: string, transform: LayerTransform, render = true) {
+    if (name !== TRANSFORMABLE_BODY_LAYER) return;
+    const nextTransform = normalizeLayerTransform(transform);
+    const isDefault = nextTransform.x === 0 && nextTransform.y === 0 && nextTransform.scaleX === 1 && nextTransform.scaleY === 1;
+    const next = neckOnlyTransforms(bodyTransformRef.current);
+    if (isDefault) delete next[name];
+    else next[name] = nextTransform;
+    bodyTransformRef.current = next;
+    setLayerTransforms(next);
+    if (render) await renderBody(layerOrderRef.current, enabledLayers, next);
+  }
+
+  async function nudgeBodyLayer(name: string, dx: number, dy: number) {
+    if (name !== TRANSFORMABLE_BODY_LAYER) return;
+    const current = bodyTransformRef.current[name] ?? defaultLayerTransform();
+    await updateBodyLayerTransform(name, { ...current, x: current.x + dx, y: current.y + dy });
+  }
+
+  async function resetBodyLayerTransform(name: string) {
+    const next = neckOnlyTransforms(bodyTransformRef.current);
+    delete next[name];
+    setLayerTransforms(next);
+    await renderBody(layerOrderRef.current, enabledLayers, next);
   }
 
   // Drag handlers (generic)
@@ -223,10 +292,34 @@ function App() {
     if (file) setOriginalImagePath(file);
   }
 
-  async function proceedToHairEdit() {
+  function parseNeckPrompts() {
+    const prompts = neckPromptText.split(",").map(p => p.trim()).filter(Boolean);
+    return prompts.length > 0 ? prompts : ["neck"];
+  }
+
+  async function runNeckExtraction() {
     setLoading(true); setStatus("SAM3で首を検出中...");
     try {
-      await invoke<string>("load_original_image", { path: originalImagePath });
+      const preview = await invoke<string>("load_original_image", {
+        path: originalImagePath,
+        neckPrompts: parseNeckPrompts(),
+      });
+      setNeckPreview(preview);
+      setStatus("首検出を確認してください");
+    } catch (e) { setError(String(e)); }
+    finally { setLoading(false); }
+  }
+
+  async function proceedToNeckExtract() {
+    setError("");
+    await runNeckExtraction();
+    resetZoom();
+    setMode("neck_extract");
+  }
+
+  async function proceedToHairEdit() {
+    setLoading(true); setStatus("Hairレイヤー準備中...");
+    try {
       const preview = await invoke<MappingPreviewResult>("get_mapping_preview", { mappingJson: JSON.stringify(layerMapping) });
       setMappingPreview(preview);
       // Init hair layers
@@ -258,6 +351,8 @@ function App() {
     if (bodyCat) {
       const order = bodyCat.layers.map(l => l.name);
       setLayerOrder(order);
+      setLayerTransforms(neckOnlyTransforms(bodyTransformRef.current));
+      setSelectedBodyLayer(order.includes(TRANSFORMABLE_BODY_LAYER) ? TRANSFORMABLE_BODY_LAYER : "");
       const en: Record<string, boolean> = {};
       for (const l of bodyCat.layers) en[l.name] = true;
       setEnabledLayers(en);
@@ -286,7 +381,7 @@ function App() {
       const result = await invoke<CreateBaseResult>("create_base", {
         mappingJson: JSON.stringify(layerMapping), originalImagePath,
         baseEyeSlot: "eye_open", baseMouthSlot: "mouth_closed",
-        bodyLayerOrder: activeOrder, hairLayerOrder: activeHairOrder,
+        bodyLayerOrder: activeOrder, bodyLayerOffsets: neckOnlyTransforms(layerTransforms), hairLayerOrder: activeHairOrder,
         hairBackLayerOrder: activeHairBackOrder, outputPath: dir,
       });
       setBaseResult(result);
@@ -346,7 +441,7 @@ function App() {
         const openOriginal = interpOriginals[pair.open.key];
         if (openOriginal) {
           setStatus(`${pair.label}: SAM3で口・首を検出中...`);
-          await invoke<string>("load_original_image", { path: openOriginal });
+          await invoke<string>("load_original_image", { path: openOriginal, neckPrompts: ["neck"] });
         }
 
         // Determine base slot names
@@ -357,7 +452,7 @@ function App() {
         await invoke<CreateBaseResult>("create_base", {
           mappingJson, originalImagePath: interpOriginals[pair.closed.key] || "",
           baseEyeSlot: baseSlotEye, baseMouthSlot: baseSlotMouth,
-          bodyLayerOrder: [] as string[], hairLayerOrder: [] as string[],
+          bodyLayerOrder: [] as string[], bodyLayerOffsets: {}, hairLayerOrder: [] as string[],
           hairBackLayerOrder: [] as string[], outputPath: "",
         });
 
@@ -386,6 +481,107 @@ function App() {
   }
 
   const bodyCategory = mappingPreview?.categories.find(c => c.target === "body");
+  const selectedBodyLayerInfo = selectedBodyLayer === TRANSFORMABLE_BODY_LAYER
+    ? bodyCategory?.layers.find(l => l.name === TRANSFORMABLE_BODY_LAYER)
+    : undefined;
+  const selectedTransform = layerTransforms[TRANSFORMABLE_BODY_LAYER] ?? defaultLayerTransform();
+
+  function getPreviewImageMetrics() {
+    const viewport = previewRef.current;
+    if (!viewport || !loadResult) return null;
+    const viewportRect = viewport.getBoundingClientRect();
+    const fitScale = Math.min(viewportRect.width / loadResult.canvas_width, viewportRect.height / loadResult.canvas_height);
+    const displayScale = fitScale * zoom;
+    const width = loadResult.canvas_width * displayScale;
+    const height = loadResult.canvas_height * displayScale;
+    return {
+      left: (viewportRect.width - width) / 2 + pan.x,
+      top: (viewportRect.height - height) / 2 + pan.y,
+      width,
+      height,
+      displayScale,
+    };
+  }
+
+  function selectedLayerBoxStyle(): React.CSSProperties | undefined {
+    if (!selectedBodyLayerInfo || !loadResult) return undefined;
+    const metrics = getPreviewImageMetrics();
+    if (!metrics) return undefined;
+    const { bounds } = selectedBodyLayerInfo;
+    const t = selectedTransform;
+    return {
+      left: metrics.left + (bounds.x + t.x) * metrics.displayScale,
+      top: metrics.top + (bounds.y + t.y) * metrics.displayScale,
+      width: bounds.width * t.scaleX * metrics.displayScale,
+      height: bounds.height * t.scaleY * metrics.displayScale,
+    };
+  }
+
+  function onLayerTransformPointerDown(
+    e: React.PointerEvent,
+    mode: "move" | "resize",
+    corner?: "tl" | "tr" | "bl" | "br",
+  ) {
+    if (selectedBodyLayer !== TRANSFORMABLE_BODY_LAYER || !selectedBodyLayerInfo) return;
+    e.preventDefault();
+    e.stopPropagation();
+    (e.target as HTMLElement).setPointerCapture(e.pointerId);
+    layerTransformDrag.current = {
+      mode,
+      corner,
+      layer: TRANSFORMABLE_BODY_LAYER,
+      startX: e.clientX,
+      startY: e.clientY,
+      startTransform: selectedTransform,
+      bounds: selectedBodyLayerInfo.bounds,
+    };
+  }
+
+  function onLayerTransformPointerMove(e: React.PointerEvent) {
+    const drag = layerTransformDrag.current;
+    if (!drag) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const metrics = getPreviewImageMetrics();
+    if (!metrics) return;
+
+    const dx = (e.clientX - drag.startX) / metrics.displayScale;
+    const dy = (e.clientY - drag.startY) / metrics.displayScale;
+    const start = drag.startTransform;
+
+    if (drag.mode === "move") {
+      void updateBodyLayerTransform(drag.layer, { ...start, x: start.x + dx, y: start.y + dy }, false);
+      return;
+    }
+
+    const bounds = drag.bounds;
+    let left = bounds.x + start.x;
+    let top = bounds.y + start.y;
+    let right = left + bounds.width * start.scaleX;
+    let bottom = top + bounds.height * start.scaleY;
+
+    if (drag.corner?.includes("l")) left += dx;
+    if (drag.corner?.includes("r")) right += dx;
+    if (drag.corner?.includes("t")) top += dy;
+    if (drag.corner?.includes("b")) bottom += dy;
+
+    const newWidth = Math.max(1, right - left);
+    const newHeight = Math.max(1, bottom - top);
+    void updateBodyLayerTransform(drag.layer, {
+      x: left - bounds.x,
+      y: top - bounds.y,
+      scaleX: newWidth / bounds.width,
+      scaleY: newHeight / bounds.height,
+    }, false);
+  }
+
+  function onLayerTransformPointerUp(e: React.PointerEvent) {
+    if (!layerTransformDrag.current) return;
+    e.preventDefault();
+    e.stopPropagation();
+    layerTransformDrag.current = null;
+    void renderBody(layerOrderRef.current, enabledLayers, neckOnlyTransforms(bodyTransformRef.current));
+  }
 
   return (
     <div className="app">
@@ -397,7 +593,7 @@ function App() {
       {/* Top bar for hair_edit mode */}
       {mode === "hair_edit" && (
         <div className="top-bar">
-          <button className="btn-nav" onClick={() => setMode("base_input")}>&larr; 戻る</button>
+          <button className="btn-nav" onClick={() => setMode("neck_extract")}>&larr; 戻る</button>
           <span className="top-bar-title">Step 1/2: Hairレイヤー確認</span>
           <button className="btn btn-primary" onClick={proceedToBodyEdit}>
             次へ → Body編集
@@ -468,11 +664,61 @@ function App() {
               )}
               <button className="btn btn-primary btn-full" style={{ marginTop: 20, padding: "12px 16px", fontSize: "1rem" }}
                 disabled={!loadResult || !originalImagePath || loading}
-                onClick={proceedToHairEdit}>
-                次へ → Hair編集
+                onClick={proceedToNeckExtract}>
+                次へ → 首検出
               </button>
               <button className="btn-nav" style={{ marginTop: 12 }} onClick={() => setMode("select")}>&larr; モード選択に戻る</button>
             </div>
+          </div>
+        )}
+
+        {/* ===== Neck Extraction Check ===== */}
+        {mode === "neck_extract" && (
+          <div className="panel-right">
+            <div className="neck-extract-layout">
+              <div className="preview-viewport" ref={previewRef}
+                onWheel={handleWheel} onMouseDown={handleMouseDown}
+                onMouseMove={handleMouseMove} onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp}>
+                {neckPreview ? (
+                  <img src={neckPreview} alt="Neck SAM3" className="preview-img"
+                    style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, cursor: isPanning ? "grabbing" : "grab" }}
+                    draggable={false} />
+                ) : (
+                  <span className="placeholder">SAM3首検出プレビュー</span>
+                )}
+              </div>
+              <div className="neck-extract-panel">
+                <div className="layer-sidebar-header">SAM3首検出</div>
+                <div className="layer-sidebar-hint">通常は neck のみ。必要な場合だけ neckwear などを追加</div>
+                <label className="field-label">プロンプト</label>
+                <input
+                  className="text-input"
+                  value={neckPromptText}
+                  onChange={(e) => setNeckPromptText(e.target.value)}
+                  placeholder="neck"
+                  disabled={loading}
+                />
+                <div className="prompt-examples">
+                  <button className="btn-prompt-chip" onClick={() => setNeckPromptText("neck")} disabled={loading}>neck</button>
+                  <button className="btn-prompt-chip" onClick={() => setNeckPromptText("neck, neckwear")} disabled={loading}>neck, neckwear</button>
+                </div>
+                <button className="btn btn-primary btn-full" onClick={runNeckExtraction} disabled={loading}>
+                  {loading ? "検出中..." : "再検出"}
+                </button>
+                <button className="btn btn-primary btn-full" onClick={proceedToHairEdit} disabled={loading || !neckPreview}>
+                  次へ → Hair編集
+                </button>
+                <button className="btn-nav" onClick={() => setMode("base_input")} disabled={loading}>&larr; ファイル選択に戻る</button>
+              </div>
+            </div>
+            {neckPreview && (
+              <div className="zoom-controls">
+                <button className="btn-zoom" onClick={() => setZoom(prev => Math.min(10, prev * 1.3))}>+</button>
+                <span className="zoom-level">{Math.round(zoom * 100)}%</span>
+                <button className="btn-zoom" onClick={() => setZoom(prev => Math.max(0.1, prev * 0.7))}>-</button>
+                <button className="btn-zoom btn-zoom-reset" onClick={resetZoom}>リセット</button>
+              </div>
+            )}
           </div>
         )}
 
@@ -670,13 +916,28 @@ function App() {
           <div className="preview-and-layers">
             <div className="preview-viewport" ref={previewRef}
               onWheel={handleWheel} onMouseDown={handleMouseDown}
-              onMouseMove={handleMouseMove} onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp}>
+              onMouseMove={handleMouseMove} onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp}
+              onPointerMove={onLayerTransformPointerMove} onPointerUp={onLayerTransformPointerUp} onPointerCancel={onLayerTransformPointerUp}>
               {bodyPreview ? (
                 <img src={bodyPreview} alt="Body" className="preview-img"
                   style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, cursor: isPanning ? "grabbing" : "grab" }}
                   draggable={false} />
               ) : (
                 <span className="placeholder">Bodyプレビュー</span>
+              )}
+              {bodyPreview && selectedBodyLayerInfo && enabledLayers[selectedBodyLayerInfo.name] !== false && (
+                <div
+                  className="layer-transform-box"
+                  style={selectedLayerBoxStyle()}
+                  onPointerDown={(e) => onLayerTransformPointerDown(e, "move")}
+                  onMouseDown={(e) => e.stopPropagation()}
+                >
+                  <span className="layer-transform-label">{selectedBodyLayerInfo.name}</span>
+                  <button className="layer-transform-handle handle-tl" onPointerDown={(e) => onLayerTransformPointerDown(e, "resize", "tl")} />
+                  <button className="layer-transform-handle handle-tr" onPointerDown={(e) => onLayerTransformPointerDown(e, "resize", "tr")} />
+                  <button className="layer-transform-handle handle-bl" onPointerDown={(e) => onLayerTransformPointerDown(e, "resize", "bl")} />
+                  <button className="layer-transform-handle handle-br" onPointerDown={(e) => onLayerTransformPointerDown(e, "resize", "br")} />
+                </div>
               )}
             </div>
 
@@ -688,17 +949,47 @@ function App() {
                   {layerOrder.map((name, idx) => {
                     const layer = bodyCategory.layers.find(l => l.name === name);
                     if (!layer) return null;
+                    const isTransformable = layer.name === TRANSFORMABLE_BODY_LAYER;
+                    const transform = isTransformable ? (layerTransforms[layer.name] ?? defaultLayerTransform()) : defaultLayerTransform();
                     return (
-                      <div key={layer.name} className={`layer-sidebar-item${draggedIdx === idx ? " dragging" : ""}`}>
+                      <div
+                        key={layer.name}
+                        className={`layer-sidebar-item${draggedIdx === idx ? " dragging" : ""}${selectedBodyLayer === layer.name ? " selected" : ""}${!isTransformable ? " not-transformable" : ""}`}
+                        onClick={() => {
+                          if (isTransformable) setSelectedBodyLayer(layer.name);
+                        }}
+                      >
                         <span className="drag-handle" onPointerDown={(e) => onDragPointerDown(e, idx)}>☰</span>
                         <input type="checkbox" checked={enabledLayers[layer.name] !== false}
                           onChange={(e) => handleLayerToggle(layer.name, e.target.checked)} />
                         <img src={layer.thumbnail} alt={layer.name} className="layer-sidebar-thumb" />
                         <span className="layer-sidebar-name">{layer.name}</span>
+                        {(transform.x !== 0 || transform.y !== 0 || transform.scaleX !== 1 || transform.scaleY !== 1) && (
+                          <span className="layer-offset-badge">{transform.x},{transform.y} / {Math.round(transform.scaleX * 100)}%</span>
+                        )}
                       </div>
                     );
                   })}
                 </div>
+                {selectedBodyLayer === TRANSFORMABLE_BODY_LAYER && (
+                  <div className="layer-adjust-panel">
+                    <div className="layer-adjust-title">位置調整: {TRANSFORMABLE_BODY_LAYER}</div>
+                    <div className="layer-adjust-values">
+                      X: {selectedTransform.x}px / Y: {selectedTransform.y}px / W: {Math.round(selectedTransform.scaleX * 100)}% / H: {Math.round(selectedTransform.scaleY * 100)}%
+                    </div>
+                    <div className="nudge-grid">
+                      <span />
+                      <button className="btn-nudge" onClick={() => nudgeBodyLayer(TRANSFORMABLE_BODY_LAYER, 0, -1)}>↑</button>
+                      <span />
+                      <button className="btn-nudge" onClick={() => nudgeBodyLayer(TRANSFORMABLE_BODY_LAYER, -1, 0)}>←</button>
+                      <button className="btn-nudge btn-nudge-reset" onClick={() => resetBodyLayerTransform(TRANSFORMABLE_BODY_LAYER)}>0</button>
+                      <button className="btn-nudge" onClick={() => nudgeBodyLayer(TRANSFORMABLE_BODY_LAYER, 1, 0)}>→</button>
+                      <button className="btn-nudge" onClick={() => nudgeBodyLayer(TRANSFORMABLE_BODY_LAYER, -5, 0)}>X-5</button>
+                      <button className="btn-nudge" onClick={() => nudgeBodyLayer(TRANSFORMABLE_BODY_LAYER, 0, 1)}>↓</button>
+                      <button className="btn-nudge" onClick={() => nudgeBodyLayer(TRANSFORMABLE_BODY_LAYER, 5, 0)}>X+5</button>
+                    </div>
+                  </div>
+                )}
                 <div className="layer-sidebar-hint">下が奥</div>
               </div>
             )}

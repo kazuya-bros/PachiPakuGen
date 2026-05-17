@@ -1,6 +1,6 @@
 use crate::error::AppError;
 use image::DynamicImage;
-use ndarray::Array4;
+use ndarray::{Array1, Array4};
 use ort::session::Session;
 use ort::value::TensorRef;
 
@@ -47,8 +47,8 @@ pub fn rife_interpolate(
         }
     }
 
-    // Timestep as (1, 1, 1, 1) tensor
-    let timestep = Array4::<f32>::from_elem([1, 1, 1, 1], ratio);
+    // Timestep as (1) tensor. TensorStack/RIFE expects a 1D scalar batch input.
+    let timestep = Array1::<f32>::from_elem(1, ratio);
 
     // Create TensorRef from arrays
     let tensor0 = TensorRef::from_array_view(&t0)?;

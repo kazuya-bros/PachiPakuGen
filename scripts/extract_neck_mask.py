@@ -19,7 +19,7 @@ Output:
 
 Requirements:
     - Python 3.10+
-    - torch >= 2.1
+    - CUDA-enabled torch (PachiPakuGen requires GPU inference)
     - sam3 package (pip install -e <sam3_repo_path>)
     - opencv-python
 """
@@ -76,12 +76,20 @@ def check_dependencies():
 
 
 def detect_device():
-    """Detect best available device with CUDA compatibility check."""
+    """Detect CUDA device and fail fast if GPU inference is unavailable."""
     import torch
 
     if not torch.cuda.is_available():
-        print("CUDA not available, using CPU", file=sys.stderr)
-        return "cpu"
+        print(
+            "ERROR: CUDA is not available. PachiPakuGen requires an NVIDIA GPU "
+            "and a CUDA-enabled PyTorch build for SAM3.",
+            file=sys.stderr,
+        )
+        print(
+            "Install the locked CUDA PyTorch environment with: uv sync --locked",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # Check if current GPU architecture is supported by this PyTorch build
     try:
@@ -91,28 +99,25 @@ def detect_device():
         print(f"Using CUDA: {torch.cuda.get_device_name(0)}", file=sys.stderr)
         return "cuda"
     except Exception as e:
-        print(f"CUDA device found but not compatible with this PyTorch build: {e}", file=sys.stderr)
-        print("Falling back to CPU. To use GPU, install a compatible PyTorch version.", file=sys.stderr)
-        print("  See: https://pytorch.org/get-started/locally/", file=sys.stderr)
-        return "cpu"
+        print(
+            f"ERROR: CUDA device found but not compatible with this PyTorch build: {e}",
+            file=sys.stderr,
+        )
+        print(
+            "Install the locked CUDA PyTorch environment with: uv sync --locked",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def load_sam3(checkpoint_path, device="cpu"):
     """Load SAM3 model and processor."""
-    import sam3 as sam3_pkg
     from sam3 import build_sam3_image_model
     from sam3.model.sam3_image_processor import Sam3Processor
 
     patch_sam3_cpu_precompute(device)
 
-    # BPE file is inside the sam3 package directory (sam3/assets/)
-    sam3_pkg_dir = Path(sam3_pkg.__file__).parent  # sam3/sam3/
-    bpe_path = str(sam3_pkg_dir / "assets" / "bpe_simple_vocab_16e6.txt.gz")
-
-    # Fallback: check repo root assets/ if not found in package
-    if not Path(bpe_path).exists():
-        sam3_root = sam3_pkg_dir.parent  # sam3/
-        bpe_path = str(sam3_root / "assets" / "bpe_simple_vocab_16e6.txt.gz")
+    bpe_path = resolve_bpe_path()
 
     checkpoint_path = Path(checkpoint_path)
     if not checkpoint_path.exists():
@@ -129,6 +134,40 @@ def load_sam3(checkpoint_path, device="cpu"):
 
     processor = Sam3Processor(model, confidence_threshold=0.3)
     return model, processor
+
+
+def resolve_bpe_path():
+    """Resolve SAM3 tokenizer BPE vocab.
+
+    The PyPI sam3 wheel may omit sam3/assets/bpe_simple_vocab_16e6.txt.gz,
+    so PachiPakuGen also ships a copy under scripts/assets/.
+    """
+    import sam3 as sam3_pkg
+
+    filename = "bpe_simple_vocab_16e6.txt.gz"
+    sam3_pkg_dir = Path(sam3_pkg.__file__).parent
+    script_dir = Path(__file__).resolve().parent
+
+    candidates = [
+        Path(os.environ["PACHIPAKUGEN_SAM3_BPE"])
+        if os.environ.get("PACHIPAKUGEN_SAM3_BPE")
+        else None,
+        sam3_pkg_dir / "assets" / filename,
+        sam3_pkg_dir.parent / "assets" / filename,
+        script_dir / "assets" / filename,
+    ]
+
+    for candidate in candidates:
+        if candidate and candidate.exists():
+            print(f"Using SAM3 BPE vocab: {candidate}", file=sys.stderr)
+            return str(candidate)
+
+    searched = "\n  - ".join(str(p) for p in candidates if p)
+    print(
+        "ERROR: SAM3 BPE vocab not found. Searched:\n  - " + searched,
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def patch_sam3_cpu_precompute(device):
