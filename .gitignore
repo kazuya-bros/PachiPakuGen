@@ -1,5 +1,9 @@
 # Dependencies
 node_modules/
+.venv/
+.uv-cache/
+.uv-python/
+__pycache__/
 
 # Build output
 dist/
@@ -7,11 +11,13 @@ src-tauri/target/
 
 # Model files (large binaries)
 src-tauri/models/*.onnx
+!src-tauri/models/rife.onnx
 src-tauri/models/*.pt
 
 # IDE
 .vscode/
 .idea/
+.claude/
 
 # OS
 .DS_Store

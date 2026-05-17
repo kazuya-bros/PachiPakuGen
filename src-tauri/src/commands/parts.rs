@@ -6,7 +6,7 @@ use crate::processing::composite::premultiply_onto_body;
 use crate::processing::image_utils;
 use crate::state::AppState;
 use image::DynamicImage;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -107,6 +107,24 @@ pub struct CreateDiffResult {
 pub struct LayerInfo {
     pub name: String,        // layer name (e.g. "face", "irides")
     pub thumbnail: String,   // base64 PNG thumbnail
+    pub bounds: LayerBounds, // non-transparent bounds on the full canvas
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct LayerBounds {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LayerTransform {
+    pub x: i32,
+    pub y: i32,
+    pub scale_x: f32,
+    pub scale_y: f32,
 }
 
 #[derive(Serialize)]
@@ -151,12 +169,13 @@ pub async fn create_base(
     base_eye_slot: String,
     base_mouth_slot: String,
     body_layer_order: Vec<String>,  // user's custom body layer order (top=front)
+    body_layer_offsets: HashMap<String, LayerTransform>,  // per-body-layer transform
     hair_layer_order: Vec<String>,  // user's custom hair layer order (top=front)
     hair_back_layer_order: Vec<String>,  // user's custom hair_back layer order (top=front)
     output_path: String,
 ) -> Result<CreateBaseResult, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
-        create_base_inner(app, mapping_json, original_image_path, base_eye_slot, base_mouth_slot, body_layer_order, hair_layer_order, hair_back_layer_order, output_path)
+        create_base_inner(app, mapping_json, original_image_path, base_eye_slot, base_mouth_slot, body_layer_order, body_layer_offsets, hair_layer_order, hair_back_layer_order, output_path)
     })
     .await
     .map_err(|e| AppError::General(format!("Task join error: {}", e)))?
@@ -216,9 +235,10 @@ pub async fn render_category(
     mapping_json: String,
     target: String,              // "body", "eye", "mouth", "hair", "hair_back"
     enabled_layers: Vec<String>, // layer names to include
+    layer_offsets: HashMap<String, LayerTransform>,
 ) -> Result<RenderCategoryResult, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
-        render_category_inner(app, mapping_json, target, enabled_layers)
+        render_category_inner(app, mapping_json, target, enabled_layers, layer_offsets)
     })
     .await
     .map_err(|e| AppError::General(format!("Task join error: {}", e)))?
@@ -230,6 +250,7 @@ pub async fn render_category(
 pub async fn load_original_image(
     app: AppHandle,
     path: String,
+    neck_prompts: Vec<String>,
 ) -> Result<String, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
@@ -246,16 +267,31 @@ pub async fn load_original_image(
         // Cache original image for later use (mouth extraction applies mask to this)
         *state.cached_original.lock().unwrap() = Some(original.clone());
 
-        // Run SAM3 to extract neck
+        // Run SAM3 to extract the user-selected neck region.
+        // Default is "neck"; users can retry with prompts such as "neck, neckwear".
         let sam3_ckpt = neck_extract::find_sam3_checkpoint();
-        let neck_img = match neck_extract::extract_neck_mask(&original, sam3_ckpt.as_deref()) {
-            Ok(mask) => {
+        let prompts: Vec<String> = neck_prompts
+            .into_iter()
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
+        let prompts = if prompts.is_empty() { vec!["neck".to_string()] } else { prompts };
+        let prompt_refs: Vec<&str> = prompts.iter().map(String::as_str).collect();
+        let includes_neckwear = prompts.iter().any(|p| p.eq_ignore_ascii_case("neckwear"));
+        let neck_img = match neck_extract::extract_masks_with_sam3(&original, &prompt_refs, sam3_ckpt.as_deref()) {
+            Ok(masks) => {
+                let mut merged = vec![0u8; (original.width() * original.height()) as usize];
+                for mask in masks {
+                    for (dst, src) in merged.iter_mut().zip(mask) {
+                        *dst = (*dst).max(src);
+                    }
+                }
                 let ow = original.width();
                 let oh = original.height();
                 let mut neck_rgba = image::RgbaImage::new(ow, oh);
                 for y in 0..oh {
                     for x in 0..ow {
-                        let mask_val = mask[(y * ow + x) as usize];
+                        let mask_val = merged[(y * ow + x) as usize];
                         if mask_val > 128 {
                             let orig = original_rgba.get_pixel(x, y);
                             neck_rgba.put_pixel(x, y, *orig);
@@ -277,9 +313,12 @@ pub async fn load_original_image(
         // Also add to slot_layers["current"] so the layer sidebar shows the SAM3 neck
         if let Some(current) = state.slot_layers.lock().unwrap().get_mut("current") {
             current.insert("neck".to_string(), neck_img);
+            if includes_neckwear && current.contains_key("neckwear") {
+                current.insert("neckwear".to_string(), DynamicImage::new_rgba8(w, h));
+            }
         }
 
-        eprintln!("[PachiPakuGen] Neck extracted and cached via SAM3");
+        eprintln!("[PachiPakuGen] Neck region extracted and cached via SAM3: {}", prompts.join(", "));
 
         // Also extract and cache mouth mask from original image
         // (original image has clear mouth features even when closed, unlike PSD composite)
@@ -416,6 +455,7 @@ fn create_base_inner(
     base_eye_slot: String,
     base_mouth_slot: String,
     body_layer_order: Vec<String>,
+    body_layer_offsets: HashMap<String, LayerTransform>,
     hair_layer_order: Vec<String>,
     hair_back_layer_order: Vec<String>,
     output_path: String,
@@ -522,7 +562,12 @@ fn create_base_inner(
                 ];
                 for candidate in &candidates {
                     if let Some(img) = current.get(candidate.as_str()) {
-                        alpha_composite_onto(&mut result, &img.to_rgba8(), w, h);
+                        let transform = if candidate == "neck" {
+                            body_layer_offsets.get(candidate.as_str()).copied().unwrap_or_default()
+                        } else {
+                            LayerTransform::default()
+                        };
+                        alpha_composite_onto_transform(&mut result, &img.to_rgba8(), w, h, transform);
                     }
                 }
             }
@@ -857,6 +902,7 @@ fn get_mapping_preview_inner(
                     layers_info.push(LayerInfo {
                         name: candidate.clone(),
                         thumbnail: image_utils::image_to_base64_png(&thumb),
+                        bounds: alpha_bounds(&img.to_rgba8()).unwrap_or_default(),
                     });
                 }
             }
@@ -899,6 +945,7 @@ fn render_category_inner(
     _mapping_json: String,
     _target: String,
     enabled_layers: Vec<String>,
+    layer_offsets: HashMap<String, LayerTransform>,
 ) -> Result<RenderCategoryResult, AppError> {
     let state = app.state::<AppState>();
 
@@ -912,7 +959,12 @@ fn render_category_inner(
     let mut result_img = image::RgbaImage::new(w, h);
     for layer_name in &enabled_layers {
         if let Some(img) = current.get(layer_name.as_str()) {
-            alpha_composite_onto(&mut result_img, &img.to_rgba8(), w, h);
+            let transform = if layer_name == "neck" {
+                layer_offsets.get(layer_name.as_str()).copied().unwrap_or_default()
+            } else {
+                LayerTransform::default()
+            };
+            alpha_composite_onto_transform(&mut result_img, &img.to_rgba8(), w, h, transform);
         }
     }
 
@@ -1173,6 +1225,119 @@ fn alpha_composite_onto(
                 }
             }
         }
+    }
+}
+
+fn alpha_composite_onto_transform(
+    dst: &mut image::RgbaImage,
+    src: &image::RgbaImage,
+    width: u32,
+    height: u32,
+    transform: LayerTransform,
+) {
+    let scale_x = if transform.scale_x > 0.0 { transform.scale_x } else { 1.0 };
+    let scale_y = if transform.scale_y > 0.0 { transform.scale_y } else { 1.0 };
+
+    if transform.x == 0 && transform.y == 0 && (scale_x - 1.0).abs() < f32::EPSILON && (scale_y - 1.0).abs() < f32::EPSILON {
+        alpha_composite_onto(dst, src, width, height);
+        return;
+    }
+
+    if (scale_x - 1.0).abs() >= f32::EPSILON || (scale_y - 1.0).abs() >= f32::EPSILON {
+        let Some(bounds) = alpha_bounds(src) else {
+            return;
+        };
+        if bounds.width == 0 || bounds.height == 0 {
+            return;
+        }
+
+        let new_w = ((bounds.width as f32) * scale_x).round().max(1.0) as u32;
+        let new_h = ((bounds.height as f32) * scale_y).round().max(1.0) as u32;
+        let cropped = image::imageops::crop_imm(src, bounds.x, bounds.y, bounds.width, bounds.height).to_image();
+        let resized = image::imageops::resize(&cropped, new_w, new_h, image::imageops::FilterType::Lanczos3);
+        alpha_composite_at(dst, &resized, bounds.x as i32 + transform.x, bounds.y as i32 + transform.y, width, height);
+        return;
+    }
+
+    alpha_composite_at(dst, src, transform.x, transform.y, width, height);
+}
+
+fn alpha_composite_at(
+    dst: &mut image::RgbaImage,
+    src: &image::RgbaImage,
+    offset_x: i32,
+    offset_y: i32,
+    width: u32,
+    height: u32,
+) {
+    let src_width = src.width();
+    let src_height = src.height();
+    for sy in 0..height {
+        if sy >= src_height {
+            break;
+        }
+        let dy = sy as i32 + offset_y;
+        if dy < 0 || dy >= height as i32 {
+            continue;
+        }
+        for sx in 0..width {
+            if sx >= src_width {
+                break;
+            }
+            let dx = sx as i32 + offset_x;
+            if dx < 0 || dx >= width as i32 {
+                continue;
+            }
+
+            let sp = src.get_pixel(sx, sy);
+            let sa = sp[3] as f32 / 255.0;
+            if sa > 0.0 {
+                let dp = dst.get_pixel(dx as u32, dy as u32);
+                let da = dp[3] as f32 / 255.0;
+                let out_a = sa + da * (1.0 - sa);
+                if out_a > 0.0 {
+                    let r = (sp[0] as f32 * sa + dp[0] as f32 * da * (1.0 - sa)) / out_a;
+                    let g = (sp[1] as f32 * sa + dp[1] as f32 * da * (1.0 - sa)) / out_a;
+                    let b = (sp[2] as f32 * sa + dp[2] as f32 * da * (1.0 - sa)) / out_a;
+                    dst.put_pixel(dx as u32, dy as u32, image::Rgba([
+                        r.clamp(0.0, 255.0) as u8,
+                        g.clamp(0.0, 255.0) as u8,
+                        b.clamp(0.0, 255.0) as u8,
+                        (out_a * 255.0).clamp(0.0, 255.0) as u8,
+                    ]));
+                }
+            }
+        }
+    }
+}
+
+fn alpha_bounds(src: &image::RgbaImage) -> Option<LayerBounds> {
+    let mut min_x = src.width();
+    let mut min_y = src.height();
+    let mut max_x = 0;
+    let mut max_y = 0;
+    let mut found = false;
+
+    for (x, y, pixel) in src.enumerate_pixels() {
+        if pixel[3] == 0 {
+            continue;
+        }
+        found = true;
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+
+    if found {
+        Some(LayerBounds {
+            x: min_x,
+            y: min_y,
+            width: max_x - min_x + 1,
+            height: max_y - min_y + 1,
+        })
+    } else {
+        None
     }
 }
 
