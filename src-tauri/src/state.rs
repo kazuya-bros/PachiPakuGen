@@ -24,11 +24,15 @@ pub struct AppState {
     // Cached original image (resized to canvas dimensions)
     pub cached_original: Mutex<Option<DynamicImage>>,
 
-    // Cached neck image extracted from original via SAM3
-    pub cached_neck: Mutex<Option<DynamicImage>>,
-
     // Cached SAM3 mouth mask (grayscale, from base PSD, reused for all diffs)
     pub cached_mouth_mask: Mutex<Option<Vec<u8>>>,
+
+    // Raw SAM3 mouth mask before UI dilation/blur adjustments.
+    pub cached_mouth_raw_mask: Mutex<Option<Vec<u8>>>,
+
+    // Per-original cache so UI adjustments do not rerun SAM3 for vowel previews.
+    pub cached_mouth_originals: Mutex<HashMap<String, DynamicImage>>,
+    pub cached_mouth_raw_masks: Mutex<HashMap<String, Vec<u8>>>,
 }
 
 impl Default for AppState {
@@ -41,8 +45,10 @@ impl Default for AppState {
             canvas_width: Mutex::new(0),
             canvas_height: Mutex::new(0),
             cached_original: Mutex::new(None),
-            cached_neck: Mutex::new(None),
             cached_mouth_mask: Mutex::new(None),
+            cached_mouth_raw_mask: Mutex::new(None),
+            cached_mouth_originals: Mutex::new(HashMap::new()),
+            cached_mouth_raw_masks: Mutex::new(HashMap::new()),
         }
     }
 }

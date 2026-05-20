@@ -1,6 +1,6 @@
 [package]
 name = "pachipakugen-app"
-version = "0.1.0"
+version = "0.3.0"
 description = "Batch intermediate frame generator for pre-separated anime parts (eyes, mouth)"
 authors = ["KAZUYA"]
 edition = "2021"

@@ -1,7 +1,8 @@
 use crate::error::AppError;
 use image::DynamicImage;
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Extract a body part mask from an image using SAM3 via Python subprocess.
 /// `prompt` is the text prompt for SAM3 (e.g. "neck", "mouth").
@@ -65,27 +66,64 @@ pub fn extract_masks_with_sam3(
         prompts.join(","), script_path.display()
     );
 
-    let output = Command::new(&python)
+    let mut child = Command::new(&python)
         .env("PYTHONIOENCODING", "utf-8")
         .arg(&script_path)
         .arg("--image").arg(&temp_image)
         .arg("--checkpoint").arg(sam3_ckpt)
         .arg("--output-dir").arg(&output_dir)
         .arg("--prompts").arg(prompts.join(","))
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| AppError::General(format!("Pythonの実行に失敗: {}", e)))?;
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stderr.is_empty() {
-        eprintln!("[PachiPakuGen] SAM3 stderr:\n{}", stderr);
-    }
+    let stdout = child.stdout.take()
+        .ok_or_else(|| AppError::General("SAM3 stdout を取得できません".into()))?;
+    let stderr = child.stderr.take()
+        .ok_or_else(|| AppError::General("SAM3 stderr を取得できません".into()))?;
 
-    if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut reader = BufReader::new(stdout);
+        let _ = reader.read_to_end(&mut buf);
+        buf
+    });
+
+    let stderr_handle = std::thread::spawn(move || {
+        let mut collected = String::new();
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    eprintln!("[PachiPakuGen] SAM3: {}", line);
+                    collected.push_str(&line);
+                    collected.push('\n');
+                }
+                Err(e) => {
+                    let msg = format!("SAM3 stderr read failed: {}", e);
+                    eprintln!("[PachiPakuGen] {}", msg);
+                    collected.push_str(&msg);
+                    collected.push('\n');
+                    break;
+                }
+            }
+        }
+        collected
+    });
+
+    let status = child.wait()
+        .map_err(|e| AppError::General(format!("Python縺ｮ螳溯｡後↓螟ｱ謨・ {}", e)))?;
+    let stdout_bytes = stdout_handle.join()
+        .map_err(|_| AppError::General("SAM3 stdout reader が異常終了しました".into()))?;
+    let stderr = stderr_handle.join()
+        .map_err(|_| AppError::General("SAM3 stderr reader が異常終了しました".into()))?;
+    if !status.success() {
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
         return Err(AppError::General(format!("SAM3がエラーで終了:\n{}\n{}", stderr, stdout)));
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
     if !stdout.trim().contains("OK") {
         return Err(AppError::General(format!("SAM3出力が不正: {}", stdout)));
     }
@@ -102,22 +140,34 @@ pub fn extract_masks_with_sam3(
     Ok(masks)
 }
 
-/// Extract mouth mask with extra dilation to cover closed lips.
-/// SAM3 detects the open mouth cavity, but closed lips need a larger mask area.
-pub fn extract_mouth_mask(
+pub fn extract_mouth_raw_mask(
     image: &DynamicImage,
     sam3_checkpoint: Option<&Path>,
 ) -> Result<Vec<u8>, AppError> {
-    let mask = extract_mask_with_sam3(image, "mouth", sam3_checkpoint)?;
-    let w = image.width();
-    let h = image.height();
-    // Dilate mask to cover surrounding lip/chin area
-    let dilated = dilate_mask(&mask, w, h, 15);
-    Ok(dilated)
+    extract_mask_with_sam3(image, "mouth", sam3_checkpoint)
+}
+
+pub fn adjust_mask(mask: &[u8], width: u32, height: u32, dilate_radius: i32, blur_radius: i32) -> Vec<u8> {
+    let radius = dilate_radius.clamp(0, 64);
+    let blur = blur_radius.clamp(0, 32);
+    let dilated = dilate_mask(mask, width, height, radius);
+    if blur <= 0 {
+        dilated
+    } else {
+        let blurred = blur_mask(&dilated, width, height, blur);
+        dilated
+            .iter()
+            .zip(blurred)
+            .map(|(hard, soft)| soft.min(*hard))
+            .collect()
+    }
 }
 
 /// Dilate a binary mask by the given radius (in pixels).
 fn dilate_mask(mask: &[u8], width: u32, height: u32, radius: i32) -> Vec<u8> {
+    if radius <= 0 {
+        return mask.to_vec();
+    }
     let mut result = vec![0u8; mask.len()];
     let r2 = radius * radius;
     for y in 0..height as i32 {
@@ -141,6 +191,47 @@ fn dilate_mask(mask: &[u8], width: u32, height: u32, radius: i32) -> Vec<u8> {
     result
 }
 
+fn blur_mask(mask: &[u8], width: u32, height: u32, radius: i32) -> Vec<u8> {
+    if radius <= 0 {
+        return mask.to_vec();
+    }
+    let mut horizontal = vec![0u8; mask.len()];
+    let diameter = radius * 2 + 1;
+    for y in 0..height as i32 {
+        let mut sum = 0u32;
+        for x in -radius..=radius {
+            let cx = x.clamp(0, width as i32 - 1);
+            sum += mask[(y as u32 * width + cx as u32) as usize] as u32;
+        }
+        for x in 0..width as i32 {
+            horizontal[(y as u32 * width + x as u32) as usize] = (sum / diameter as u32) as u8;
+            let remove_x = (x - radius).clamp(0, width as i32 - 1);
+            let add_x = (x + radius + 1).clamp(0, width as i32 - 1);
+            sum = sum
+                .saturating_sub(mask[(y as u32 * width + remove_x as u32) as usize] as u32)
+                .saturating_add(mask[(y as u32 * width + add_x as u32) as usize] as u32);
+        }
+    }
+
+    let mut result = vec![0u8; mask.len()];
+    for x in 0..width as i32 {
+        let mut sum = 0u32;
+        for y in -radius..=radius {
+            let cy = y.clamp(0, height as i32 - 1);
+            sum += horizontal[(cy as u32 * width + x as u32) as usize] as u32;
+        }
+        for y in 0..height as i32 {
+            result[(y as u32 * width + x as u32) as usize] = (sum / diameter as u32) as u8;
+            let remove_y = (y - radius).clamp(0, height as i32 - 1);
+            let add_y = (y + radius + 1).clamp(0, height as i32 - 1);
+            sum = sum
+                .saturating_sub(horizontal[(remove_y as u32 * width + x as u32) as usize] as u32)
+                .saturating_add(horizontal[(add_y as u32 * width + x as u32) as usize] as u32);
+        }
+    }
+    result
+}
+
 /// Apply a grayscale mask to an image, returning the masked RGBA result.
 pub fn apply_mask_to_image(
     image: &DynamicImage,
@@ -153,8 +244,10 @@ pub fn apply_mask_to_image(
     for y in 0..height {
         for x in 0..width {
             let mask_val = mask[(y * width + x) as usize];
-            if mask_val > 128 {
-                result.put_pixel(x, y, *rgba.get_pixel(x, y));
+            if mask_val > 0 {
+                let mut p = *rgba.get_pixel(x, y);
+                p[3] = ((p[3] as u16 * mask_val as u16) / 255) as u8;
+                result.put_pixel(x, y, p);
             }
         }
     }

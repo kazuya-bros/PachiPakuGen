@@ -26,8 +26,11 @@ Requirements:
 import argparse
 import os
 import sys
+import functools
 from contextlib import nullcontext
 from pathlib import Path
+
+print = functools.partial(print, flush=True)
 
 # Force UTF-8 output on Windows
 if sys.platform == "win32":

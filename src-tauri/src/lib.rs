@@ -23,9 +23,13 @@ pub fn run() {
             commands::parts::create_base,
             commands::parts::create_diff,
             commands::parts::load_original_image,
+            commands::parts::update_mouth_mask_preview,
             commands::parts::get_base_preview,
             commands::parts::get_mapping_preview,
             commands::parts::render_category,
+            commands::parts::get_all_layers_preview,
+            commands::parts::import_correction_layer,
+            commands::parts::export_corrected_layer,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
