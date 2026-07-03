@@ -8,6 +8,7 @@ __pycache__/
 # Build output
 dist/
 src-tauri/target/
+prototype-results/
 
 # Model files (large binaries)
 src-tauri/models/*.onnx

@@ -34,8 +34,7 @@ pub fn create_session(model_path: &Path) -> Result<Session, AppError> {
     }
 
     // Fallback: CPU only
-    let session = Session::builder()?
-        .commit_from_file(model_path)?;
+    let session = Session::builder()?.commit_from_file(model_path)?;
 
     eprintln!("[PachiPakuGen] Session created with CPU only");
     Ok(session)
@@ -44,10 +43,10 @@ pub fn create_session(model_path: &Path) -> Result<Session, AppError> {
 /// Resolve model path: check resource dir first, then fallback to local models/ dir.
 pub fn resolve_model_path(app: &AppHandle, filename: &str) -> Result<PathBuf, AppError> {
     // Try Tauri resource directory first (for bundled releases)
-    if let Ok(path) = app
-        .path()
-        .resolve(format!("models/{}", filename), tauri::path::BaseDirectory::Resource)
-    {
+    if let Ok(path) = app.path().resolve(
+        format!("models/{}", filename),
+        tauri::path::BaseDirectory::Resource,
+    ) {
         if path.exists() {
             return Ok(path);
         }

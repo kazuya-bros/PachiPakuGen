@@ -2,11 +2,13 @@
 
 [SpriTalk](https://kazuyabros.booth.pm/items/8102679) 専用の素材生成ツールです。
 
-**RIFE（Real-Time Intermediate Flow Estimation）** によるフレーム補間で、滑らかな口パク・まばたきアニメーションを実現します。See-Through で分解したPSDから、SpriTalk のレイヤーモードに必要な透過PNGパーツを自動生成します。
+**RIFE（Real-Time Intermediate Flow Estimation）** によるフレーム補間で、滑らかな口パク・まばたきアニメーションを実現します。新規制作は立ち絵1枚から開始し、内蔵See-Throughで分解したPSDを既存のレイヤー解析・補正処理へ直接渡します。
 
 ## 特徴
 
-- **See-Through PSD 入力** -- [See-Through](https://github.com/shitagaki-lab/see-through) で分解済みのPSDを直接読み込み
+- **内蔵See-Through** -- 立ち絵1枚からアプリ内で分解し、生成PSDを自動分類
+- **分解結果の承認・補正** -- 自動分類をプレビューし、必要な時だけ既存のレイヤー補正画面で調整
+- **外部PSD復旧経路** -- 既存のSee-Through PSDも引き続き直接読み込み可能
 - **SAM3 による口検出** -- SAM3 は口パク補間の口領域抽出にのみ使用（素体出力・See-Through補正では使用しません）
 - **素体出力** -- body / hair / hair_back の3パーツを透過PNGで出力。レイヤー並び替え・ON/OFF・切り出し対応
 - **See-Through補正** -- PSDに含まれる全レイヤーと外部PNGを手動で並び替え・切り出し・保存
@@ -31,15 +33,31 @@ PachiPakuGen は Body 編集や See-Through補正で任意レイヤーの一部�
 
 - Windows 10/11
 - DirectX 12 対応 GPU（必須）
-- NVIDIA GPU + CUDA 対応 PyTorch（口パクのSAM3口検出時は必須）
+- NVIDIA GPU + CUDA 対応 PyTorch（内蔵See-Through・口パクのSAM3口検出時は必須）
 - Node.js 18+
 - Rust 1.75+
 - Python 3.12+（口パクのSAM3口検出時に使用）
 - CUDA版 PyTorch（口パクのSAM3口検出時に使用、`uv.lock` では CUDA 12.8 版を固定）
 
-> 素体出力・See-Through補正だけを使う場合、SAM3用Python環境は使用しません。口パクでSAM3を実行する場合、CPU版PyTorchはサポート対象外です。CUDA が利用できない場合、処理を中止します。
+> 内蔵See-Throughは専用のPython 3.12環境をアプリ管理領域へ作成します。初回セットアップ時に依存パッケージ、最初の解析時にモデルをダウンロードします。既存PSDの素体出力・See-Through補正だけを使う場合、内蔵See-Through環境は不要です。
 
 ## 処理フロー
+
+### 表情セット作成
+
+```
+開眼・口が確認できる立ち絵1枚
+    ↓
+内蔵See-Through（GPU検出 → 通常版 / オフロード版 / 量子化版）
+    ↓
+生成PSDを既存パーサーへ直接読込・自動分類
+    ↓
+分解プレビューを確認・承認（必要時だけ高度なレイヤー補正）
+    ↓
+差分設定・生成確認
+```
+
+初回セットアップと解析は明示ボタンからのみ開始します。解析中は進捗表示とキャンセルが利用でき、成果物はアプリのローカルデータ領域へ保持されます。
 
 ### 素体出力モード
 
@@ -88,11 +106,13 @@ RIFE はこのフレーム補間モードでのみ使用します。SAM3 は口�
 
 ## 入力素材
 
-[See-Through](https://github.com/shitagaki-lab/see-through) で分解したPSDファイルを入力します。元画像は口パク補間で SAM3 による口領域抽出を行う場合のみ必要です。
+新規の表情セット作成では、開眼・口が確認できる立ち絵1枚だけが必須です。既存の個別ツールでは、See-Throughで分解済みのPSDを引き続き入力できます。
 
 | 入力 | 説明 | 必須 |
 |------|------|------|
-| PSD | See-Through出力のPSDファイル | Yes |
+| 立ち絵 | 開眼・口が確認できる元画像 | 表情セット作成 |
+| 参照画像 | 瞳デザイン・口内色の任意参照 | 任意 |
+| PSD | See-Through出力のPSDファイル | 既存個別ツールのみ |
 | 元画像 | See-Throughに入力した元のイラスト画像 | 口パク補間のみ |
 
 ### See-Through レイヤー対応
@@ -108,6 +128,18 @@ RIFE はこのフレーム補間モードでのみ使用します。SAM3 は口�
 `See-Through補正` では上記マッピングに関係なく、PSDに含まれる全レイヤーを対象にできます。See-Throughの中間素材には存在するがPSDに出てこない `head.png` なども、外部PNGとして追加できます。
 
 ## インストール
+
+### 内蔵See-Through
+
+表情セット作成のSTEP 2で `初回セットアップ` を押すと、検証済みの公式See-Throughコミットと専用Python環境をアプリ管理領域へ準備します。GPUメモリに応じて、既定では次のプロファイルを自動選択します。
+
+| GPUメモリ | 自動プロファイル |
+|-----------|------------------|
+| 16GB以上 | standard |
+| 10GB以上 | group-offload |
+| 10GB未満 / 未検出 | low-vram |
+
+See-Through公式実装のライセンスはApache-2.0です。接続先は検証済みコミットへ固定しています。
 
 ### リリースビルドを使う場合
 

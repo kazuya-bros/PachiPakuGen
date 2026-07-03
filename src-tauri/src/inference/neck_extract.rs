@@ -24,8 +24,9 @@ pub fn extract_masks_with_sam3(
     prompts: &[&str],
     sam3_checkpoint: Option<&Path>,
 ) -> Result<Vec<Vec<u8>>, AppError> {
-    let sam3_ckpt = sam3_checkpoint
-        .ok_or_else(|| AppError::General("sam3.pt が見つかりません。models/ に配置してください".into()))?;
+    let sam3_ckpt = sam3_checkpoint.ok_or_else(|| {
+        AppError::General("sam3.pt が見つかりません。models/ に配置してください".into())
+    })?;
     if prompts.is_empty() {
         return Err(AppError::General("SAM3プロンプトが空です".into()));
     }
@@ -44,14 +45,19 @@ pub fn extract_masks_with_sam3(
         for x in 0..w {
             let p = rgba.get_pixel(x, y);
             let a = p[3] as f32 / 255.0;
-            rgb_img.put_pixel(x, y, image::Rgb([
-                (p[0] as f32 * a + 255.0 * (1.0 - a)) as u8,
-                (p[1] as f32 * a + 255.0 * (1.0 - a)) as u8,
-                (p[2] as f32 * a + 255.0 * (1.0 - a)) as u8,
-            ]));
+            rgb_img.put_pixel(
+                x,
+                y,
+                image::Rgb([
+                    (p[0] as f32 * a + 255.0 * (1.0 - a)) as u8,
+                    (p[1] as f32 * a + 255.0 * (1.0 - a)) as u8,
+                    (p[2] as f32 * a + 255.0 * (1.0 - a)) as u8,
+                ]),
+            );
         }
     }
-    DynamicImage::ImageRgb8(rgb_img).save(&temp_image)
+    DynamicImage::ImageRgb8(rgb_img)
+        .save(&temp_image)
         .map_err(|e| AppError::General(format!("一時画像の保存に失敗: {}", e)))?;
 
     let output_dir = temp_dir.join("output");
@@ -63,24 +69,33 @@ pub fn extract_masks_with_sam3(
 
     eprintln!(
         "[PachiPakuGen] SAM3 extraction: prompts='{}', script={}",
-        prompts.join(","), script_path.display()
+        prompts.join(","),
+        script_path.display()
     );
 
     let mut child = Command::new(&python)
         .env("PYTHONIOENCODING", "utf-8")
         .arg(&script_path)
-        .arg("--image").arg(&temp_image)
-        .arg("--checkpoint").arg(sam3_ckpt)
-        .arg("--output-dir").arg(&output_dir)
-        .arg("--prompts").arg(prompts.join(","))
+        .arg("--image")
+        .arg(&temp_image)
+        .arg("--checkpoint")
+        .arg(sam3_ckpt)
+        .arg("--output-dir")
+        .arg(&output_dir)
+        .arg("--prompts")
+        .arg(prompts.join(","))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| AppError::General(format!("Pythonの実行に失敗: {}", e)))?;
 
-    let stdout = child.stdout.take()
+    let stdout = child
+        .stdout
+        .take()
         .ok_or_else(|| AppError::General("SAM3 stdout を取得できません".into()))?;
-    let stderr = child.stderr.take()
+    let stderr = child
+        .stderr
+        .take()
         .ok_or_else(|| AppError::General("SAM3 stderr を取得できません".into()))?;
 
     let stdout_handle = std::thread::spawn(move || {
@@ -112,15 +127,21 @@ pub fn extract_masks_with_sam3(
         collected
     });
 
-    let status = child.wait()
-        .map_err(|e| AppError::General(format!("Python縺ｮ螳溯｡後↓螟ｱ謨・ {}", e)))?;
-    let stdout_bytes = stdout_handle.join()
+    let status = child
+        .wait()
+        .map_err(|e| AppError::General(format!("Pythonの実行に失敗: {}", e)))?;
+    let stdout_bytes = stdout_handle
+        .join()
         .map_err(|_| AppError::General("SAM3 stdout reader が異常終了しました".into()))?;
-    let stderr = stderr_handle.join()
+    let stderr = stderr_handle
+        .join()
         .map_err(|_| AppError::General("SAM3 stderr reader が異常終了しました".into()))?;
     if !status.success() {
         let stdout = String::from_utf8_lossy(&stdout_bytes);
-        return Err(AppError::General(format!("SAM3がエラーで終了:\n{}\n{}", stderr, stdout)));
+        return Err(AppError::General(format!(
+            "SAM3がエラーで終了:\n{}\n{}",
+            stderr, stdout
+        )));
     }
 
     let stdout = String::from_utf8_lossy(&stdout_bytes);
@@ -147,7 +168,13 @@ pub fn extract_mouth_raw_mask(
     extract_mask_with_sam3(image, "mouth", sam3_checkpoint)
 }
 
-pub fn adjust_mask(mask: &[u8], width: u32, height: u32, dilate_radius: i32, blur_radius: i32) -> Vec<u8> {
+pub fn adjust_mask(
+    mask: &[u8],
+    width: u32,
+    height: u32,
+    dilate_radius: i32,
+    blur_radius: i32,
+) -> Vec<u8> {
     let radius = dilate_radius.clamp(0, 64);
     let blur = blur_radius.clamp(0, 32);
     let dilated = dilate_mask(mask, width, height, radius);
@@ -256,12 +283,16 @@ pub fn apply_mask_to_image(
 
 fn read_grayscale_mask(path: &Path, target_w: u32, target_h: u32) -> Result<Vec<u8>, AppError> {
     if !path.exists() {
-        return Err(AppError::General(format!("マスクファイルが見つかりません: {}", path.display())));
+        return Err(AppError::General(format!(
+            "マスクファイルが見つかりません: {}",
+            path.display()
+        )));
     }
-    let img = image::open(path)
-        .map_err(|e| AppError::General(format!("マスク読み込み失敗: {}", e)))?;
+    let img =
+        image::open(path).map_err(|e| AppError::General(format!("マスク読み込み失敗: {}", e)))?;
     let gray = if img.width() != target_w || img.height() != target_h {
-        img.resize_exact(target_w, target_h, image::imageops::FilterType::Nearest).to_luma8()
+        img.resize_exact(target_w, target_h, image::imageops::FilterType::Nearest)
+            .to_luma8()
     } else {
         img.to_luma8()
     };
@@ -291,7 +322,10 @@ fn find_python() -> Result<String, AppError> {
                 if let Ok(output) = Command::new(&candidate).arg("--version").output() {
                     if output.status.success() {
                         let python = candidate.to_string_lossy().into_owned();
-                        eprintln!("[PachiPakuGen] Using Python from PACHIPAKUGEN_PYTHON: {}", python);
+                        eprintln!(
+                            "[PachiPakuGen] Using Python from PACHIPAKUGEN_PYTHON: {}",
+                            python
+                        );
                         return Ok(python);
                     }
                 }
@@ -305,7 +339,9 @@ fn find_python() -> Result<String, AppError> {
 
     for name in &["python", "python3", "py"] {
         if let Ok(output) = Command::new(name).arg("--version").output() {
-            if output.status.success() { return Ok(name.to_string()); }
+            if output.status.success() {
+                return Ok(name.to_string());
+            }
         }
     }
     Err(AppError::General(
@@ -317,23 +353,38 @@ fn resolve_script_path() -> Result<std::path::PathBuf, AppError> {
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let root = manifest.parent().unwrap();
     let script = root.join("scripts").join("extract_neck_mask.py");
-    if script.exists() { return Ok(script); }
+    if script.exists() {
+        return Ok(script);
+    }
     if let Ok(exe) = std::env::current_exe() {
-        let s = exe.parent().unwrap().join("scripts").join("extract_neck_mask.py");
-        if s.exists() { return Ok(s); }
+        let s = exe
+            .parent()
+            .unwrap()
+            .join("scripts")
+            .join("extract_neck_mask.py");
+        if s.exists() {
+            return Ok(s);
+        }
     }
     Err(AppError::General("SAM3スクリプトが見つかりません".into()))
 }
 
 pub fn find_sam3_checkpoint() -> Option<std::path::PathBuf> {
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for dir in &[manifest.join("models"), manifest.parent().unwrap().join("models")] {
+    for dir in &[
+        manifest.join("models"),
+        manifest.parent().unwrap().join("models"),
+    ] {
         let path = dir.join("sam3.pt");
-        if path.exists() { return Some(path); }
+        if path.exists() {
+            return Some(path);
+        }
     }
     if let Ok(exe) = std::env::current_exe() {
         let path = exe.parent().unwrap().join("models").join("sam3.pt");
-        if path.exists() { return Some(path); }
+        if path.exists() {
+            return Some(path);
+        }
     }
     None
 }

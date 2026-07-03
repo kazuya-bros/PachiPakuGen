@@ -2,13 +2,13 @@ use crate::error::AppError;
 use crate::inference::neck_extract;
 use crate::inference::rife::rife_interpolate;
 use crate::inference::session::{create_session, resolve_model_path};
-use crate::processing::composite::premultiply_onto_body;
+use crate::processing::composite::{extract_part_with_blended_alpha, premultiply_onto_body};
 use crate::processing::image_utils;
 use crate::state::AppState;
 use base64::{engine::general_purpose::STANDARD, Engine};
-use image::DynamicImage;
+use image::{DynamicImage, GrayImage, RgbaImage};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;
@@ -47,21 +47,13 @@ const ADJUSTABLE_DEFAULTS: &[(&str, &str)] = &[
     ("tail", "body"),
 ];
 
-/// Default display order for body layers (top=front in UI).
-/// This order is reversed when compositing (first=back, last=front).
-const BODY_LAYER_ORDER: &[&str] = &[
-    "nose", "face", "ears", "neck",
-    "earwear", "eyewear", "neckwear",
-    "topwear", "handwear", "bottomwear", "legwear", "footwear",
-    "wings", "tail", "objects",
-];
-
-const EYE_LAYER_ORDER: &[&str] = &["eyewhite", "irides", "eyelash", "eyebrow"];
-
 /// Layers that may have -l/-r variants.
 const LR_SPLIT_LAYERS: &[&str] = &[
     "eyebrow", "eyelash", "irides", "eyewhite", "ears", "handwear",
 ];
+
+const DEPTH_VISIBILITY_TOLERANCE: u8 = 2;
+const DEPTH_VISIBILITY_FEATHER_SIGMA: f32 = 1.0;
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -134,9 +126,9 @@ pub struct LayerPatch {
 pub struct CategoryPreview {
     pub target: String,
     pub label: String,
-    pub preview: String,           // merged preview base64 PNG
+    pub preview: String, // merged preview base64 PNG
     pub layer_names: Vec<String>,
-    pub layers: Vec<LayerInfo>,    // individual layer thumbnails for toggle UI
+    pub layers: Vec<LayerInfo>, // individual layer thumbnails for toggle UI
 }
 
 #[derive(Serialize)]
@@ -175,10 +167,7 @@ pub struct MouthMaskPreviewResult {
 
 /// Load a See-Through output (PSD file or folder of PNGs) into the current slot.
 #[tauri::command]
-pub async fn load_slot(
-    app: AppHandle,
-    path: String,
-) -> Result<SlotLoadResult, AppError> {
+pub async fn load_slot(app: AppHandle, path: String) -> Result<SlotLoadResult, AppError> {
     tauri::async_runtime::spawn_blocking(move || load_slot_inner(app, path))
         .await
         .map_err(|e| AppError::General(format!("Task join error: {}", e)))?
@@ -192,14 +181,25 @@ pub async fn create_base(
     original_image_path: String,
     base_eye_slot: String,
     base_mouth_slot: String,
-    body_layer_order: Vec<String>,  // user's custom body layer order (top=front)
+    body_layer_order: Vec<String>, // user's custom body layer order (top=front)
     body_layer_patches: Vec<LayerPatch>,
-    hair_layer_order: Vec<String>,  // user's custom hair layer order (top=front)
-    hair_back_layer_order: Vec<String>,  // user's custom hair_back layer order (top=front)
+    hair_layer_order: Vec<String>, // user's custom hair layer order (top=front)
+    hair_back_layer_order: Vec<String>, // user's custom hair_back layer order (top=front)
     output_path: String,
 ) -> Result<CreateBaseResult, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
-        create_base_inner(app, mapping_json, original_image_path, base_eye_slot, base_mouth_slot, body_layer_order, body_layer_patches, hair_layer_order, hair_back_layer_order, output_path)
+        create_base_inner(
+            app,
+            mapping_json,
+            original_image_path,
+            base_eye_slot,
+            base_mouth_slot,
+            body_layer_order,
+            body_layer_patches,
+            hair_layer_order,
+            hair_back_layer_order,
+            output_path,
+        )
     })
     .await
     .map_err(|e| AppError::General(format!("Task join error: {}", e)))?
@@ -210,14 +210,22 @@ pub async fn create_base(
 pub async fn create_diff(
     app: AppHandle,
     path: String,
-    diff_type: String,    // "eye" or "mouth"
-    slot_name: String,    // e.g. "eye_closed", "mouth_a", "mouth_i", etc.
+    diff_type: String, // "eye" or "mouth"
+    slot_name: String, // e.g. "eye_closed", "mouth_a", "mouth_i", etc.
     frame_count: u32,
     output_path: String,
-    original_image_path: String,  // 元画像パス（mouth SAM3マスク適用用）
+    original_image_path: String, // 元画像パス（mouth SAM3マスク適用用）
 ) -> Result<CreateDiffResult, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
-        create_diff_inner(app, path, diff_type, slot_name, frame_count, output_path, original_image_path)
+        create_diff_inner(
+            app,
+            path,
+            diff_type,
+            slot_name,
+            frame_count,
+            output_path,
+            original_image_path,
+        )
     })
     .await
     .map_err(|e| AppError::General(format!("Task join error: {}", e)))?
@@ -225,9 +233,7 @@ pub async fn create_diff(
 
 /// Get a composite preview using current base parts.
 #[tauri::command]
-pub async fn get_base_preview(
-    app: AppHandle,
-) -> Result<String, AppError> {
+pub async fn get_base_preview(app: AppHandle) -> Result<String, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let parts = state.parts.lock().unwrap();
@@ -245,11 +251,9 @@ pub async fn get_mapping_preview(
     app: AppHandle,
     mapping_json: String,
 ) -> Result<MappingPreviewResult, AppError> {
-    tauri::async_runtime::spawn_blocking(move || {
-        get_mapping_preview_inner(app, mapping_json)
-    })
-    .await
-    .map_err(|e| AppError::General(format!("Task join error: {}", e)))?
+    tauri::async_runtime::spawn_blocking(move || get_mapping_preview_inner(app, mapping_json))
+        .await
+        .map_err(|e| AppError::General(format!("Task join error: {}", e)))?
 }
 
 /// Render a category preview with only specified layers enabled.
@@ -264,7 +268,15 @@ pub async fn render_category(
     overlap_highlight: bool,
 ) -> Result<RenderCategoryResult, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
-        render_category_inner(app, mapping_json, target, enabled_layers, layer_patches, layer_opacities, overlap_highlight)
+        render_category_inner(
+            app,
+            mapping_json,
+            target,
+            enabled_layers,
+            layer_patches,
+            layer_opacities,
+            overlap_highlight,
+        )
     })
     .await
     .map_err(|e| AppError::General(format!("Task join error: {}", e)))?
@@ -272,9 +284,7 @@ pub async fn render_category(
 
 /// Get all loaded PSD layers for See-Through correction mode.
 #[tauri::command]
-pub async fn get_all_layers_preview(
-    app: AppHandle,
-) -> Result<MappingPreviewResult, AppError> {
+pub async fn get_all_layers_preview(app: AppHandle) -> Result<MappingPreviewResult, AppError> {
     tauri::async_runtime::spawn_blocking(move || get_all_layers_preview_inner(app))
         .await
         .map_err(|e| AppError::General(format!("Task join error: {}", e)))?
@@ -304,12 +314,17 @@ pub async fn export_corrected_layer(
     layer_opacities: HashMap<String, f32>,
 ) -> Result<ExportCorrectedLayerResult, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
-        export_corrected_layer_inner(app, output_path, enabled_layers, layer_patches, layer_opacities)
+        export_corrected_layer_inner(
+            app,
+            output_path,
+            enabled_layers,
+            layer_patches,
+            layer_opacities,
+        )
     })
     .await
     .map_err(|e| AppError::General(format!("Task join error: {}", e)))?
 }
-
 
 /// Load original image and extract mouth mask via SAM3. Caches the result.
 #[tauri::command]
@@ -376,10 +391,29 @@ pub async fn update_mouth_mask_preview(
 ) -> Result<MouthMaskPreviewResult, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let original = state.cached_mouth_originals.lock().unwrap().get(&path).cloned()
-            .ok_or_else(|| AppError::General("元画像が読み込まれていません。先に口マスク確認を実行してください".into()))?;
-        let raw_mask = state.cached_mouth_raw_masks.lock().unwrap().get(&path).cloned()
-            .ok_or_else(|| AppError::General("SAM3口マスクがまだ作成されていません。先に口マスク確認を実行してください".into()))?;
+        let original = state
+            .cached_mouth_originals
+            .lock()
+            .unwrap()
+            .get(&path)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::General(
+                    "元画像が読み込まれていません。先に口マスク確認を実行してください".into(),
+                )
+            })?;
+        let raw_mask = state
+            .cached_mouth_raw_masks
+            .lock()
+            .unwrap()
+            .get(&path)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::General(
+                    "SAM3口マスクがまだ作成されていません。先に口マスク確認を実行してください"
+                        .into(),
+                )
+            })?;
         let mask = neck_extract::adjust_mask(
             &raw_mask,
             original.width(),
@@ -387,12 +421,19 @@ pub async fn update_mouth_mask_preview(
             mouth_mask_dilate_radius,
             mouth_mask_blur_radius,
         );
-        let masked = neck_extract::apply_mask_to_image(&original, &mask, original.width(), original.height());
+        let masked = neck_extract::apply_mask_to_image(
+            &original,
+            &mask,
+            original.width(),
+            original.height(),
+        );
         let preview = mouth_preview_to_base64(&masked, &mask, original.width(), original.height());
         *state.cached_original.lock().unwrap() = Some(original);
         *state.cached_mouth_raw_mask.lock().unwrap() = Some(raw_mask);
         *state.cached_mouth_mask.lock().unwrap() = Some(mask);
-        Ok(MouthMaskPreviewResult { mouth_preview: preview })
+        Ok(MouthMaskPreviewResult {
+            mouth_preview: preview,
+        })
     })
     .await
     .map_err(|e| AppError::General(format!("Task join error: {}", e)))?
@@ -464,7 +505,10 @@ fn part_previews_to_base64(frames: &[DynamicImage]) -> Vec<String> {
     }
 
     if !found {
-        return frames.iter().map(image_utils::image_to_base64_png).collect();
+        return frames
+            .iter()
+            .map(image_utils::image_to_base64_png)
+            .collect();
     }
 
     let part_w = max_x - min_x + 1;
@@ -494,7 +538,9 @@ fn fit_image_to_canvas(image: &DynamicImage, target_w: u32, target_h: u32) -> Dy
     let scale = (target_w as f32 / src_w as f32).min(target_h as f32 / src_h as f32);
     let resized_w = ((src_w as f32 * scale).round() as u32).max(1);
     let resized_h = ((src_h as f32 * scale).round() as u32).max(1);
-    let resized = image.resize_exact(resized_w, resized_h, image::imageops::FilterType::Lanczos3).to_rgba8();
+    let resized = image
+        .resize_exact(resized_w, resized_h, image::imageops::FilterType::Lanczos3)
+        .to_rgba8();
     let mut canvas = image::RgbaImage::new(target_w, target_h);
     let x0 = (target_w - resized_w) / 2;
     let y0 = (target_h - resized_h) / 2;
@@ -506,23 +552,44 @@ fn fit_image_to_canvas(image: &DynamicImage, target_w: u32, target_h: u32) -> Dy
     DynamicImage::ImageRgba8(canvas)
 }
 
-fn load_slot_inner(
-    app: AppHandle,
-    path: String,
-) -> Result<SlotLoadResult, AppError> {
+pub(crate) fn cache_original_image_for_canvas(
+    app: &AppHandle,
+    path: &Path,
+) -> Result<(), AppError> {
+    let state = app.state::<AppState>();
+    let original = image::open(path)?;
+    let w = *state.canvas_width.lock().unwrap();
+    let h = *state.canvas_height.lock().unwrap();
+    let original = if w > 0 && h > 0 && (original.width() != w || original.height() != h) {
+        fit_image_to_canvas(&original, w, h)
+    } else {
+        original
+    };
+    *state.cached_original.lock().unwrap() = Some(original);
+    Ok(())
+}
+
+pub(crate) fn load_slot_inner(app: AppHandle, path: String) -> Result<SlotLoadResult, AppError> {
     let p = Path::new(&path);
     if !p.is_file() {
-        return Err(AppError::General(format!("ファイルが見つかりません: {}", path)));
+        return Err(AppError::General(format!(
+            "ファイルが見つかりません: {}",
+            path
+        )));
     }
     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
     if ext.to_lowercase() != "psd" {
-        return Err(AppError::General("PSD形式のファイルを選択してください".into()));
+        return Err(AppError::General(
+            "PSD形式のファイルを選択してください".into(),
+        ));
     }
-    let layers = load_layers_from_psd(&path)?;
+    let (layers, layer_order) = load_layers_from_psd(&path)?;
     let source_type = "psd".to_string();
 
     if layers.is_empty() {
-        return Err(AppError::General("レイヤーが1つも見つかりませんでした".into()));
+        return Err(AppError::General(
+            "レイヤーが1つも見つかりませんでした".into(),
+        ));
     }
 
     let state = app.state::<AppState>();
@@ -548,6 +615,7 @@ fn load_slot_inner(
         };
         resized_layers.insert(name.clone(), img);
     }
+    let depth_maps = load_depth_maps_for_psd(&path, &resized_layers, w, h);
 
     // Detect adjustable layers
     let mut adjustable_layers = Vec::new();
@@ -555,7 +623,8 @@ fn load_slot_inner(
     let mut seen_adjustable: Vec<String> = Vec::new();
 
     for &(layer_name, default_target) in ADJUSTABLE_DEFAULTS {
-        let img = resized_layers.get(layer_name)
+        let img = resized_layers
+            .get(layer_name)
             .or_else(|| resized_layers.get(&format!("{}-l", layer_name)))
             .or_else(|| resized_layers.get(&format!("{}-r", layer_name)))
             .or_else(|| resized_layers.get(&format!("{}_l", layer_name)))
@@ -576,7 +645,9 @@ fn load_slot_inner(
 
     // Detect unknown layers
     for layer_name in &detected_layers {
-        if layer_name.starts_with('_') { continue; } // skip internal layers
+        if layer_name.starts_with('_') {
+            continue;
+        } // skip internal layers
         let base = normalize_layer_name(layer_name);
         let is_known = FIXED_MAPPINGS.iter().any(|(n, _)| *n == base)
             || ADJUSTABLE_DEFAULTS.iter().any(|(n, _)| *n == base);
@@ -599,10 +670,15 @@ fn load_slot_inner(
         m.insert("current".to_string(), resized_layers);
         m
     };
+    *state.slot_layer_order.lock().unwrap() = layer_order;
+    *state.slot_depth_maps.lock().unwrap() = depth_maps;
 
     eprintln!(
         "[PachiPakuGen] Loaded from {} ({} layers, canvas {}x{})",
-        source_type, detected_layers.len(), w, h
+        source_type,
+        detected_layers.len(),
+        w,
+        h
     );
 
     Ok(SlotLoadResult {
@@ -637,13 +713,60 @@ fn create_base_inner(
     *state.layer_mapping.lock().unwrap() = full_mapping.clone();
 
     let slot_layers = state.slot_layers.lock().unwrap();
-    let current = slot_layers.get("current")
+    let current = slot_layers
+        .get("current")
         .ok_or_else(|| AppError::General("PSDが読み込まれていません".into()))?;
+    let source_layer_order = state.slot_layer_order.lock().unwrap().clone();
+    let depth_maps = state.slot_depth_maps.lock().unwrap().clone();
     let w = *state.canvas_width.lock().unwrap();
     let h = *state.canvas_height.lock().unwrap();
 
-    // eye: PSD layers directly
-    let eye = merge_layers_for_target(current, &full_mapping, "eye", w, h);
+    // Keep open-eye assets pixel-exact by cutting the original image with the
+    // See-Through eye mask. Fall back to reconstructed layers when no original
+    // image is available.
+    let reconstructed_eye =
+        merge_eye_layers_for_base(current, &full_mapping, &source_layer_order, w, h);
+    let exact_original = if !original_image_path.is_empty() {
+        let original = image::open(&original_image_path)
+            .map_err(|e| AppError::General(format!("Base eye image load failed: {}", e)))?;
+        Some(if original.width() != w || original.height() != h {
+            fit_image_to_canvas(&original, w, h)
+        } else {
+            original
+        })
+    } else {
+        state.cached_original.lock().unwrap().clone()
+    };
+    let exact_eye = exact_original.as_ref().and_then(|original| {
+        extract_original_target_pixels(
+            original,
+            reconstructed_eye.as_ref()?,
+            current,
+            &depth_maps,
+            &full_mapping,
+            "eye",
+            Some("hair"),
+            w,
+            h,
+        )
+    });
+    let eye = match (exact_eye, reconstructed_eye) {
+        (Some(exact), Some(reconstructed)) => {
+            let exact_color = saturated_alpha_pixel_count(&exact);
+            let reconstructed_color = saturated_alpha_pixel_count(&reconstructed);
+            if reconstructed_color > 32 && exact_color.saturating_mul(3) < reconstructed_color {
+                eprintln!(
+                    "[PachiPakuGen] Base eye exact extraction lost colored pixels; using reconstructed eye layers (exact={}, reconstructed={})",
+                    exact_color, reconstructed_color
+                );
+                Some(reconstructed)
+            } else {
+                Some(exact)
+            }
+        }
+        (Some(exact), None) => Some(exact),
+        (None, reconstructed) => reconstructed,
+    };
 
     // mouth: use cached SAM3 mask applied to THIS base's original image
     // (SAM3 mask was detected from open original, but pixels come from base's own original)
@@ -661,7 +784,15 @@ fn create_base_inner(
             Some(neck_extract::apply_mask_to_image(&base_orig, &mask, w, h))
         } else {
             eprintln!("[PachiPakuGen] No cached mouth mask/original, using PSD mouth layer");
-            merge_layers_for_target(current, &full_mapping, "mouth", w, h)
+            merge_layers_for_target(
+                current,
+                &depth_maps,
+                &full_mapping,
+                "mouth",
+                &source_layer_order,
+                w,
+                h,
+            )
         }
     };
 
@@ -669,71 +800,145 @@ fn create_base_inner(
     let mut file_count = 0u32;
 
     let is_base_export = !output_path.is_empty();
+    let uses_unified_layer_order = !body_layer_order.is_empty()
+        && hair_layer_order.is_empty()
+        && hair_back_layer_order.is_empty()
+        && body_layer_order.iter().any(|layer_name| {
+            layer_order_entry_target(layer_name, &body_layer_patches, &full_mapping)
+                .is_some_and(|target| target == "hair" || target == "hair_back")
+        });
+    let body_order = if uses_unified_layer_order {
+        filter_layer_order_for_target(
+            &body_layer_order,
+            &body_layer_patches,
+            &full_mapping,
+            "body",
+        )
+    } else {
+        body_layer_order.clone()
+    };
+    let hair_order = if uses_unified_layer_order {
+        filter_layer_order_for_target(
+            &body_layer_order,
+            &body_layer_patches,
+            &full_mapping,
+            "hair",
+        )
+    } else {
+        hair_layer_order.clone()
+    };
+    let hair_back_order = if uses_unified_layer_order {
+        filter_layer_order_for_target(
+            &body_layer_order,
+            &body_layer_patches,
+            &full_mapping,
+            "hair_back",
+        )
+    } else {
+        hair_back_layer_order.clone()
+    };
 
     if is_base_export {
         // === 素体モード: body/hair/hair_back を出力 ===
         // hair: merge layers using user's custom order
-        let hair = if !hair_layer_order.is_empty() {
-            let mut order_reversed = hair_layer_order.clone();
+        let mut hair = if !hair_order.is_empty() {
+            let mut order_reversed = hair_order.clone();
             order_reversed.reverse();
-            let mut result = image::RgbaImage::new(w, h);
-            for layer_name in &order_reversed {
-                let candidates = [
-                    layer_name.clone(),
-                    format!("{}-l", layer_name), format!("{}-r", layer_name),
-                    format!("{}_l", layer_name), format!("{}_r", layer_name),
-                ];
-                for candidate in &candidates {
-                    if let Some(img) = current.get(candidate.as_str()) {
-                        alpha_composite_onto(&mut result, &img.to_rgba8(), w, h);
-                    }
-                }
-            }
-            Some(DynamicImage::ImageRgba8(result))
+            let render_layers =
+                collect_ordered_render_layers(current, &order_reversed, &[], &HashMap::new(), None);
+            Some(compose_depth_gated_layers(render_layers, &depth_maps, w, h))
         } else {
-            merge_layers_for_target(current, &full_mapping, "hair", w, h)
+            merge_layers_for_target(
+                current,
+                &depth_maps,
+                &full_mapping,
+                "hair",
+                &source_layer_order,
+                w,
+                h,
+            )
         };
         // hair_back: merge layers using user's custom order
-        let hair_back = if !hair_back_layer_order.is_empty() {
-            let mut order_reversed = hair_back_layer_order.clone();
+        let hair_back = if !hair_back_order.is_empty() {
+            let mut order_reversed = hair_back_order.clone();
             order_reversed.reverse();
-            let mut result = image::RgbaImage::new(w, h);
-            for layer_name in &order_reversed {
-                let candidates = [
-                    layer_name.clone(),
-                    format!("{}-l", layer_name), format!("{}-r", layer_name),
-                    format!("{}_l", layer_name), format!("{}_r", layer_name),
-                ];
-                for candidate in &candidates {
-                    if let Some(img) = current.get(candidate.as_str()) {
-                        alpha_composite_onto(&mut result, &img.to_rgba8(), w, h);
-                    }
-                }
-            }
-            Some(DynamicImage::ImageRgba8(result))
+            let render_layers =
+                collect_ordered_render_layers(current, &order_reversed, &[], &HashMap::new(), None);
+            Some(compose_depth_gated_layers(render_layers, &depth_maps, w, h))
         } else {
-            merge_layers_for_target(current, &full_mapping, "hair_back", w, h)
+            merge_layers_for_target(
+                current,
+                &depth_maps,
+                &full_mapping,
+                "hair_back",
+                &source_layer_order,
+                w,
+                h,
+            )
         };
 
         // body: merge layers using user's custom order
-        let body_img = if !body_layer_order.is_empty() {
-            let mut order_reversed = body_layer_order.clone();
+        let body_img = if !body_order.is_empty() {
+            let effective_order = if uses_unified_layer_order {
+                body_order.clone()
+            } else {
+                ensure_core_body_layers_for_custom_order(
+                    &body_order,
+                    current,
+                    &full_mapping,
+                    &source_layer_order,
+                )
+            };
+            let active_patches = active_patches_for_order(&body_layer_patches, &effective_order);
+            let mut order_reversed = effective_order;
             order_reversed.reverse();
-            let mut result = image::RgbaImage::new(w, h);
-            let active_patches = active_patches_for_order(&body_layer_patches, &body_layer_order);
             let patch_masks = prepare_patch_masks(&active_patches, w, h)?;
-            for layer_name in &order_reversed {
-                composite_body_order_item(&mut result, current, layer_name, &active_patches, &patch_masks, None, w, h)?;
-            }
-            DynamicImage::ImageRgba8(result)
+            let render_layers = collect_ordered_render_layers(
+                current,
+                &order_reversed,
+                &active_patches,
+                &patch_masks,
+                None,
+            );
+            compose_depth_gated_layers(render_layers, &depth_maps, w, h)
         } else {
-            merge_layers_for_target(current, &full_mapping, "body", w, h)
-                .ok_or_else(|| AppError::General("bodyに対応するレイヤーが見つかりません".into()))?
+            merge_layers_for_target(
+                current,
+                &depth_maps,
+                &full_mapping,
+                "body",
+                &source_layer_order,
+                w,
+                h,
+            )
+            .ok_or_else(|| AppError::General("bodyに対応するレイヤーが見つかりません".into()))?
         };
 
+        if let Some(hair_img) = hair.as_mut() {
+            let promoted_pixels = promote_body_foreground_over_hair(
+                &body_img,
+                hair_img,
+                current,
+                &depth_maps,
+                &full_mapping,
+                w,
+                h,
+            );
+            if promoted_pixels > 0 {
+                eprintln!(
+                    "[PachiPakuGen] Promoted {} body-over-hair pixels into hair overlay",
+                    promoted_pixels
+                );
+            }
+        }
+
         parts.insert("body".to_string(), body_img);
-        if let Some(img) = hair { parts.insert("hair".to_string(), img); }
-        if let Some(img) = hair_back { parts.insert("hair_back".to_string(), img); }
+        if let Some(img) = hair {
+            parts.insert("hair".to_string(), img);
+        }
+        if let Some(img) = hair_back {
+            parts.insert("hair_back".to_string(), img);
+        }
 
         // Export static layers
         let out_dir = Path::new(&output_path);
@@ -745,21 +950,132 @@ fn create_base_inner(
             }
         }
 
-        eprintln!("[PachiPakuGen] Base body created ({}x{}), {}files", w, h, file_count);
+        eprintln!(
+            "[PachiPakuGen] Base body created ({}x{}), {}files",
+            w, h, file_count
+        );
     } else {
         // === フレーム補間モード: bodyはPSD合成でRIFE用に保持するだけ ===
-        // Exclude neck from body (prevents neck bleeding into RIFE mouth frames)
-        let body = merge_layers_for_target_excluding(
-            current, &full_mapping, "body", &["neck"], w, h,
-        ).unwrap_or_else(|| DynamicImage::new_rgba8(w, h));
-        parts.insert("body".to_string(), body);
+        let body = if !body_order.is_empty() {
+            let effective_order = if uses_unified_layer_order {
+                body_order.clone()
+            } else {
+                ensure_core_body_layers_for_custom_order(
+                    &body_order,
+                    current,
+                    &full_mapping,
+                    &source_layer_order,
+                )
+            };
+            let active_patches = active_patches_for_order(&body_layer_patches, &effective_order);
+            let mut order_reversed = effective_order;
+            order_reversed.reverse();
+            let patch_masks = prepare_patch_masks(&active_patches, w, h)?;
+            let render_layers = collect_ordered_render_layers(
+                current,
+                &order_reversed,
+                &active_patches,
+                &patch_masks,
+                None,
+            );
+            compose_depth_gated_layers(render_layers, &depth_maps, w, h)
+        } else {
+            // Exclude neck from body when there is no user-edited layer order.
+            merge_layers_for_target_excluding(
+                current,
+                &depth_maps,
+                &full_mapping,
+                "body",
+                &["neck"],
+                &source_layer_order,
+                w,
+                h,
+            )
+            .unwrap_or_else(|| DynamicImage::new_rgba8(w, h))
+        };
 
-        eprintln!("[PachiPakuGen] Interp base loaded ({}x{}), body for premultiply (no neck)", w, h);
+        let mut hair = if !hair_order.is_empty() {
+            let mut order_reversed = hair_order.clone();
+            order_reversed.reverse();
+            let render_layers =
+                collect_ordered_render_layers(current, &order_reversed, &[], &HashMap::new(), None);
+            Some(compose_depth_gated_layers(render_layers, &depth_maps, w, h))
+        } else {
+            merge_layers_for_target(
+                current,
+                &depth_maps,
+                &full_mapping,
+                "hair",
+                &source_layer_order,
+                w,
+                h,
+            )
+        };
+
+        let hair_back = if !hair_back_order.is_empty() {
+            let mut order_reversed = hair_back_order.clone();
+            order_reversed.reverse();
+            let render_layers =
+                collect_ordered_render_layers(current, &order_reversed, &[], &HashMap::new(), None);
+            Some(compose_depth_gated_layers(render_layers, &depth_maps, w, h))
+        } else {
+            merge_layers_for_target(
+                current,
+                &depth_maps,
+                &full_mapping,
+                "hair_back",
+                &source_layer_order,
+                w,
+                h,
+            )
+        };
+
+        if let Some(hair_img) = hair.as_mut() {
+            let promoted_pixels = promote_body_foreground_over_hair(
+                &body,
+                hair_img,
+                current,
+                &depth_maps,
+                &full_mapping,
+                w,
+                h,
+            );
+            if promoted_pixels > 0 {
+                eprintln!(
+                    "[PachiPakuGen] Promoted {} body-over-hair pixels into hair overlay",
+                    promoted_pixels
+                );
+            }
+        }
+
+        parts.insert("body".to_string(), body);
+        if body_order.is_empty() {
+            if let Some(neck) =
+                merge_layers_for_names(current, &depth_maps, &["neck"], &source_layer_order, w, h)
+            {
+                parts.insert("neck".to_string(), neck);
+            }
+        }
+        if let Some(img) = hair {
+            parts.insert("hair".to_string(), img);
+        }
+        if let Some(img) = hair_back {
+            parts.insert("hair_back".to_string(), img);
+        }
+
+        eprintln!(
+            "[PachiPakuGen] Interp base loaded ({}x{}), body for premultiply (no neck)",
+            w, h
+        );
     }
 
     // eye/mouth
-    if let Some(img) = eye { parts.insert(base_eye_slot.clone(), img); }
-    if let Some(img) = mouth { parts.insert(base_mouth_slot.clone(), img); }
+    if let Some(img) = eye {
+        parts.insert(base_eye_slot.clone(), img);
+    }
+    if let Some(img) = mouth {
+        parts.insert(base_mouth_slot.clone(), img);
+    }
 
     let composite_preview = generate_composite_preview(&parts, w, h);
 
@@ -767,6 +1083,8 @@ fn create_base_inner(
     drop(slot_layers);
     *state.parts.lock().unwrap() = parts;
     state.slot_layers.lock().unwrap().clear();
+    state.slot_layer_order.lock().unwrap().clear();
+    state.slot_depth_maps.lock().unwrap().clear();
 
     eprintln!(
         "[PachiPakuGen] Base created: {}files, eye={}, mouth={}",
@@ -792,7 +1110,9 @@ fn create_diff_inner(
     original_image_path: String,
 ) -> Result<CreateDiffResult, AppError> {
     if frame_count < 2 || frame_count > 30 {
-        return Err(AppError::General("フレーム数は2〜30の範囲で指定してください".into()));
+        return Err(AppError::General(
+            "フレーム数は2〜30の範囲で指定してください".into(),
+        ));
     }
 
     let state = app.state::<AppState>();
@@ -800,9 +1120,12 @@ fn create_diff_inner(
     // Load the diff PSD
     let p = Path::new(&path);
     if !p.is_file() {
-        return Err(AppError::General(format!("ファイルが見つかりません: {}", path)));
+        return Err(AppError::General(format!(
+            "ファイルが見つかりません: {}",
+            path
+        )));
     }
-    let layers = load_layers_from_psd(&path)?;
+    let (layers, source_layer_order) = load_layers_from_psd(&path)?;
 
     let mapping = state.layer_mapping.lock().unwrap().clone();
     if mapping.is_empty() {
@@ -823,6 +1146,8 @@ fn create_diff_inner(
         resized.insert(name.clone(), img);
     }
 
+    let depth_maps = load_depth_maps_for_psd(&path, &resized, w, h);
+
     // Extract the target (eye or mouth) from the diff PSD
     let target = match diff_type.as_str() {
         "eye" => "eye",
@@ -830,52 +1155,104 @@ fn create_diff_inner(
         _ => return Err(AppError::General(format!("不正なdiff_type: {}", diff_type))),
     };
 
-    // Extract target from diff PSD
+    // Extract target from diff PSD. See-Through semantic layers are the primary
+    // source for both eyes and mouths; masks are only a fallback when layer
+    // classification fails.
     let diff_merged = if target == "mouth" {
-        // Mouth: use cached SAM3 mask applied to diff's original image
-        let cached_mask = state.cached_mouth_mask.lock().unwrap().clone();
-        if let (Some(mask), true) = (cached_mask, !original_image_path.is_empty()) {
-            // Load diff's original image and apply mouth mask
-            let diff_orig = image::open(&original_image_path)
-                .map_err(|e| AppError::General(format!("Diff元画像の読み込み失敗: {}", e)))?;
-            let diff_orig = if diff_orig.width() != w || diff_orig.height() != h {
-                fit_image_to_canvas(&diff_orig, w, h)
-            } else {
-                diff_orig
-            };
-            eprintln!("[PachiPakuGen] Diff mouth: SAM3 mask applied to original image");
-            neck_extract::apply_mask_to_image(&diff_orig, &mask, w, h)
+        if let Some(merged) = merge_layers_for_target(
+            &resized,
+            &depth_maps,
+            &mapping,
+            target,
+            &source_layer_order,
+            w,
+            h,
+        ) {
+            eprintln!("[PachiPakuGen] Diff mouth: using See-Through mouth layers");
+            merged
         } else {
-            eprintln!("[PachiPakuGen] No cached mouth mask or original, using PSD layers");
-            merge_layers_for_target(&resized, &mapping, target, w, h)
-                .ok_or_else(|| AppError::General("mouthレイヤーが見つかりません".into()))?
+            let cached_mask = state.cached_mouth_mask.lock().unwrap().clone();
+            if let (Some(mask), true) = (cached_mask, !original_image_path.is_empty()) {
+                let diff_orig = image::open(&original_image_path)
+                    .map_err(|e| AppError::General(format!("Diff元画像の読み込み失敗: {}", e)))?;
+                let diff_orig = if diff_orig.width() != w || diff_orig.height() != h {
+                    fit_image_to_canvas(&diff_orig, w, h)
+                } else {
+                    diff_orig
+                };
+                eprintln!("[PachiPakuGen] Diff mouth: See-Through mouth layer missing; fallback to SAM3 gate");
+                neck_extract::apply_mask_to_image(&diff_orig, &mask, w, h)
+            } else {
+                return Err(AppError::General(
+                    "mouthレイヤーが見つかりません。See-Through分類を補正するか、口マスクを作成してください"
+                        .into(),
+                ));
+            }
         }
     } else {
         // Eye: PSD layers directly
-        merge_layers_for_target(&resized, &mapping, target, w, h)
-            .ok_or_else(|| AppError::General(format!(
-                "{}に対応するレイヤーが見つかりません", target
-            )))?
+        merge_layers_for_target(
+            &resized,
+            &depth_maps,
+            &mapping,
+            target,
+            &source_layer_order,
+            w,
+            h,
+        )
+        .ok_or_else(|| AppError::General(format!("{}に対応するレイヤーが見つかりません", target)))?
+    };
+
+    let diff_merged = if target == "eye" && !original_image_path.is_empty() {
+        let original = image::open(&original_image_path)
+            .map_err(|e| AppError::General(format!("Diff eye image load failed: {}", e)))?;
+        let original = if original.width() != w || original.height() != h {
+            fit_image_to_canvas(&original, w, h)
+        } else {
+            original
+        };
+        extract_original_target_pixels(
+            &original,
+            &diff_merged,
+            &resized,
+            &depth_maps,
+            &mapping,
+            "eye",
+            Some("hair"),
+            w,
+            h,
+        )
+        .unwrap_or(diff_merged)
+    } else {
+        diff_merged
     };
 
     // Get base frame from stored parts
     let parts = state.parts.lock().unwrap();
     let base_key = if diff_type == "eye" {
         // Find which eye slot is the base (eye_open or eye_closed)
-        parts.keys().find(|k| k.starts_with("eye_"))
+        parts
+            .keys()
+            .find(|k| k.starts_with("eye_"))
             .cloned()
             .ok_or_else(|| AppError::General("素体のeyeが見つかりません".into()))?
     } else {
-        parts.keys().find(|k| k.starts_with("mouth_") || *k == "mouth_closed")
+        parts
+            .keys()
+            .find(|k| k.starts_with("mouth_") || *k == "mouth_closed")
             .cloned()
             .ok_or_else(|| AppError::General("素体のmouthが見つかりません".into()))?
     };
 
-    let base_frame = parts.get(&base_key)
-        .ok_or_else(|| AppError::General(format!("ベースフレーム '{}' が見つかりません", base_key)))?
+    let base_frame = parts
+        .get(&base_key)
+        .ok_or_else(|| {
+            AppError::General(format!("ベースフレーム '{}' が見つかりません", base_key))
+        })?
         .clone();
 
-    let body = parts.get("body")
+    let body = parts
+        .get("body")
         .ok_or_else(|| AppError::General("素体のbodyが見つかりません".into()))?
         .clone();
     let body_rgb = body.to_rgb8();
@@ -909,11 +1286,14 @@ fn create_diff_inner(
     let pair_name = slot_name.clone();
 
     for (step, &ratio) in ratios.iter().enumerate() {
-        let _ = app.emit("generation-progress", ProgressPayload {
-            current: (step + 1) as u32,
-            total: frame_count,
-            pair_name: pair_name.clone(),
-        });
+        let _ = app.emit(
+            "generation-progress",
+            ProgressPayload {
+                current: (step + 1) as u32,
+                total: frame_count,
+                pair_name: pair_name.clone(),
+            },
+        );
 
         let part_frame = if step == 0 {
             DynamicImage::ImageRgba8(img_a_rgba.clone())
@@ -921,9 +1301,7 @@ fn create_diff_inner(
             DynamicImage::ImageRgba8(img_b_rgba.clone())
         } else {
             let interpolated = rife_interpolate(session, &rife_a, &rife_b, ratio)?;
-            extract_part_with_blended_alpha(
-                &interpolated, &img_a_rgba, &img_b_rgba, ratio, w, h,
-            )
+            extract_part_with_blended_alpha(&interpolated, &img_a_rgba, &img_b_rgba, ratio, w, h)
         };
         frames.push(part_frame);
     }
@@ -948,7 +1326,9 @@ fn create_diff_inner(
 
     eprintln!(
         "[PachiPakuGen] Diff created: {} ({} frames) → {}",
-        pair_name, frame_count, out_dir.display()
+        pair_name,
+        frame_count,
+        out_dir.display()
     );
 
     Ok(CreateDiffResult {
@@ -962,7 +1342,7 @@ fn create_diff_inner(
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-fn get_mapping_preview_inner(
+pub(crate) fn get_mapping_preview_inner(
     app: AppHandle,
     mapping_json: String,
 ) -> Result<MappingPreviewResult, AppError> {
@@ -973,8 +1353,11 @@ fn get_mapping_preview_inner(
     let full_mapping = build_full_mapping(&user_mapping);
 
     let slot_layers = state.slot_layers.lock().unwrap();
-    let current = slot_layers.get("current")
+    let current = slot_layers
+        .get("current")
         .ok_or_else(|| AppError::General("PSD/フォルダが読み込まれていません".into()))?;
+    let source_layer_order = state.slot_layer_order.lock().unwrap().clone();
+    let depth_maps = state.slot_depth_maps.lock().unwrap().clone();
     let w = *state.canvas_width.lock().unwrap();
     let h = *state.canvas_height.lock().unwrap();
 
@@ -990,38 +1373,10 @@ fn get_mapping_preview_inner(
     let mut categories = Vec::new();
 
     for &(target, label) in target_labels {
-        // Collect which layers map to this target, in BODY_LAYER_ORDER
-        let mut layer_names: Vec<String> = Vec::new();
-
-        // First: add in predefined order
-        let order: &[&str] = match target {
-            "body" => BODY_LAYER_ORDER,
-            "eye" => EYE_LAYER_ORDER,
-            _ => &[],
-        };
-        for &name in order {
-            if !layer_names.contains(&name.to_string()) {
-                // Check if this layer exists in current and maps to target
-                let exists = current.keys().any(|k| normalize_layer_name(k) == name);
-                if exists {
-                    if let Some(mapped) = full_mapping.get(name) {
-                        if mapped == target {
-                            layer_names.push(name.to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        // Then: add remaining layers not in the order list
-        for (layer_name, _) in current {
-            let base = normalize_layer_name(layer_name);
-            if let Some(mapped) = full_mapping.get(base) {
-                if mapped == target && !layer_names.contains(&base.to_string()) {
-                    layer_names.push(base.to_string());
-                }
-            }
-        }
+        // Keep the PSD's top/front-first order so layer grouping does not
+        // destroy See-Through's inferred depth relationships.
+        let layer_names =
+            ordered_layer_names_for_target(current, &full_mapping, target, &source_layer_order);
 
         if layer_names.is_empty() && target != "skip" {
             continue;
@@ -1032,32 +1387,52 @@ fn get_mapping_preview_inner(
             // For skip, just show a placeholder
             String::new()
         } else {
-            match merge_layers_for_target(current, &full_mapping, target, w, h) {
-                Some(img) => {
-                    image_utils::image_to_base64_png(&img)
-                }
+            let merged = merge_layers_for_target(
+                current,
+                &depth_maps,
+                &full_mapping,
+                target,
+                &source_layer_order,
+                w,
+                h,
+            );
+            let merged = if target == "eye" {
+                let cached_original = state.cached_original.lock().unwrap().clone();
+                cached_original
+                    .as_ref()
+                    .and_then(|original| {
+                        extract_original_target_pixels(
+                            original,
+                            merged.as_ref()?,
+                            current,
+                            &depth_maps,
+                            &full_mapping,
+                            "eye",
+                            Some("hair"),
+                            w,
+                            h,
+                        )
+                    })
+                    .or(merged)
+            } else {
+                merged
+            };
+            match merged {
+                Some(img) => image_utils::image_to_base64_png(&img),
                 None => String::new(),
             }
         };
 
         // Generate individual layer thumbnails
         let mut layers_info = Vec::new();
-        for base_name in &layer_names {
-            // Find the actual image(s) for this base name (including L/R variants)
-            let candidates = [
-                base_name.clone(),
-                format!("{}-l", base_name), format!("{}-r", base_name),
-                format!("{}_l", base_name), format!("{}_r", base_name),
-            ];
-            for candidate in &candidates {
-                if let Some(img) = current.get(candidate.as_str()) {
-                    let thumb = img.thumbnail(120, 120);
-                    layers_info.push(LayerInfo {
-                        name: candidate.clone(),
-                        thumbnail: image_utils::image_to_base64_png(&thumb),
-                        bounds: alpha_bounds(&img.to_rgba8()).unwrap_or_default(),
-                    });
-                }
+        for layer_name in &layer_names {
+            if let Some(img) = current.get(layer_name.as_str()) {
+                let thumb = img.thumbnail(120, 120);
+                layers_info.push(LayerInfo {
+                    name: layer_name.clone(),
+                    thumbnail: image_utils::image_to_base64_png(&thumb),
+                    bounds: alpha_bounds(&img.to_rgba8()).unwrap_or_default(),
+                });
             }
         }
 
@@ -1075,7 +1450,33 @@ fn get_mapping_preview_inner(
     // Full composite preview
     let mut composite_parts: HashMap<String, DynamicImage> = HashMap::new();
     for target in &["body", "eye", "mouth", "hair", "hair_back"] {
-        if let Some(img) = merge_layers_for_target(current, &full_mapping, target, w, h) {
+        if let Some(mut img) = merge_layers_for_target(
+            current,
+            &depth_maps,
+            &full_mapping,
+            target,
+            &source_layer_order,
+            w,
+            h,
+        ) {
+            if *target == "eye" {
+                let cached_original = state.cached_original.lock().unwrap().clone();
+                if let Some(exact_eye) = cached_original.as_ref().and_then(|original| {
+                    extract_original_target_pixels(
+                        original,
+                        &img,
+                        current,
+                        &depth_maps,
+                        &full_mapping,
+                        "eye",
+                        Some("hair"),
+                        w,
+                        h,
+                    )
+                }) {
+                    img = exact_eye;
+                }
+            }
             // Map to expected keys for composite
             let key = match *target {
                 "eye" => "eye_open",
@@ -1084,6 +1485,10 @@ fn get_mapping_preview_inner(
             };
             composite_parts.insert(key.to_string(), img);
         }
+    }
+    let body = composite_parts.get("body").cloned();
+    if let (Some(body), Some(hair)) = (body.as_ref(), composite_parts.get_mut("hair")) {
+        promote_body_foreground_over_hair(body, hair, current, &depth_maps, &full_mapping, w, h);
     }
     let composite_preview = generate_composite_preview(&composite_parts, w, h);
 
@@ -1105,56 +1510,75 @@ fn render_category_inner(
     let state = app.state::<AppState>();
 
     let slot_layers = state.slot_layers.lock().unwrap();
-    let current = slot_layers.get("current")
+    let current = slot_layers
+        .get("current")
         .ok_or_else(|| AppError::General("PSDが読み込まれていません".into()))?;
     let w = *state.canvas_width.lock().unwrap();
     let h = *state.canvas_height.lock().unwrap();
+    let depth_maps = state.slot_depth_maps.lock().unwrap().clone();
 
     // Composite in the exact order of enabled_layers (user-controlled order)
-    let mut result_img = image::RgbaImage::new(w, h);
     let active_patches = active_patches_for_order(&layer_patches, &enabled_layers);
     let patch_masks = prepare_patch_masks(&active_patches, w, h)?;
-    for layer_name in &enabled_layers {
-        composite_body_order_item(&mut result_img, current, layer_name, &active_patches, &patch_masks, Some(&layer_opacities), w, h)?;
-    }
+    let render_layers = collect_ordered_render_layers(
+        current,
+        &enabled_layers,
+        &active_patches,
+        &patch_masks,
+        Some(&layer_opacities),
+    );
+    let mut result_img = compose_depth_gated_layers(render_layers, &depth_maps, w, h).to_rgba8();
     if overlap_highlight {
-        apply_overlap_highlight(&mut result_img, current, &enabled_layers, &active_patches, &patch_masks, &layer_opacities, w, h)?;
+        apply_overlap_highlight(
+            &mut result_img,
+            current,
+            &enabled_layers,
+            &active_patches,
+            &patch_masks,
+            &layer_opacities,
+            w,
+            h,
+        )?;
     }
 
     let preview = image_utils::image_to_base64_png(&DynamicImage::ImageRgba8(result_img));
     Ok(RenderCategoryResult { preview })
 }
 
-fn get_all_layers_preview_inner(
-    app: AppHandle,
-) -> Result<MappingPreviewResult, AppError> {
+fn get_all_layers_preview_inner(app: AppHandle) -> Result<MappingPreviewResult, AppError> {
     let state = app.state::<AppState>();
 
     let slot_layers = state.slot_layers.lock().unwrap();
-    let current = slot_layers.get("current")
-        .ok_or_else(|| AppError::General("PSD縺瑚ｪｭ縺ｿ霎ｼ縺ｾ繧後※縺・∪縺帙ｓ".into()))?;
+    let current = slot_layers
+        .get("current")
+        .ok_or_else(|| AppError::General("PSDが読み込まれていません".into()))?;
     let w = *state.canvas_width.lock().unwrap();
     let h = *state.canvas_height.lock().unwrap();
 
-    let mut layer_names: Vec<String> = current.keys().cloned().collect();
-    layer_names.sort();
+    let mut compositing_order = state.slot_layer_order.lock().unwrap().clone();
+    append_missing_layer_names(&mut compositing_order, current);
+    let layer_names: Vec<String> = compositing_order.iter().rev().cloned().collect();
 
     let mut composite = image::RgbaImage::new(w, h);
     let mut layers = Vec::new();
     for name in &layer_names {
         if let Some(img) = current.get(name.as_str()) {
-            let rgba = img.to_rgba8();
-            alpha_composite_onto(&mut composite, &rgba, w, h);
             let thumb = img.thumbnail(120, 120);
             layers.push(LayerInfo {
                 name: name.clone(),
                 thumbnail: image_utils::image_to_base64_png(&thumb),
-                bounds: alpha_bounds(&rgba).unwrap_or_default(),
+                bounds: alpha_bounds(&img.to_rgba8()).unwrap_or_default(),
             });
         }
     }
+    for name in &compositing_order {
+        if let Some(img) = current.get(name.as_str()) {
+            alpha_composite_onto(&mut composite, &img.to_rgba8(), w, h);
+        }
+    }
 
-    let composite_preview = image_utils::image_to_base64_png(&DynamicImage::ImageRgba8(composite.clone()));
+    let composite_preview =
+        image_utils::image_to_base64_png(&DynamicImage::ImageRgba8(composite.clone()));
     Ok(MappingPreviewResult {
         categories: vec![CategoryPreview {
             target: "free".to_string(),
@@ -1193,7 +1617,8 @@ fn import_correction_layer_inner(
     };
 
     let mut slot_layers = state.slot_layers.lock().unwrap();
-    let current = slot_layers.get_mut("current")
+    let current = slot_layers
+        .get_mut("current")
         .ok_or_else(|| AppError::General("PSDが読み込まれていません".into()))?;
 
     let mut final_name = normalized_name.clone();
@@ -1209,9 +1634,19 @@ fn import_correction_layer_inner(
         }
     }
     current.insert(final_name.clone(), img);
-    eprintln!("[PachiPakuGen] Imported correction layer '{}' from {}", final_name, path);
+    state
+        .slot_layer_order
+        .lock()
+        .unwrap()
+        .push(final_name.clone());
+    eprintln!(
+        "[PachiPakuGen] Imported correction layer '{}' from {}",
+        final_name, path
+    );
 
-    Ok(ImportCorrectionLayerResult { layer_name: final_name })
+    Ok(ImportCorrectionLayerResult {
+        layer_name: final_name,
+    })
 }
 
 fn export_corrected_layer_inner(
@@ -1227,26 +1662,23 @@ fn export_corrected_layer_inner(
 
     let state = app.state::<AppState>();
     let slot_layers = state.slot_layers.lock().unwrap();
-    let current = slot_layers.get("current")
-        .ok_or_else(|| AppError::General("PSD縺瑚ｪｭ縺ｿ霎ｼ縺ｾ繧後※縺・∪縺帙ｓ".into()))?;
+    let current = slot_layers
+        .get("current")
+        .ok_or_else(|| AppError::General("PSDが読み込まれていません".into()))?;
     let w = *state.canvas_width.lock().unwrap();
     let h = *state.canvas_height.lock().unwrap();
+    let depth_maps = state.slot_depth_maps.lock().unwrap().clone();
 
     let active_patches = active_patches_for_order(&layer_patches, &enabled_layers);
     let patch_masks = prepare_patch_masks(&active_patches, w, h)?;
-    let mut result_img = image::RgbaImage::new(w, h);
-    for layer_name in &enabled_layers {
-        composite_body_order_item(
-            &mut result_img,
-            current,
-            layer_name,
-            &active_patches,
-            &patch_masks,
-            Some(&layer_opacities),
-            w,
-            h,
-        )?;
-    }
+    let render_layers = collect_ordered_render_layers(
+        current,
+        &enabled_layers,
+        &active_patches,
+        &patch_masks,
+        Some(&layer_opacities),
+    );
+    let result_img = compose_depth_gated_layers(render_layers, &depth_maps, w, h).to_rgba8();
 
     let out_path = Path::new(&output_path);
     if let Some(parent) = out_path.parent() {
@@ -1254,15 +1686,15 @@ fn export_corrected_layer_inner(
     }
     DynamicImage::ImageRgba8(result_img).save(out_path)?;
 
-    Ok(ExportCorrectedLayerResult {
-        output_path,
-    })
+    Ok(ExportCorrectedLayerResult { output_path })
 }
 
 fn normalize_layer_name(name: &str) -> &str {
     for &base in LR_SPLIT_LAYERS {
-        if name == format!("{}-l", base) || name == format!("{}-r", base)
-            || name == format!("{}_l", base) || name == format!("{}_r", base)
+        if name == format!("{}-l", base)
+            || name == format!("{}-r", base)
+            || name == format!("{}_l", base)
+            || name == format!("{}_r", base)
         {
             return base;
         }
@@ -1291,49 +1723,56 @@ fn active_patches_for_order(patches: &[LayerPatch], enabled_layers: &[String]) -
         .collect()
 }
 
-fn composite_body_order_item(
-    result: &mut image::RgbaImage,
+fn collect_ordered_render_layers(
     current: &HashMap<String, DynamicImage>,
-    layer_name: &str,
+    ordered_layer_names: &[String],
     patches: &[LayerPatch],
-    patch_masks: &HashMap<String, image::GrayImage>,
+    patch_masks: &HashMap<String, GrayImage>,
     layer_opacities: Option<&HashMap<String, f32>>,
-    width: u32,
-    height: u32,
-) -> Result<(), AppError> {
-    let opacity = layer_opacities
-        .and_then(|opacities| opacities.get(layer_name).copied())
-        .unwrap_or(1.0)
-        .clamp(0.0, 1.0);
+) -> Vec<(String, RgbaImage)> {
+    let mut rendered = Vec::new();
+    for layer_name in ordered_layer_names {
+        let opacity = layer_opacities
+            .and_then(|opacities| opacities.get(layer_name).copied())
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
 
-    if let Some(patch) = patches.iter().find(|p| p.id == layer_name) {
-        if let (Some(src), Some(mask)) = (current.get(patch.source_layer.as_str()), patch_masks.get(patch.id.as_str())) {
-            let mut patch_img = apply_mask_to_rgba(&src.to_rgba8(), mask, false);
-            apply_opacity(&mut patch_img, opacity);
-            alpha_composite_onto(result, &patch_img, width, height);
-        }
-        return Ok(());
-    }
-
-    let candidates = [
-        layer_name.to_string(),
-        format!("{}-l", layer_name), format!("{}-r", layer_name),
-        format!("{}_l", layer_name), format!("{}_r", layer_name),
-    ];
-    for candidate in &candidates {
-        if let Some(img) = current.get(candidate.as_str()) {
-            let mut rgba = img.to_rgba8();
-            for patch in patches.iter().filter(|p| p.cut_source && p.source_layer == *candidate) {
-                if let Some(mask) = patch_masks.get(patch.id.as_str()) {
-                    subtract_mask_from_rgba(&mut rgba, mask);
-                }
+        if let Some(patch) = patches.iter().find(|patch| patch.id == *layer_name) {
+            if let (Some(src), Some(mask)) = (
+                current.get(patch.source_layer.as_str()),
+                patch_masks.get(patch.id.as_str()),
+            ) {
+                let mut rgba = apply_mask_to_rgba(&src.to_rgba8(), mask, false);
+                apply_opacity(&mut rgba, opacity);
+                rendered.push((patch.source_layer.clone(), rgba));
             }
-            apply_opacity(&mut rgba, opacity);
-            alpha_composite_onto(result, &rgba, width, height);
+            continue;
+        }
+
+        let candidates = [
+            layer_name.clone(),
+            format!("{}-l", layer_name),
+            format!("{}-r", layer_name),
+            format!("{}_l", layer_name),
+            format!("{}_r", layer_name),
+        ];
+        for candidate in &candidates {
+            if let Some(img) = current.get(candidate.as_str()) {
+                let mut rgba = img.to_rgba8();
+                for patch in patches
+                    .iter()
+                    .filter(|patch| patch.cut_source && patch.source_layer == *candidate)
+                {
+                    if let Some(mask) = patch_masks.get(patch.id.as_str()) {
+                        subtract_mask_from_rgba(&mut rgba, mask);
+                    }
+                }
+                apply_opacity(&mut rgba, opacity);
+                rendered.push((candidate.clone(), rgba));
+            }
         }
     }
-
-    Ok(())
+    rendered
 }
 
 fn apply_overlap_highlight(
@@ -1394,7 +1833,10 @@ fn body_order_item_alpha_images(
     patch_masks: &HashMap<String, image::GrayImage>,
 ) -> Vec<image::RgbaImage> {
     if let Some(patch) = patches.iter().find(|p| p.id == layer_name) {
-        if let (Some(src), Some(mask)) = (current.get(patch.source_layer.as_str()), patch_masks.get(patch.id.as_str())) {
+        if let (Some(src), Some(mask)) = (
+            current.get(patch.source_layer.as_str()),
+            patch_masks.get(patch.id.as_str()),
+        ) {
             return vec![apply_mask_to_rgba(&src.to_rgba8(), mask, false)];
         }
         return Vec::new();
@@ -1402,14 +1844,19 @@ fn body_order_item_alpha_images(
 
     let candidates = [
         layer_name.to_string(),
-        format!("{}-l", layer_name), format!("{}-r", layer_name),
-        format!("{}_l", layer_name), format!("{}_r", layer_name),
+        format!("{}-l", layer_name),
+        format!("{}-r", layer_name),
+        format!("{}_l", layer_name),
+        format!("{}_r", layer_name),
     ];
     let mut images = Vec::new();
     for candidate in &candidates {
         if let Some(img) = current.get(candidate.as_str()) {
             let mut rgba = img.to_rgba8();
-            for patch in patches.iter().filter(|p| p.cut_source && p.source_layer == *candidate) {
+            for patch in patches
+                .iter()
+                .filter(|p| p.cut_source && p.source_layer == *candidate)
+            {
                 if let Some(mask) = patch_masks.get(patch.id.as_str()) {
                     subtract_mask_from_rgba(&mut rgba, mask);
                 }
@@ -1443,53 +1890,25 @@ fn build_full_mapping(user_mapping: &HashMap<String, String>) -> HashMap<String,
     full
 }
 
-/// Extract part from RIFE output using blended alpha.
-fn extract_part_with_blended_alpha(
-    rife_output: &DynamicImage,
-    img_a_rgba: &image::RgbaImage,
-    img_b_rgba: &image::RgbaImage,
-    ratio: f32,
-    width: u32,
-    height: u32,
-) -> DynamicImage {
-    let rgb = rife_output.to_rgb8();
-    let mut result = image::RgbaImage::new(width, height);
-
-    for y in 0..height {
-        for x in 0..width {
-            let alpha_a = img_a_rgba.get_pixel(x, y)[3] as f32;
-            let alpha_b = img_b_rgba.get_pixel(x, y)[3] as f32;
-            let alpha_union = alpha_a.max(alpha_b);
-
-            if alpha_union > 0.0 {
-                let alpha_lerp = alpha_a * (1.0 - ratio) + alpha_b * ratio;
-                let alpha = alpha_lerp.max(alpha_union * 0.5).min(alpha_union);
-                let p = rgb.get_pixel(x, y);
-                result.put_pixel(x, y, image::Rgba([
-                    p[0], p[1], p[2],
-                    alpha.clamp(0.0, 255.0) as u8,
-                ]));
-            }
-        }
-    }
-
-    DynamicImage::ImageRgba8(result)
-}
-
 // ── Layer loading ────────────────────────────────────────────────────
 
-fn load_layers_from_psd(path: &str) -> Result<HashMap<String, DynamicImage>, AppError> {
+fn load_layers_from_psd(
+    path: &str,
+) -> Result<(HashMap<String, DynamicImage>, Vec<String>), AppError> {
     let bytes = fs::read(path)?;
     let psd = psd::Psd::from_bytes(&bytes)
         .map_err(|e| AppError::General(format!("PSD読み込みエラー: {:?}", e)))?;
 
     let mut layers = HashMap::new();
+    let mut layer_order = Vec::new();
     let doc_width = psd.width();
     let doc_height = psd.height();
 
     for layer in psd.layers() {
         let name = layer.name().to_lowercase().replace(' ', "_");
-        if name.is_empty() { continue; }
+        if name.is_empty() {
+            continue;
+        }
 
         // psd crate's layer.rgba() returns FULL document-sized RGBA data
         // (doc_width * doc_height * 4 bytes), already positioned on the canvas.
@@ -1499,140 +1918,640 @@ fn load_layers_from_psd(path: &str) -> Result<HashMap<String, DynamicImage>, App
         if rgba_data.len() != expected_len {
             eprintln!(
                 "[PachiPakuGen] PSD layer '{}': unexpected rgba size {} (expected {}), skipping",
-                name, rgba_data.len(), expected_len
+                name,
+                rgba_data.len(),
+                expected_len
             );
             continue;
         }
 
         // Check if layer has any non-transparent pixels
         let has_content = rgba_data.chunks(4).any(|px| px[3] > 0);
-        if !has_content { continue; }
+        if !has_content {
+            continue;
+        }
 
         let canvas = image::RgbaImage::from_raw(doc_width, doc_height, rgba_data)
-            .ok_or_else(|| AppError::General(format!(
-                "PSDレイヤー '{}' のRGBA変換に失敗", name
-            )))?;
+            .ok_or_else(|| AppError::General(format!("PSDレイヤー '{}' のRGBA変換に失敗", name)))?;
 
+        layer_order.push(name.clone());
         layers.insert(name, DynamicImage::ImageRgba8(canvas));
     }
-    Ok(layers)
+    Ok((layers, layer_order))
 }
 
 // ── Layer merging ────────────────────────────────────────────────────
 
 /// Merge layers for a target, EXCLUDING specific base layer names.
+fn load_depth_maps_for_psd(
+    path: &str,
+    layers: &HashMap<String, DynamicImage>,
+    width: u32,
+    height: u32,
+) -> HashMap<String, GrayImage> {
+    let psd_path = Path::new(path);
+    let Some(parent) = psd_path.parent() else {
+        return HashMap::new();
+    };
+    let Some(stem) = psd_path.file_stem().and_then(|value| value.to_str()) else {
+        return HashMap::new();
+    };
+    let asset_dir = parent.join(stem);
+    if !asset_dir.is_dir() {
+        return HashMap::new();
+    }
+
+    let mut depth_maps = HashMap::new();
+    for layer_name in layers.keys() {
+        let depth_name = normalize_layer_name(layer_name).replace('_', " ");
+        let depth_path = asset_dir.join(format!("{depth_name}_depth.png"));
+        let Ok(depth) = image::open(&depth_path) else {
+            continue;
+        };
+        let depth = if depth.width() != width || depth.height() != height {
+            depth
+                .resize_exact(width, height, image::imageops::FilterType::Nearest)
+                .to_luma8()
+        } else {
+            depth.to_luma8()
+        };
+        depth_maps.insert(layer_name.clone(), depth);
+    }
+
+    eprintln!(
+        "[PachiPakuGen] Loaded {} local depth maps from {}",
+        depth_maps.len(),
+        asset_dir.display()
+    );
+    depth_maps
+}
+
 fn merge_layers_for_target_excluding(
     slot_layers: &HashMap<String, DynamicImage>,
+    depth_maps: &HashMap<String, GrayImage>,
     mapping: &HashMap<String, String>,
     target: &str,
     exclude: &[&str],
+    source_layer_order: &[String],
     width: u32,
     height: u32,
 ) -> Option<DynamicImage> {
-    let order: &[&str] = match target {
-        "body" => BODY_LAYER_ORDER,
-        "eye" => EYE_LAYER_ORDER,
-        _ => &[],
-    };
+    let ordered_layers =
+        ordered_layers_for_target(slot_layers, mapping, target, exclude, source_layer_order);
 
-    let mut ordered_layers: Vec<&DynamicImage> = Vec::new();
-    let mut added_names: Vec<String> = Vec::new();
-
-    for &base_name in order {
-        if exclude.contains(&base_name) { continue; }
-        if let Some(mapped_target) = get_mapping_target(base_name, mapping) {
-            if mapped_target == target {
-                let candidates = [
-                    base_name.to_string(),
-                    format!("{}-l", base_name), format!("{}-r", base_name),
-                    format!("{}_l", base_name), format!("{}_r", base_name),
-                ];
-                for candidate in &candidates {
-                    if let Some(img) = slot_layers.get(candidate.as_str()) {
-                        ordered_layers.push(img);
-                        added_names.push(candidate.clone());
-                    }
-                }
-            }
-        }
+    if ordered_layers.is_empty() {
+        return None;
     }
-
-    for (layer_name, img) in slot_layers {
-        if added_names.contains(layer_name) { continue; }
-        let base = normalize_layer_name(layer_name);
-        if exclude.contains(&base) { continue; }
-        if let Some(mapped_target) = get_mapping_target(layer_name, mapping) {
-            if mapped_target == target {
-                ordered_layers.push(img);
-            }
-        }
-    }
-
-    if ordered_layers.is_empty() { return None; }
-    if ordered_layers.len() == 1 { return Some(ordered_layers[0].clone()); }
-
-    let mut result = image::RgbaImage::new(width, height);
-    for layer in &ordered_layers {
-        let rgba = layer.to_rgba8();
-        alpha_composite_onto(&mut result, &rgba, width, height);
-    }
-    Some(DynamicImage::ImageRgba8(result))
+    Some(compose_depth_gated_layers(
+        ordered_layers
+            .into_iter()
+            .map(|(name, layer)| (name, layer.to_rgba8()))
+            .collect(),
+        depth_maps,
+        width,
+        height,
+    ))
 }
 
 fn merge_layers_for_target(
     slot_layers: &HashMap<String, DynamicImage>,
+    depth_maps: &HashMap<String, GrayImage>,
+    mapping: &HashMap<String, String>,
+    target: &str,
+    source_layer_order: &[String],
+    width: u32,
+    height: u32,
+) -> Option<DynamicImage> {
+    let ordered_layers =
+        ordered_layers_for_target(slot_layers, mapping, target, &[], source_layer_order);
+
+    if ordered_layers.is_empty() {
+        return None;
+    }
+    Some(compose_depth_gated_layers(
+        ordered_layers
+            .into_iter()
+            .map(|(name, layer)| (name, layer.to_rgba8()))
+            .collect(),
+        depth_maps,
+        width,
+        height,
+    ))
+}
+
+fn merge_eye_layers_for_base(
+    slot_layers: &HashMap<String, DynamicImage>,
+    _mapping: &HashMap<String, String>,
+    _source_layer_order: &[String],
+    width: u32,
+    height: u32,
+) -> Option<DynamicImage> {
+    let mut result = RgbaImage::new(width, height);
+    let mut found = false;
+    for target_name in ["eyewhite", "irides", "eyelash", "eyebrow"] {
+        let mut matching_layers: Vec<_> = slot_layers
+            .iter()
+            .filter(|(layer_name, _)| normalize_layer_name(layer_name) == target_name)
+            .collect();
+        matching_layers.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (_, layer) in matching_layers {
+            let rgba = layer.to_rgba8();
+            if !rgba.pixels().any(|pixel| pixel[3] > 0) {
+                continue;
+            }
+            alpha_composite_onto(&mut result, &rgba, width, height);
+            found = true;
+        }
+    }
+    found.then_some(DynamicImage::ImageRgba8(result))
+}
+
+fn merge_layers_for_names(
+    slot_layers: &HashMap<String, DynamicImage>,
+    depth_maps: &HashMap<String, GrayImage>,
+    normalized_names: &[&str],
+    source_layer_order: &[String],
+    width: u32,
+    height: u32,
+) -> Option<DynamicImage> {
+    let mut ordered_layers = Vec::new();
+    for layer_name in source_layer_order {
+        let base = normalize_layer_name(layer_name);
+        if normalized_names.contains(&base) {
+            if let Some(img) = slot_layers.get(layer_name.as_str()) {
+                ordered_layers.push((layer_name.clone(), img.to_rgba8()));
+            }
+        }
+    }
+    if ordered_layers.is_empty() {
+        return None;
+    }
+    Some(compose_depth_gated_layers(
+        ordered_layers,
+        depth_maps,
+        width,
+        height,
+    ))
+}
+
+fn ordered_layers_for_target<'a>(
+    slot_layers: &'a HashMap<String, DynamicImage>,
+    mapping: &HashMap<String, String>,
+    target: &str,
+    exclude: &[&str],
+    source_layer_order: &[String],
+) -> Vec<(String, &'a DynamicImage)> {
+    let mut ordered_layers = Vec::new();
+    let mut added_names = HashSet::new();
+
+    // See-Through stores layers back-to-front. Keep that direction for alpha
+    // compositing; local depth maps handle crossings that a global order cannot.
+    for layer_name in source_layer_order {
+        let base = normalize_layer_name(layer_name);
+        if exclude.contains(&base) {
+            continue;
+        }
+        if get_mapping_target(layer_name, mapping) == Some(target) {
+            if let Some(img) = slot_layers.get(layer_name.as_str()) {
+                ordered_layers.push((layer_name.clone(), img));
+                added_names.insert(layer_name.clone());
+            }
+        }
+    }
+
+    // Imported/manual layers may not exist in the original PSD order.
+    let mut remaining: Vec<_> = slot_layers
+        .iter()
+        .filter(|(layer_name, _)| {
+            !added_names.contains(*layer_name)
+                && !exclude.contains(&normalize_layer_name(layer_name))
+                && get_mapping_target(layer_name, mapping) == Some(target)
+        })
+        .collect();
+    remaining.sort_by(|(left, _), (right, _)| left.cmp(right));
+    ordered_layers.extend(
+        remaining
+            .into_iter()
+            .map(|(layer_name, img)| (layer_name.clone(), img)),
+    );
+    ordered_layers
+}
+
+fn ensure_core_body_layers_for_custom_order(
+    body_layer_order: &[String],
+    slot_layers: &HashMap<String, DynamicImage>,
+    mapping: &HashMap<String, String>,
+    source_layer_order: &[String],
+) -> Vec<String> {
+    let mut order = body_layer_order.to_vec();
+    let mut normalized: HashSet<String> = order
+        .iter()
+        .map(|layer_name| normalize_layer_name(layer_name))
+        .map(str::to_string)
+        .collect();
+
+    for required in ["face", "nose"] {
+        if normalized.contains(required) {
+            continue;
+        }
+        let source_name = source_layer_order
+            .iter()
+            .find(|layer_name| {
+                slot_layers.contains_key(layer_name.as_str())
+                    && normalize_layer_name(layer_name) == required
+                    && get_mapping_target(layer_name, mapping) == Some("body")
+            })
+            .or_else(|| {
+                slot_layers.keys().find(|layer_name| {
+                    normalize_layer_name(layer_name) == required
+                        && get_mapping_target(layer_name, mapping) == Some("body")
+                })
+            });
+        if let Some(source_name) = source_name {
+            order.insert(0, source_name.clone());
+            normalized.insert(required.to_string());
+        }
+    }
+
+    order
+}
+
+fn layer_order_entry_target<'a>(
+    layer_name: &str,
+    patches: &'a [LayerPatch],
+    mapping: &'a HashMap<String, String>,
+) -> Option<&'a str> {
+    let source_name = patches
+        .iter()
+        .find(|patch| patch.id == layer_name)
+        .map(|patch| patch.source_layer.as_str())
+        .unwrap_or(layer_name);
+    get_mapping_target(source_name, mapping)
+}
+
+fn filter_layer_order_for_target(
+    layer_order: &[String],
+    patches: &[LayerPatch],
+    mapping: &HashMap<String, String>,
+    target: &str,
+) -> Vec<String> {
+    layer_order
+        .iter()
+        .filter(|layer_name| layer_order_entry_target(layer_name, patches, mapping) == Some(target))
+        .cloned()
+        .collect()
+}
+
+fn ordered_layer_names_for_target(
+    slot_layers: &HashMap<String, DynamicImage>,
+    mapping: &HashMap<String, String>,
+    target: &str,
+    source_layer_order: &[String],
+) -> Vec<String> {
+    let mut names: Vec<String> = source_layer_order
+        .iter()
+        .rev()
+        .filter(|layer_name| {
+            slot_layers.contains_key(layer_name.as_str())
+                && get_mapping_target(layer_name, mapping) == Some(target)
+        })
+        .cloned()
+        .collect();
+    let mut missing: Vec<String> = slot_layers
+        .keys()
+        .filter(|layer_name| {
+            !names.contains(layer_name) && get_mapping_target(layer_name, mapping) == Some(target)
+        })
+        .cloned()
+        .collect();
+    missing.sort();
+    missing.extend(names);
+    names = missing;
+    names
+}
+
+fn compose_depth_gated_layers(
+    mut layers: Vec<(String, RgbaImage)>,
+    depth_maps: &HashMap<String, GrayImage>,
+    width: u32,
+    height: u32,
+) -> DynamicImage {
+    if layers.is_empty() {
+        return DynamicImage::new_rgba8(width, height);
+    }
+
+    let mut closest_depth = vec![u16::MAX; (width * height) as usize];
+    let mut source_alpha = vec![0u8; (width * height) as usize];
+    for (name, rgba) in &layers {
+        for y in 0..height {
+            for x in 0..width {
+                let index = (y * width + x) as usize;
+                source_alpha[index] = union_alpha(source_alpha[index], rgba.get_pixel(x, y)[3]);
+            }
+        }
+        let Some(depth) = depth_maps.get(name) else {
+            continue;
+        };
+        if depth.width() != width || depth.height() != height {
+            continue;
+        }
+        for y in 0..height {
+            for x in 0..width {
+                if rgba.get_pixel(x, y)[3] == 0 {
+                    continue;
+                }
+                let index = (y * width + x) as usize;
+                closest_depth[index] = closest_depth[index].min(depth.get_pixel(x, y)[0] as u16);
+            }
+        }
+    }
+
+    let tolerance = DEPTH_VISIBILITY_TOLERANCE as u16;
+    let mut result = RgbaImage::new(width, height);
+    for (name, rgba) in &mut layers {
+        if let Some(depth) = depth_maps.get(name) {
+            if depth.width() == width && depth.height() == height {
+                apply_feathered_depth_visibility(
+                    rgba,
+                    depth,
+                    &closest_depth,
+                    tolerance,
+                    width,
+                    height,
+                );
+            }
+        }
+        alpha_composite_onto(&mut result, rgba, width, height);
+    }
+    for y in 0..height {
+        for x in 0..width {
+            result.get_pixel_mut(x, y)[3] = source_alpha[(y * width + x) as usize];
+        }
+    }
+    DynamicImage::ImageRgba8(result)
+}
+
+fn union_alpha(background: u8, foreground: u8) -> u8 {
+    let background = background as u16;
+    let foreground = foreground as u16;
+    (foreground + ((background * (255 - foreground) + 127) / 255)).min(255) as u8
+}
+
+fn apply_feathered_depth_visibility(
+    rgba: &mut RgbaImage,
+    depth: &GrayImage,
+    closest_depth: &[u16],
+    tolerance: u16,
+    width: u32,
+    height: u32,
+) {
+    let mut visibility = GrayImage::from_pixel(width, height, image::Luma([255]));
+    let mut visible_pixels = 0u64;
+    let mut hidden_pixels = 0u64;
+
+    for y in 0..height {
+        for x in 0..width {
+            if rgba.get_pixel(x, y)[3] == 0 {
+                continue;
+            }
+            let index = (y * width + x) as usize;
+            let hidden = closest_depth[index] != u16::MAX
+                && depth.get_pixel(x, y)[0] as u16 > closest_depth[index].saturating_add(tolerance);
+            if hidden {
+                visibility.put_pixel(x, y, image::Luma([0]));
+                hidden_pixels += 1;
+            } else {
+                visible_pixels += 1;
+            }
+        }
+    }
+
+    if hidden_pixels == 0 {
+        return;
+    }
+    if visible_pixels == 0 {
+        for pixel in rgba.pixels_mut() {
+            pixel[3] = 0;
+        }
+        return;
+    }
+
+    let visibility = image::imageops::blur(&visibility, DEPTH_VISIBILITY_FEATHER_SIGMA);
+    for y in 0..height {
+        for x in 0..width {
+            let alpha = rgba.get_pixel(x, y)[3] as u16;
+            if alpha == 0 {
+                continue;
+            }
+            let mask = visibility.get_pixel(x, y)[0] as u16;
+            rgba.get_pixel_mut(x, y)[3] = ((alpha * mask + 127) / 255) as u8;
+        }
+    }
+}
+
+fn extract_original_target_pixels(
+    original: &DynamicImage,
+    target_mask: &DynamicImage,
+    slot_layers: &HashMap<String, DynamicImage>,
+    depth_maps: &HashMap<String, GrayImage>,
+    mapping: &HashMap<String, String>,
+    target: &str,
+    occluding_target: Option<&str>,
+    width: u32,
+    height: u32,
+) -> Option<DynamicImage> {
+    if original.width() != width
+        || original.height() != height
+        || target_mask.width() != width
+        || target_mask.height() != height
+    {
+        return None;
+    }
+
+    let original = original.to_rgba8();
+    let target_mask = target_mask.to_rgba8();
+    let target_depth =
+        closest_depth_for_target(slot_layers, depth_maps, mapping, target, width, height);
+    let occluding_depth = occluding_target.map(|occluder| {
+        closest_depth_for_target(slot_layers, depth_maps, mapping, occluder, width, height)
+    });
+    let strong_bounds = alpha_bounds_above(&target_mask, 8)?;
+    let padding = 24u32;
+    let min_x = strong_bounds.x.saturating_sub(padding);
+    let min_y = strong_bounds.y.saturating_sub(padding);
+    let max_x = (strong_bounds.x + strong_bounds.width + padding).min(width);
+    let max_y = (strong_bounds.y + strong_bounds.height + padding).min(height);
+    let tolerance = DEPTH_VISIBILITY_TOLERANCE as u16;
+    let mut result = RgbaImage::new(width, height);
+
+    for y in min_y..max_y {
+        for x in min_x..max_x {
+            let index = (y * width + x) as usize;
+            let mask_alpha = target_mask.get_pixel(x, y)[3];
+            if mask_alpha == 0 {
+                continue;
+            }
+            if let Some(occluding_depth) = occluding_depth.as_ref() {
+                if target_depth[index] != u16::MAX
+                    && occluding_depth[index] != u16::MAX
+                    && occluding_depth[index].saturating_add(tolerance) < target_depth[index]
+                {
+                    continue;
+                }
+            }
+            let mut pixel = *original.get_pixel(x, y);
+            pixel[3] = ((pixel[3] as u16 * mask_alpha as u16 + 127) / 255) as u8;
+            result.put_pixel(x, y, pixel);
+        }
+    }
+    Some(DynamicImage::ImageRgba8(result))
+}
+
+fn alpha_bounds_above(src: &RgbaImage, threshold: u8) -> Option<LayerBounds> {
+    let mut min_x = src.width();
+    let mut min_y = src.height();
+    let mut max_x = 0;
+    let mut max_y = 0;
+    let mut found = false;
+
+    for (x, y, pixel) in src.enumerate_pixels() {
+        if pixel[3] <= threshold {
+            continue;
+        }
+        found = true;
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+
+    found.then_some(LayerBounds {
+        x: min_x,
+        y: min_y,
+        width: max_x - min_x + 1,
+        height: max_y - min_y + 1,
+    })
+}
+
+fn saturated_alpha_pixel_count(image: &DynamicImage) -> u64 {
+    image
+        .to_rgba8()
+        .pixels()
+        .filter(|pixel| {
+            if pixel[3] <= 8 {
+                return false;
+            }
+            let max = pixel[0].max(pixel[1]).max(pixel[2]);
+            let min = pixel[0].min(pixel[1]).min(pixel[2]);
+            max.saturating_sub(min) > 32
+        })
+        .count() as u64
+}
+
+/// Preserve cross-category crossings without changing the three-part export
+/// contract. Body pixels that are locally closer than front hair are copied
+/// into the hair overlay, which is composited last at runtime.
+fn promote_body_foreground_over_hair(
+    body: &DynamicImage,
+    hair: &mut DynamicImage,
+    slot_layers: &HashMap<String, DynamicImage>,
+    depth_maps: &HashMap<String, GrayImage>,
+    mapping: &HashMap<String, String>,
+    width: u32,
+    height: u32,
+) -> u64 {
+    let body_depth =
+        closest_depth_for_target(slot_layers, depth_maps, mapping, "body", width, height);
+    let hair_depth =
+        closest_depth_for_target(slot_layers, depth_maps, mapping, "hair", width, height);
+    let body_rgba = body.to_rgba8();
+    let mut hair_rgba = hair.to_rgba8();
+    let mut foreground_mask = GrayImage::new(width, height);
+    let tolerance = DEPTH_VISIBILITY_TOLERANCE as u16;
+    let mut promoted_pixels = 0u64;
+
+    for y in 0..height {
+        for x in 0..width {
+            let index = (y * width + x) as usize;
+            if body_rgba.get_pixel(x, y)[3] == 0
+                || hair_rgba.get_pixel(x, y)[3] == 0
+                || body_depth[index] == u16::MAX
+                || hair_depth[index] == u16::MAX
+            {
+                continue;
+            }
+            if body_depth[index].saturating_add(tolerance) < hair_depth[index] {
+                foreground_mask.put_pixel(x, y, image::Luma([255]));
+                promoted_pixels += 1;
+            }
+        }
+    }
+
+    if promoted_pixels == 0 {
+        return 0;
+    }
+
+    let foreground_mask = image::imageops::blur(&foreground_mask, DEPTH_VISIBILITY_FEATHER_SIGMA);
+    let mut foreground = body_rgba;
+    for y in 0..height {
+        for x in 0..width {
+            let mask = foreground_mask.get_pixel(x, y)[0] as u16;
+            let pixel = foreground.get_pixel_mut(x, y);
+            pixel[3] = ((pixel[3] as u16 * mask + 127) / 255) as u8;
+        }
+    }
+    alpha_composite_onto(&mut hair_rgba, &foreground, width, height);
+    *hair = DynamicImage::ImageRgba8(hair_rgba);
+    promoted_pixels
+}
+
+fn closest_depth_for_target(
+    slot_layers: &HashMap<String, DynamicImage>,
+    depth_maps: &HashMap<String, GrayImage>,
     mapping: &HashMap<String, String>,
     target: &str,
     width: u32,
     height: u32,
-) -> Option<DynamicImage> {
-    let order: &[&str] = match target {
-        "body" => BODY_LAYER_ORDER,
-        "eye" => EYE_LAYER_ORDER,
-        _ => &[],
-    };
-
-    let mut ordered_layers: Vec<&DynamicImage> = Vec::new();
-    let mut added_names: Vec<String> = Vec::new();
-
-    // Add layers from predefined order (including L/R variants)
-    for &base_name in order {
-        if let Some(mapped_target) = get_mapping_target(base_name, mapping) {
-            if mapped_target == target {
-                let candidates = [
-                    base_name.to_string(),
-                    format!("{}-l", base_name), format!("{}-r", base_name),
-                    format!("{}_l", base_name), format!("{}_r", base_name),
-                ];
-                for candidate in &candidates {
-                    if let Some(img) = slot_layers.get(candidate.as_str()) {
-                        ordered_layers.push(img);
-                        added_names.push(candidate.clone());
-                    }
-                }
-            }
+) -> Vec<u16> {
+    let mut closest_depth = vec![u16::MAX; (width * height) as usize];
+    for (layer_name, layer) in slot_layers {
+        if get_mapping_target(layer_name, mapping) != Some(target) {
+            continue;
         }
-    }
-
-    // Add remaining layers mapped to this target
-    for (layer_name, img) in slot_layers {
-        if added_names.contains(layer_name) { continue; }
-        if let Some(mapped_target) = get_mapping_target(layer_name, mapping) {
-            if mapped_target == target {
-                ordered_layers.push(img);
-            }
+        let Some(depth) = depth_maps.get(layer_name) else {
+            continue;
+        };
+        if depth.width() != width || depth.height() != height {
+            continue;
         }
-    }
-
-    if ordered_layers.is_empty() { return None; }
-    if ordered_layers.len() == 1 { return Some(ordered_layers[0].clone()); }
-
-    let mut result = image::RgbaImage::new(width, height);
-    for layer in &ordered_layers {
         let rgba = layer.to_rgba8();
-        alpha_composite_onto(&mut result, &rgba, width, height);
+        if rgba.width() != width || rgba.height() != height {
+            continue;
+        }
+        for y in 0..height {
+            for x in 0..width {
+                if rgba.get_pixel(x, y)[3] == 0 {
+                    continue;
+                }
+                let index = (y * width + x) as usize;
+                closest_depth[index] = closest_depth[index].min(depth.get_pixel(x, y)[0] as u16);
+            }
+        }
     }
-    Some(DynamicImage::ImageRgba8(result))
+    closest_depth
+}
+
+fn append_missing_layer_names(
+    layer_names: &mut Vec<String>,
+    slot_layers: &HashMap<String, DynamicImage>,
+) {
+    let mut missing: Vec<String> = slot_layers
+        .keys()
+        .filter(|name| !layer_names.contains(name))
+        .cloned()
+        .collect();
+    missing.sort();
+    layer_names.extend(missing);
 }
 
 fn alpha_composite_onto(
@@ -1653,12 +2572,16 @@ fn alpha_composite_onto(
                     let r = (sp[0] as f32 * sa + dp[0] as f32 * da * (1.0 - sa)) / out_a;
                     let g = (sp[1] as f32 * sa + dp[1] as f32 * da * (1.0 - sa)) / out_a;
                     let b = (sp[2] as f32 * sa + dp[2] as f32 * da * (1.0 - sa)) / out_a;
-                    dst.put_pixel(x, y, image::Rgba([
-                        r.clamp(0.0, 255.0) as u8,
-                        g.clamp(0.0, 255.0) as u8,
-                        b.clamp(0.0, 255.0) as u8,
-                        (out_a * 255.0).clamp(0.0, 255.0) as u8,
-                    ]));
+                    dst.put_pixel(
+                        x,
+                        y,
+                        image::Rgba([
+                            r.clamp(0.0, 255.0) as u8,
+                            g.clamp(0.0, 255.0) as u8,
+                            b.clamp(0.0, 255.0) as u8,
+                            (out_a * 255.0).clamp(0.0, 255.0) as u8,
+                        ]),
+                    );
                 }
             }
         }
@@ -1691,7 +2614,11 @@ fn decode_mask_png(data_uri: &str, width: u32, height: u32) -> Result<image::Gra
     Ok(mask)
 }
 
-fn apply_mask_to_rgba(src: &image::RgbaImage, mask: &image::GrayImage, invert: bool) -> image::RgbaImage {
+fn apply_mask_to_rgba(
+    src: &image::RgbaImage,
+    mask: &image::GrayImage,
+    invert: bool,
+) -> image::RgbaImage {
     let mut out = src.clone();
     for (x, y, pixel) in out.enumerate_pixels_mut() {
         let m = mask.get_pixel(x, y)[0] as u16;
@@ -1776,5 +2703,275 @@ fn generate_composite_preview(
         alpha_composite_onto(&mut result, &img.to_rgba8(), width, height);
     }
     let composite = DynamicImage::ImageRgba8(result);
-    image_utils::image_to_base64_jpeg(&composite, 80)
+    image_utils::image_to_base64_png(&composite)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn solid(r: u8, g: u8, b: u8) -> DynamicImage {
+        DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([r, g, b, 255]),
+        ))
+    }
+
+    #[test]
+    fn target_merge_preserves_psd_back_to_front_order() {
+        let layers = HashMap::from([
+            ("face".to_string(), solid(255, 0, 0)),
+            ("neck".to_string(), solid(0, 0, 255)),
+        ]);
+        let mapping = HashMap::from([
+            ("face".to_string(), "body".to_string()),
+            ("neck".to_string(), "body".to_string()),
+        ]);
+        let source_order = vec!["neck".to_string(), "face".to_string()];
+
+        let merged = merge_layers_for_target(
+            &layers,
+            &HashMap::new(),
+            &mapping,
+            "body",
+            &source_order,
+            1,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(merged.to_rgba8().get_pixel(0, 0).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn category_names_are_front_first_for_ui() {
+        let layers = HashMap::from([
+            ("face".to_string(), solid(255, 0, 0)),
+            ("neck".to_string(), solid(0, 0, 255)),
+        ]);
+        let mapping = HashMap::from([
+            ("face".to_string(), "body".to_string()),
+            ("neck".to_string(), "body".to_string()),
+        ]);
+        let source_order = vec!["neck".to_string(), "face".to_string()];
+
+        assert_eq!(
+            ordered_layer_names_for_target(&layers, &mapping, "body", &source_order),
+            vec!["face".to_string(), "neck".to_string()]
+        );
+    }
+
+    #[test]
+    fn custom_body_order_keeps_core_face_parts_without_restoring_neck() {
+        let layers = HashMap::from([
+            ("face".to_string(), solid(255, 0, 0)),
+            ("nose".to_string(), solid(0, 255, 0)),
+            ("neck".to_string(), solid(0, 0, 255)),
+            ("topwear".to_string(), solid(255, 255, 0)),
+        ]);
+        let mapping = HashMap::from([
+            ("face".to_string(), "body".to_string()),
+            ("nose".to_string(), "body".to_string()),
+            ("neck".to_string(), "body".to_string()),
+            ("topwear".to_string(), "body".to_string()),
+        ]);
+        let source_order = vec![
+            "neck".to_string(),
+            "face".to_string(),
+            "nose".to_string(),
+            "topwear".to_string(),
+        ];
+
+        let order = ensure_core_body_layers_for_custom_order(
+            &["topwear".to_string()],
+            &layers,
+            &mapping,
+            &source_order,
+        );
+
+        assert_eq!(
+            order,
+            vec![
+                "nose".to_string(),
+                "face".to_string(),
+                "topwear".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn unified_layer_order_is_split_by_mapping_and_patch_source() {
+        let mapping = HashMap::from([
+            ("face".to_string(), "body".to_string()),
+            ("neck".to_string(), "body".to_string()),
+            ("front_hair".to_string(), "hair".to_string()),
+            ("back_hair".to_string(), "hair_back".to_string()),
+        ]);
+        let patches = vec![LayerPatch {
+            id: "neck_patch_1".to_string(),
+            source_layer: "neck".to_string(),
+            mask_png: String::new(),
+            cut_source: true,
+        }];
+        let order = vec![
+            "front_hair".to_string(),
+            "neck_patch_1".to_string(),
+            "neck".to_string(),
+            "face".to_string(),
+            "back_hair".to_string(),
+        ];
+
+        assert_eq!(
+            filter_layer_order_for_target(&order, &patches, &mapping, "body"),
+            vec![
+                "neck_patch_1".to_string(),
+                "neck".to_string(),
+                "face".to_string()
+            ]
+        );
+        assert_eq!(
+            filter_layer_order_for_target(&order, &patches, &mapping, "hair"),
+            vec!["front_hair".to_string()]
+        );
+        assert_eq!(
+            filter_layer_order_for_target(&order, &patches, &mapping, "hair_back"),
+            vec!["back_hair".to_string()]
+        );
+    }
+
+    #[test]
+    fn local_depth_masks_crossing_layers_per_pixel() {
+        let layers = vec![
+            (
+                "back".to_string(),
+                RgbaImage::from_pixel(9, 1, image::Rgba([0, 0, 255, 255])),
+            ),
+            (
+                "front".to_string(),
+                RgbaImage::from_pixel(9, 1, image::Rgba([255, 0, 0, 255])),
+            ),
+        ];
+        let depth_maps = HashMap::from([
+            (
+                "back".to_string(),
+                GrayImage::from_raw(9, 1, vec![10, 10, 10, 10, 20, 20, 20, 20, 20]).unwrap(),
+            ),
+            (
+                "front".to_string(),
+                GrayImage::from_raw(9, 1, vec![20, 20, 20, 20, 10, 10, 10, 10, 10]).unwrap(),
+            ),
+        ]);
+
+        let merged = compose_depth_gated_layers(layers, &depth_maps, 9, 1).to_rgba8();
+
+        assert_eq!(merged.get_pixel(0, 0).0, [0, 0, 255, 255]);
+        assert_eq!(merged.get_pixel(8, 0).0, [255, 0, 0, 255]);
+        assert_eq!(merged.get_pixel(3, 0)[3], 255);
+        assert_eq!(merged.get_pixel(4, 0)[3], 255);
+        assert!(merged.get_pixel(3, 0)[0] > 0);
+        assert!(merged.get_pixel(4, 0)[2] > 0);
+    }
+
+    #[test]
+    fn body_pixels_closer_than_hair_are_promoted_into_hair_overlay() {
+        let width = 9;
+        let body = DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+            width,
+            1,
+            image::Rgba([255, 0, 0, 255]),
+        ));
+        let mut hair = DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+            width,
+            1,
+            image::Rgba([0, 0, 255, 255]),
+        ));
+        let layers = HashMap::from([
+            ("handwear-r".to_string(), body.clone()),
+            ("front_hair".to_string(), hair.clone()),
+        ]);
+        let mapping = HashMap::from([
+            ("handwear".to_string(), "body".to_string()),
+            ("front_hair".to_string(), "hair".to_string()),
+        ]);
+        let depths = HashMap::from([
+            (
+                "handwear-r".to_string(),
+                GrayImage::from_raw(width, 1, vec![10, 10, 10, 10, 20, 20, 20, 20, 20]).unwrap(),
+            ),
+            (
+                "front_hair".to_string(),
+                GrayImage::from_raw(width, 1, vec![20, 20, 20, 20, 10, 10, 10, 10, 10]).unwrap(),
+            ),
+        ]);
+
+        let promoted = promote_body_foreground_over_hair(
+            &body, &mut hair, &layers, &depths, &mapping, width, 1,
+        );
+        let hair = hair.to_rgba8();
+
+        assert_eq!(promoted, 4);
+        assert_eq!(hair.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(hair.get_pixel(8, 0).0, [0, 0, 255, 255]);
+        assert!(hair.get_pixel(3, 0)[0] > 0);
+        assert!(hair.get_pixel(4, 0)[2] > 0);
+    }
+
+    #[test]
+    fn original_eye_pixels_exclude_hair_that_is_locally_in_front() {
+        let width = 3;
+        let original = DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+            width,
+            1,
+            image::Rgba([10, 200, 240, 255]),
+        ));
+        let eye_mask = DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+            width,
+            1,
+            image::Rgba([255, 255, 255, 255]),
+        ));
+        let layers = HashMap::from([
+            ("eyewhite".to_string(), eye_mask.clone()),
+            (
+                "front_hair".to_string(),
+                DynamicImage::ImageRgba8(RgbaImage::from_pixel(
+                    width,
+                    1,
+                    image::Rgba([20, 20, 30, 255]),
+                )),
+            ),
+        ]);
+        let mapping = HashMap::from([
+            ("eyewhite".to_string(), "eye".to_string()),
+            ("front_hair".to_string(), "hair".to_string()),
+        ]);
+        let depths = HashMap::from([
+            (
+                "eyewhite".to_string(),
+                GrayImage::from_raw(width, 1, vec![10, 20, 10]).unwrap(),
+            ),
+            (
+                "front_hair".to_string(),
+                GrayImage::from_raw(width, 1, vec![20, 10, 20]).unwrap(),
+            ),
+        ]);
+
+        let exact_eye = extract_original_target_pixels(
+            &original,
+            &eye_mask,
+            &layers,
+            &depths,
+            &mapping,
+            "eye",
+            Some("hair"),
+            width,
+            1,
+        )
+        .unwrap()
+        .to_rgba8();
+
+        assert_eq!(exact_eye.get_pixel(0, 0).0, [10, 200, 240, 255]);
+        assert_eq!(exact_eye.get_pixel(1, 0)[3], 0);
+        assert_eq!(exact_eye.get_pixel(2, 0).0, [10, 200, 240, 255]);
+    }
 }

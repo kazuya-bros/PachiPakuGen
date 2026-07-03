@@ -27,10 +27,178 @@ type PreviewPan = { x: number; y: number };
 type DiffPreview = { pairName: string; label: string; frames: string[] };
 type InterpStep = 1 | 2 | 3 | 4;
 type BaseStep = 1 | 2 | 3 | 4;
+type WorkspaceStep = 1 | 2 | 3 | 4 | 5 | 6;
+type SeeThroughProfile = "low-vram" | "standard";
+type SeeThroughOptionMode = "default" | "on" | "off";
 
-// Each RIFE pair: closed PSD ↔ open PSD (open = base)
+interface SeeThroughOptions {
+  seed: number;
+  resolution: number;
+  resolutionDepth: number;
+  inferenceSteps: number;
+  inferenceStepsDepth: number;
+  groupOffload: SeeThroughOptionMode;
+  cpuOffload: SeeThroughOptionMode;
+}
+
+const DEFAULT_SEE_THROUGH_OPTIONS: SeeThroughOptions = {
+  seed: 42,
+  resolution: 1280,
+  resolutionDepth: 768,
+  inferenceSteps: 30,
+  inferenceStepsDepth: -1,
+  groupOffload: "default",
+  cpuOffload: "default",
+};
+
+const RIFE_FRAME_MIN = 2;
+const RIFE_FRAME_MAX = 16;
+const RIFE_FRAME_RECOMMENDED = "4〜8";
+
+interface SeeThroughRuntimeStatus {
+  ready: boolean;
+  busy: boolean;
+  runtimeRoot: string;
+  repoPath: string;
+  pythonPath: string;
+  pinnedCommit: string;
+  installedCommit: string | null;
+  gpuIndex: number | null;
+  gpuName: string | null;
+  gpuMemoryMb: number | null;
+  recommendedProfile: string;
+  message: string;
+}
+interface SeeThroughProgress { stage: string; percent: number; message: string; }
+interface SeeThroughRunResult {
+  psdPath: string;
+  outputDir: string;
+  selectedProfile: string;
+  slotLoad: SlotLoadResult;
+  mappingPreview: MappingPreviewResult;
+}
+interface WorkspaceProject {
+  version: number;
+  createdAt: number;
+  updatedAt: number;
+  currentStep: number;
+  sourceImagePath: string | null;
+  referenceImagePath: string | null;
+}
+interface ExpressionWorkspaceResult {
+  workPath: string;
+  projectPath: string;
+  codexRequestPath: string;
+  generatedPartsPath: string;
+  seeThroughPath: string;
+  spritalkPartsPath: string;
+  project: WorkspaceProject;
+}
+interface WorkspaceGeneratedPartsStatus {
+  requestPath: string;
+  handoffPath: string;
+  generatedPartsPath: string;
+  expectedParts: string[];
+  presentParts: string[];
+  missingParts: string[];
+  sizeMismatches: string[];
+  ready: boolean;
+}
+interface ExtractCodexGeneratedPartsResult {
+  extractedPartsPath: string;
+  extractedParts: string[];
+  warnings: string[];
+}
+
+function isNoisySeeThroughWarning(message: string): boolean {
+  return message.includes("HF_TOKEN")
+    || message.includes("unauthenticated requests to the HF Hub")
+    || message.includes("local_dir_use_symlinks");
+}
+
+function displaySeeThroughMessage(progress: SeeThroughProgress | null): string {
+  if (!progress) return "See-Throughを実行しています";
+  if (isNoisySeeThroughWarning(progress.message)) {
+    return progress.stage === "inference" ? "モデル取得または分解処理を継続しています" : "See-Through処理を継続しています";
+  }
+  if (progress.message.trim()) return progress.message;
+  return "See-Through処理を継続しています";
+}
+
+function formatElapsed(seconds: number): string {
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return minutes > 0 ? `${minutes}分${rest.toString().padStart(2, "0")}秒` : `${rest}秒`;
+}
+interface CodexCompositePreviewItem {
+  part: string;
+  preview: string;
+}
+interface PreviewCodexCompositeResult {
+  basePreview: string;
+  previews: CodexCompositePreviewItem[];
+}
+interface CodexRifeFramePreviewItem {
+  part: string;
+  frameIndex: number;
+  frameCount: number;
+  preview: string;
+}
+interface PreviewCodexRifeResult {
+  basePreview: string;
+  previews: CodexRifeFramePreviewItem[];
+}
+type WorkspacePreviewItem = CodexCompositePreviewItem | CodexRifeFramePreviewItem;
+
+function isRifePreviewItem(item: WorkspacePreviewItem): item is CodexRifeFramePreviewItem {
+  return "frameIndex" in item;
+}
+
+function workspacePreviewItemKey(item: WorkspacePreviewItem): string {
+  return isRifePreviewItem(item) ? `${item.part}:${item.frameIndex}` : item.part;
+}
+
+function workspacePreviewItemLabel(item: WorkspacePreviewItem): string {
+  return isRifePreviewItem(item) ? `${item.part} ${item.frameIndex}/${item.frameCount}` : item.part;
+}
+
+interface GenerateCodexRifeOutputResult {
+  outputPath: string;
+  directories: string[];
+  frameCount: number;
+}
+interface SaveCodexBasePartsResult {
+  basePartsPath: string;
+  savedParts: string[];
+}
+interface AdjustCodexExtractedPartsResult {
+  extractedPartsPath: string;
+  adjustedParts: string[];
+  offsetX: number;
+  offsetY: number;
+  scalePercent: number;
+}
+interface PrepareCodexExpressionJobResult {
+  jobPath: string;
+  sourcePath: string;
+  referencePath: string | null;
+  requestPath: string;
+  handoffPath: string;
+  generatedPartsPath: string;
+  expectedParts: string[];
+  missingParts: string[];
+}
+interface LoadCodexExpressionJobResult {
+  job: PrepareCodexExpressionJobResult;
+  generatedParts: WorkspaceGeneratedPartsStatus;
+  extractedParts: ExtractCodexGeneratedPartsResult | null;
+  rifeOutput: GenerateCodexRifeOutputResult | null;
+  resumeStep: number;
+}
+
+// Each RIFE pair: closed PSD -> open PSD (open = base)
 const EYE_PAIRS = [
-  { name: "eye", label: "まばたき（目）",
+  { name: "eye", label: "まばたき(目)",
     closed: { key: "eye_closed", label: "閉じる" },
     open: { key: "eye_open", label: "開く" },
     required: true },
@@ -44,37 +212,72 @@ const MOUTH_PAIRS_SINGLE = [
 ];
 
 const MOUTH_PAIRS_VOWELS = [
-  { name: "mouth_a", label: "口パク（あ）",
+  { name: "mouth_a", label: "口パク(あ)",
     closed: { key: "mouth_a_closed", label: "閉じる" },
     open: { key: "mouth_a_open", label: "開く" },
     required: false },
-  { name: "mouth_i", label: "口パク（い）",
+  { name: "mouth_i", label: "口パク(い)",
     closed: { key: "mouth_i_closed", label: "閉じる" },
     open: { key: "mouth_i_open", label: "開く" },
     required: false },
-  { name: "mouth_u", label: "口パク（う）",
+  { name: "mouth_u", label: "口パク(う)",
     closed: { key: "mouth_u_closed", label: "閉じる" },
     open: { key: "mouth_u_open", label: "開く" },
     required: false },
-  { name: "mouth_e", label: "口パク（え）",
+  { name: "mouth_e", label: "口パク(え)",
     closed: { key: "mouth_e_closed", label: "閉じる" },
     open: { key: "mouth_e_open", label: "開く" },
     required: false },
-  { name: "mouth_o", label: "口パク（お）",
+  { name: "mouth_o", label: "口パク(お)",
     closed: { key: "mouth_o_closed", label: "閉じる" },
     open: { key: "mouth_o_open", label: "開く" },
     required: false },
 ];
 
-type Mode = "select" | "base_input" | "hair_edit" | "base_edit" | "correction" | "interp";
+type Mode = "select" | "workspace" | "base_input" | "hair_edit" | "base_edit" | "correction" | "interp";
+type ThemeMode = "dark" | "light";
 
 function App() {
   const [mode, setMode] = useState<Mode>("select");
+  const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
+    if (typeof window === "undefined") return "dark";
+    return window.localStorage.getItem("pachipakugen-theme") === "light" ? "light" : "dark";
+  });
 
   // Shared
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [status, setStatus] = useState("モードを選択してください");
+
+  const [workspaceStep, setWorkspaceStep] = useState<WorkspaceStep>(1);
+  const [expressionWorkspace, setExpressionWorkspace] = useState<ExpressionWorkspaceResult | null>(null);
+  const [workspaceFiles, setWorkspaceFiles] = useState<Record<string, string>>({});
+  const [workspaceImagePreviews, setWorkspaceImagePreviews] = useState<Record<string, string>>({});
+  const [workspaceGeneratedStatus, setWorkspaceGeneratedStatus] = useState<WorkspaceGeneratedPartsStatus | null>(null);
+  const [workspaceExtractResult, setWorkspaceExtractResult] = useState<ExtractCodexGeneratedPartsResult | null>(null);
+  const [workspaceCompositePreview, setWorkspaceCompositePreview] = useState<PreviewCodexCompositeResult | null>(null);
+  const [workspaceRifePreview, setWorkspaceRifePreview] = useState<PreviewCodexRifeResult | null>(null);
+  const [workspaceSelectedPreviewPart, setWorkspaceSelectedPreviewPart] = useState<string>("base");
+  const [workspacePreviewZoom, setWorkspacePreviewZoom] = useState(1);
+  const [workspacePreviewPan, setWorkspacePreviewPan] = useState<PreviewPan>({ x: 0, y: 0 });
+  const [workspacePreviewDragging, setWorkspacePreviewDragging] = useState(false);
+  const workspacePreviewDrag = useRef<{ pointerId: number; startX: number; startY: number; startPan: PreviewPan } | null>(null);
+  const [workspaceRifeResult, setWorkspaceRifeResult] = useState<GenerateCodexRifeOutputResult | null>(null);
+  const [workspaceBusy, setWorkspaceBusy] = useState(false);
+  const [seeThroughRuntime, setSeeThroughRuntime] = useState<SeeThroughRuntimeStatus | null>(null);
+  const [seeThroughProgress, setSeeThroughProgress] = useState<SeeThroughProgress | null>(null);
+  const [seeThroughStartedAt, setSeeThroughStartedAt] = useState<number | null>(null);
+  const [seeThroughElapsedSeconds, setSeeThroughElapsedSeconds] = useState(0);
+  const [seeThroughProfile, setSeeThroughProfile] = useState<SeeThroughProfile>("low-vram");
+  const [seeThroughSplitParts, setSeeThroughSplitParts] = useState(true);
+  const [seeThroughOptions, setSeeThroughOptions] = useState<SeeThroughOptions>(DEFAULT_SEE_THROUGH_OPTIONS);
+  const [workspacePartOffsetX, setWorkspacePartOffsetX] = useState(0);
+  const [workspacePartOffsetY, setWorkspacePartOffsetY] = useState(0);
+  const [workspacePartScale, setWorkspacePartScale] = useState(100);
+
+  useEffect(() => {
+    window.localStorage.setItem("pachipakugen-theme", themeMode);
+  }, [themeMode]);
 
   // === Input (shared) ===
   const [loadResult, setLoadResult] = useState<SlotLoadResult | null>(null);
@@ -106,7 +309,7 @@ function App() {
   const [brushCursor, setBrushCursor] = useState<{ x: number; y: number; size: number; visible: boolean }>({ x: 0, y: 0, size: 0, visible: false });
 
   // === フレーム補間モード (interp) ===
-  const [diffTarget, setDiffTarget] = useState<"eye" | "mouth">("eye");
+  const [diffTarget] = useState<"eye" | "mouth">("eye");
   const [frameCount, setFrameCount] = useState(8);
   const [outputPath, setOutputPath] = useState("");
   const [progress, setProgress] = useState({ current: 0, total: 0, pair_name: "" });
@@ -118,7 +321,7 @@ function App() {
   const [interpOriginals, setInterpOriginals] = useState<Record<string, string>>({});
   const [interpGenerating, setInterpGenerating] = useState(false);
   const [interpStep, setInterpStep] = useState<InterpStep>(1);
-  const [mouthMode, setMouthMode] = useState<"single" | "vowels">("single");
+  const [mouthMode] = useState<"single" | "vowels">("single");
   const [mouthMaskSettings, setMouthMaskSettings] = useState<Record<string, MouthMaskSetting>>({});
   const [mouthMaskPreviews, setMouthMaskPreviews] = useState<Record<string, string>>({});
   const [mouthMaskPreviewing, setMouthMaskPreviewing] = useState<Record<string, boolean>>({});
@@ -141,7 +344,7 @@ function App() {
   const layerOpacitiesRef = useRef(layerOpacities);
   layerOpacitiesRef.current = layerOpacities;
   const opacityRenderTimer = useRef<number | null>(null);
-  // Drag reorder (generic — used for body, hair, hair_back)
+  // Drag reorder (generic - used for body, hair, hair_back)
   type DragTarget = "body" | "hair" | "hair_back";
   const dragState = useRef<{ target: DragTarget; idx: number; startY: number; currentIdx: number } | null>(null);
   const [draggedIdx, setDraggedIdx] = useState<number | null>(null);
@@ -157,8 +360,15 @@ function App() {
     const unlisten = listen<ProgressPayload>("generation-progress", (event) => {
       setProgress({ current: event.payload.current, total: event.payload.total, pair_name: event.payload.pair_name });
     });
+    const unlistenSeeThrough = listen<SeeThroughProgress>("see-through-progress", (event) => {
+      setSeeThroughProgress(event.payload);
+      if (!isNoisySeeThroughWarning(event.payload.message)) {
+        setStatus(event.payload.message);
+      }
+    });
     return () => {
       unlisten.then(fn => fn());
+      unlistenSeeThrough.then(fn => fn());
       if (opacityRenderTimer.current !== null) {
         window.clearTimeout(opacityRenderTimer.current);
       }
@@ -167,6 +377,19 @@ function App() {
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (!workspaceBusy || !seeThroughStartedAt) {
+      setSeeThroughElapsedSeconds(0);
+      return;
+    }
+    const updateElapsed = () => {
+      setSeeThroughElapsedSeconds(Math.max(0, Math.floor((Date.now() - seeThroughStartedAt) / 1000)));
+    };
+    updateElapsed();
+    const timer = window.setInterval(updateElapsed, 1000);
+    return () => window.clearInterval(timer);
+  }, [workspaceBusy, seeThroughStartedAt]);
 
   useEffect(() => {
     if (diffPreviews.length === 0) return;
@@ -336,6 +559,56 @@ function App() {
   function handleMouseMove(e: React.MouseEvent) { if (isPanning) setPan({ x: e.clientX - panStart.current.x, y: e.clientY - panStart.current.y }); }
   function handleMouseUp() { setIsPanning(false); }
   function resetZoom() { setZoom(1); setPan({ x: 0, y: 0 }); }
+  function resetWorkspacePreviewZoom() {
+    setWorkspacePreviewZoom(1);
+    setWorkspacePreviewPan({ x: 0, y: 0 });
+  }
+  function handleWorkspacePreviewWheel(e: React.WheelEvent) {
+    e.preventDefault();
+    setWorkspacePreviewZoom(prev => Math.max(0.25, Math.min(8, prev * (e.deltaY > 0 ? 0.9 : 1.1))));
+  }
+  function handleWorkspacePreviewPointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (!e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.setPointerCapture(e.pointerId);
+    }
+    workspacePreviewDrag.current = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      startPan: workspacePreviewPan,
+    };
+    setWorkspacePreviewDragging(true);
+  }
+  function handleWorkspacePreviewPointerMove(e: React.PointerEvent<HTMLDivElement>) {
+    const drag = workspacePreviewDrag.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setWorkspacePreviewPan({
+      x: drag.startPan.x + e.clientX - drag.startX,
+      y: drag.startPan.y + e.clientY - drag.startY,
+    });
+  }
+  function handleWorkspacePreviewPointerUp(e: React.PointerEvent<HTMLDivElement>) {
+    const drag = workspacePreviewDrag.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    workspacePreviewDrag.current = null;
+    setWorkspacePreviewDragging(false);
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+  }
+  function handleWorkspacePreviewLostPointerCapture(e: React.PointerEvent<HTMLDivElement>) {
+    const drag = workspacePreviewDrag.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    workspacePreviewDrag.current = null;
+    setWorkspacePreviewDragging(false);
+  }
 
   // === Step 1: Input ===
   async function loadPsd() {
@@ -361,28 +634,105 @@ function App() {
     try {
       const preview = await invoke<MappingPreviewResult>("get_mapping_preview", { mappingJson: JSON.stringify(layerMapping) });
       setMappingPreview(preview);
-      // Init hair layers
-      const hairCat = preview.categories.find(c => c.target === "hair");
-      if (hairCat) {
-        const order = hairCat.layers.map(l => l.name);
-        setHairLayerOrder(order);
-        const en: Record<string, boolean> = {};
-        for (const l of hairCat.layers) en[l.name] = true;
-        setHairEnabledLayers(en);
-        await renderHair(order, en);
-      }
-      const hairBackCat = preview.categories.find(c => c.target === "hair_back");
-      if (hairBackCat) {
-        const order = hairBackCat.layers.map(l => l.name);
-        setHairBackLayerOrder(order);
-        const en: Record<string, boolean> = {};
-        for (const l of hairBackCat.layers) en[l.name] = true;
-        setHairBackEnabledLayers(en);
-        await renderHairBack(order, en);
-      }
-      resetZoom(); setBaseStep(2); setMode("hair_edit"); setStatus("Step 2/4: Hairレイヤーを確認");
+      await openHairEditorWithPreview(preview);
     } catch (e) { setError(String(e)); }
     finally { setLoading(false); }
+  }
+
+  async function openHairEditorWithPreview(preview: MappingPreviewResult) {
+    const hairCat = preview.categories.find(c => c.target === "hair");
+    if (hairCat) {
+      const order = hairCat.layers.map(l => l.name);
+      setHairLayerOrder(order);
+      const en: Record<string, boolean> = {};
+      for (const l of hairCat.layers) en[l.name] = true;
+      setHairEnabledLayers(en);
+      await renderHair(order, en);
+    }
+    const hairBackCat = preview.categories.find(c => c.target === "hair_back");
+    if (hairBackCat) {
+      const order = hairBackCat.layers.map(l => l.name);
+      setHairBackLayerOrder(order);
+      const en: Record<string, boolean> = {};
+      for (const l of hairBackCat.layers) en[l.name] = true;
+      setHairBackEnabledLayers(en);
+      await renderHairBack(order, en);
+    }
+    resetZoom(); setBaseStep(2); setMode("hair_edit"); setStatus("Step 2/4: Hairレイヤーを確認");
+  }
+
+  async function openUnifiedBaseEditorWithPreview(preview: MappingPreviewResult) {
+    const freeCat = preview.categories.find(c => c.target === "free");
+    const layers = freeCat?.layers ?? preview.categories.flatMap(c => c.layers);
+    const seen = new Set<string>();
+    const order = recommendedUnifiedLayerOrder(layers
+      .map(layer => layer.name)
+      .filter(name => {
+        if (seen.has(name)) return false;
+        seen.add(name);
+        return true;
+      }));
+    const enabled: Record<string, boolean> = {};
+    for (const name of order) enabled[name] = true;
+    const opacities = createDefaultOpacities(order);
+    setLayerOrder(order);
+    setLayerPatches([]);
+    setPatchDraftSource("");
+    setSelectedBodyLayer(order[0] ?? "");
+    setEnabledLayers(enabled);
+    setLayerOpacities(opacities);
+    await renderBody(order, enabled, [], opacities);
+    resetZoom();
+    setBaseStep(3);
+    setMode("base_edit");
+    setStatus("Step 4: 全レイヤーを元の順序で調整");
+  }
+
+  function baseLayerName(name: string) {
+    return name
+      .toLowerCase()
+      .replace(/\s+/g, "_")
+      .replace(/[-_](l|r)$/u, "");
+  }
+
+  function recommendedLayerPriority(name: string) {
+    const base = baseLayerName(name);
+    if (base === "front_hair") return 10;
+    if (base === "headwear" || base === "earwear" || base === "eyewear") return 20;
+    if (base === "eyebrow") return 30;
+    if (base === "eyelash") return 35;
+    if (base === "irides") return 40;
+    if (base === "eyewhite") return 45;
+    if (base === "mouth") return 50;
+    if (base === "nose") return 55;
+    if (base === "face") return 60;
+    if (base === "neckwear") return 65;
+    if (base === "topwear" || base === "handwear" || base === "objects") return 70;
+    if (base === "bottomwear" || base === "legwear" || base === "footwear") return 75;
+    if (base === "ears" || base === "wings" || base === "tail") return 78;
+    if (base === "neck") return 80;
+    if (base === "back_hair") return 90;
+    return 85;
+  }
+
+  function recommendedUnifiedLayerOrder(order: string[]) {
+    return order
+      .map((name, index) => ({ name, index, priority: recommendedLayerPriority(name) }))
+      .sort((a, b) => a.priority - b.priority || a.index - b.index)
+      .map(item => item.name);
+  }
+
+  async function applyRecommendedLayerOrder() {
+    const nextOrder = [...layerOrderRef.current]
+      .map((name, index) => {
+        const patch = layerPatchesRef.current.find(item => item.id === name);
+        const sourceName = patch?.sourceLayer ?? name;
+        return { name, index, priority: recommendedLayerPriority(sourceName) };
+      })
+      .sort((a, b) => a.priority - b.priority || a.index - b.index)
+      .map(item => item.name);
+    setLayerOrder(nextOrder);
+    await renderBody(nextOrder, enabledLayers, layerPatchesRef.current, layerOpacitiesRef.current);
   }
 
   async function proceedToBodyEdit() {
@@ -401,22 +751,6 @@ function App() {
       await renderBody(order, en, [], opacities);
     }
     resetZoom(); setBaseStep(3); setMode("base_edit"); setStatus("Step 3/4: Bodyレイヤーを調整して出力");
-  }
-
-  function startCorrectionMode() {
-    setMode("correction");
-    setLoadResult(null);
-    setMappingPreview(null);
-    setBodyPreview("");
-    setLayerOrder([]);
-    setEnabledLayers({});
-    setLayerPatches([]);
-    setLayerOpacities({});
-    setSelectedBodyLayer("");
-    setPatchDraftSource("");
-    setCorrectionOutputPath("");
-    resetZoom();
-    setStatus("See-Through補正用のPSDを読み込んでください");
   }
 
   async function loadCorrectionPsd() {
@@ -518,31 +852,42 @@ function App() {
     finally { setLoading(false); }
   }
 
-  function proceedToInterp(target: "eye" | "mouth", selectedMouthMode: "single" | "vowels" = "single") {
-    setDiffTarget(target);
-    setInterpPaths({});
-    setInterpOriginals({});
-    setMouthMaskSettings({});
-    setMouthMaskPreviews({});
-    setMouthMaskPreviewing({});
-    setMouthPreviewZooms({});
-    setMouthPreviewPans({});
-    setCompletedDiffs([]);
-    setDiffPreviews([]);
-    setDiffPreviewTick(0);
-    setDiffPreviewZoom(1);
-    setOutputPath("");
-    setProgress({ current: 0, total: 0, pair_name: "" });
-    setActivePreviewKey("");
-    setInterpStep(1);
-    if (target === "mouth") setMouthMode(selectedMouthMode);
-    setMode("interp");
-    setStatus(target === "mouth" ? "差分PSD+元画像を設定してください" : "差分PSDを設定してください");
-  }
-
-  // === Step 3A: base_edit — create base ===
+  // === Step 3A: base_edit - create base ===
   async function handleCreateBase() {
     setError("");
+    const workspacePath = expressionWorkspace?.workPath ?? "";
+    if (workspacePath) {
+      setLoading(true);
+      setStatus("素体を作成しています...");
+      try {
+        const activeOrder = layerOrder.filter(name => enabledLayers[name] !== false);
+        const result = await invoke<CreateBaseResult>("create_base", {
+          mappingJson: JSON.stringify(layerMapping),
+          originalImagePath: "",
+          baseEyeSlot: "eye_open",
+          baseMouthSlot: "mouth_closed",
+          bodyLayerOrder: activeOrder,
+          bodyLayerPatches: layerPatches,
+          hairLayerOrder: [] as string[],
+          hairBackLayerOrder: [] as string[],
+          outputPath: "",
+        });
+        await invoke<SaveCodexBasePartsResult>("save_codex_base_parts", {
+          jobPath: workspacePath,
+        });
+        await refreshWorkspaceCompositePreview().catch(() => null);
+        setBaseResult(result);
+        setBaseStep(4);
+        await setWorkspaceStepAndPersist(5);
+        setMode("workspace");
+        setStatus("素体を作業フォルダに保存しました。差分位置調整へ進めます。");
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setLoading(false);
+      }
+      return;
+    }
     const dir = await open({ multiple: false, directory: true, title: "素体の出力先フォルダを選択" });
     if (!dir) return;
     setLoading(true); setStatus("素体を作成中...");
@@ -806,7 +1151,7 @@ function App() {
 
         const pairDiffType = pair.name.startsWith("mouth") ? "mouth" : "eye";
 
-        // Load original image for SAM3 mouth extraction (use "open" original — open mouth is easier to detect)
+        // Load original image for SAM3 mouth extraction (use "open" original - open mouth is easier to detect)
         const openOriginal = interpOriginals[pair.open.key];
         if (pairDiffType === "mouth" && openOriginal) {
           const setting = getMouthMaskSetting(pair.open.key);
@@ -913,9 +1258,383 @@ function App() {
     setStatus(`${pair.label}: 口マスクを破棄しました`);
   }
 
+  async function startExpressionWorkspace(kind: "new" | "resume") {
+    setError("");
+    const selected = await open({
+      multiple: false,
+      directory: true,
+      title: kind === "new" ? "作業フォルダを選択" : "既存の作業フォルダを選択",
+    });
+    const workPath = typeof selected === "string" ? selected : null;
+    if (!workPath) return;
+    setWorkspaceBusy(true);
+    try {
+      const workspace = await invoke<ExpressionWorkspaceResult>(
+        kind === "new" ? "create_expression_workspace" : "load_expression_workspace",
+        { workPath },
+      );
+      setExpressionWorkspace(workspace);
+      const nextFiles = {
+        ...(workspace.project.sourceImagePath ? { source: workspace.project.sourceImagePath } : {}),
+        ...(workspace.project.referenceImagePath ? { reference: workspace.project.referenceImagePath } : {}),
+      };
+      setWorkspaceFiles(nextFiles);
+      await loadWorkspaceImagePreviews(nextFiles);
+      setWorkspaceGeneratedStatus(null);
+      setWorkspaceExtractResult(null);
+      setWorkspaceCompositePreview(null);
+      setWorkspaceRifeResult(null);
+      setWorkspaceRifePreview(null);
+      setWorkspaceStep(Math.min(Math.max(workspace.project.currentStep || 1, 1), 6) as WorkspaceStep);
+      setMode("workspace");
+      setStatus(`作業フォルダ: ${workspace.workPath}`);
+      if (kind === "resume") {
+        await restoreWorkspaceProgress(workspace);
+      }
+      await refreshWorkspaceSeeThroughStatus();
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setWorkspaceBusy(false);
+    }
+  }
+
+  async function persistWorkspaceStep(step: WorkspaceStep, workspaceOverride?: ExpressionWorkspaceResult) {
+    const workspace = workspaceOverride ?? expressionWorkspace;
+    if (!workspace) return;
+    try {
+      const updated = await invoke<ExpressionWorkspaceResult>("update_expression_workspace_step", {
+        workPath: workspace.workPath,
+        currentStep: step,
+      });
+      setExpressionWorkspace(updated);
+    } catch {
+      // UI progress can continue even if project.json could not be updated.
+    }
+  }
+
+  async function setWorkspaceStepAndPersist(step: WorkspaceStep) {
+    setWorkspaceStep(step);
+    await persistWorkspaceStep(step);
+  }
+
+  async function restoreWorkspaceProgress(workspace: ExpressionWorkspaceResult) {
+    let restoredStep = Math.min(Math.max(workspace.project.currentStep || 1, 1), 6) as WorkspaceStep;
+    try {
+      const generated = await invoke<WorkspaceGeneratedPartsStatus>("inspect_workspace_generated_parts", {
+        workPath: workspace.workPath,
+      });
+      setWorkspaceGeneratedStatus(generated);
+      if (generated.ready && restoredStep < 3) restoredStep = 3;
+    } catch {
+      // Step 1 workspaces may not have a source image or request files yet.
+    }
+
+    try {
+      const loaded = await invoke<LoadCodexExpressionJobResult>("load_codex_expression_job", {
+        jobPath: workspace.workPath,
+      });
+      setWorkspaceGeneratedStatus(loaded.generatedParts);
+      setWorkspaceExtractResult(loaded.extractedParts);
+      setWorkspaceRifeResult(loaded.rifeOutput);
+      if (loaded.extractedParts) {
+        await refreshWorkspaceCompositePreview(workspace);
+      }
+      if (loaded.rifeOutput) {
+        await refreshWorkspaceRifePreview(workspace).catch(() => null);
+      }
+      if (loaded.rifeOutput) restoredStep = 6;
+      else if (loaded.extractedParts) restoredStep = Math.max(restoredStep, 5) as WorkspaceStep;
+      else if (loaded.generatedParts.ready) restoredStep = Math.max(restoredStep, 3) as WorkspaceStep;
+    } catch {
+      // Not all workspaces are valid Codex jobs until Step 2 has been prepared.
+    }
+
+    setWorkspaceStep(restoredStep);
+    await persistWorkspaceStep(restoredStep, workspace);
+  }
+
+  async function refreshWorkspaceCompositePreview(workspaceOverride?: ExpressionWorkspaceResult) {
+    const workspace = workspaceOverride ?? expressionWorkspace;
+    if (!workspace) return;
+    const preview = await invoke<PreviewCodexCompositeResult>("preview_codex_composite", {
+      jobPath: workspace.workPath,
+      profile: "auto",
+    });
+    setWorkspaceCompositePreview(preview);
+    setWorkspaceSelectedPreviewPart(prev => (
+      prev === "base" || preview.previews.some(item => item.part === prev) ? prev : "base"
+    ));
+  }
+
+  async function refreshWorkspaceRifePreview(workspaceOverride?: ExpressionWorkspaceResult) {
+    const workspace = workspaceOverride ?? expressionWorkspace;
+    if (!workspace) return;
+    const preview = await invoke<PreviewCodexRifeResult>("preview_codex_rife_outputs", {
+      jobPath: workspace.workPath,
+    });
+    setWorkspaceRifePreview(preview);
+    setWorkspaceSelectedPreviewPart(prev => (
+      prev === "base" || preview.previews.some(item => workspacePreviewItemKey(item) === prev)
+        ? prev
+        : preview.previews[0] ? workspacePreviewItemKey(preview.previews[0]) : "base"
+    ));
+  }
+
+  async function updateWorkspaceCompositePreview() {
+    setError("");
+    setWorkspaceBusy(true);
+    try {
+      await refreshWorkspaceCompositePreview();
+      setStatus("合成プレビューを更新しました");
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setWorkspaceBusy(false);
+    }
+  }
+
+  async function openWorkspaceBaseAdjustment() {
+    if (!expressionWorkspace || !workspaceFiles.source) {
+      setError("立ち絵を読み込んでから素体調整を開いてください");
+      return;
+    }
+    setError("");
+    setWorkspaceBusy(true);
+    try {
+      const base = await invoke<SeeThroughRunResult>("load_codex_source_see_through", {
+        jobPath: expressionWorkspace.workPath,
+      });
+      const defaultMapping = Object.fromEntries(base.slotLoad.adjustable_layers.map(layer => [layer.name, layer.default_target]));
+      setLoadResult(base.slotLoad);
+      setLayerMapping(defaultMapping);
+      const allPreview = await invoke<MappingPreviewResult>("get_all_layers_preview");
+      setMappingPreview(allPreview);
+      await openUnifiedBaseEditorWithPreview(allPreview);
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setWorkspaceBusy(false);
+    }
+  }
+
+  async function loadWorkspaceImagePreviews(files: Record<string, string>) {
+    const entries = Object.entries(files).filter(([, path]) => !!path);
+    if (entries.length === 0) {
+      setWorkspaceImagePreviews({});
+      return;
+    }
+    const next: Record<string, string> = {};
+    await Promise.all(entries.map(async ([key, path]) => {
+      try {
+        next[key] = await invoke<string>("load_expression_source_preview", { path });
+      } catch {
+        // Keep the path visible even when thumbnail decoding fails.
+      }
+    }));
+    setWorkspaceImagePreviews(next);
+  }
+
+  async function pickWorkspaceImage(key: "source" | "reference") {
+    const file = await open({ multiple: false, directory: false, filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg", "webp"] }] });
+    if (!file || typeof file !== "string") return;
+    setWorkspaceFiles(prev => {
+      const next = { ...prev, [key]: file };
+      void loadWorkspaceImagePreviews(next);
+      return next;
+    });
+  }
+
+  async function prepareWorkspaceCodexRequest() {
+    if (!expressionWorkspace || !workspaceFiles.source) {
+      setError("先に作業フォルダと立ち絵を選択してください");
+      return;
+    }
+    setError("");
+    setWorkspaceBusy(true);
+    try {
+      const status = await invoke<WorkspaceGeneratedPartsStatus>("prepare_workspace_codex_request", {
+        request: {
+          workPath: expressionWorkspace.workPath,
+          sourceImagePath: workspaceFiles.source,
+          referenceImagePath: workspaceFiles.reference || null,
+          prompt: "Keep character identity, pose, hair, clothes, lighting, and background unchanged. Edit only the requested eyes or mouth.",
+          mouthCorner: "neutral",
+          mouthSize: "normal",
+        },
+      });
+      setWorkspaceGeneratedStatus(status);
+      await setWorkspaceStepAndPersist(2);
+      setStatus("Codex依頼ファイルを作成しました");
+      await revealItemInDir(status.requestPath).catch(() => {});
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setWorkspaceBusy(false);
+    }
+  }
+
+  async function inspectWorkspaceGeneratedParts() {
+    if (!expressionWorkspace) return;
+    setError("");
+    setWorkspaceBusy(true);
+    try {
+      const status = await invoke<WorkspaceGeneratedPartsStatus>("inspect_workspace_generated_parts", { workPath: expressionWorkspace.workPath });
+      setWorkspaceGeneratedStatus(status);
+      if (status.ready) await setWorkspaceStepAndPersist(3);
+      setStatus(status.ready ? "Codex成果物が揃いました" : "Codex成果物に不足があります");
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setWorkspaceBusy(false);
+    }
+  }
+
+  async function refreshWorkspaceSeeThroughStatus() {
+    setError("");
+    setWorkspaceBusy(true);
+    setSeeThroughProgress({ stage: "status", percent: 0, message: "See-Through環境を確認しています" });
+    setStatus("See-Through環境を確認しています");
+    try {
+      const runtime = await invoke<SeeThroughRuntimeStatus>("get_see_through_runtime_status");
+      setSeeThroughRuntime(runtime);
+      setStatus(runtime.message);
+      setSeeThroughProgress({ stage: "status", percent: 100, message: runtime.message });
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setWorkspaceBusy(false);
+    }
+  }
+
+  async function prepareWorkspaceSeeThroughRuntime() {
+    setError("");
+    setWorkspaceBusy(true);
+    setSeeThroughProgress({ stage: "prepare", percent: 0, message: "See-Throughを準備しています" });
+    try {
+      const runtime = await invoke<SeeThroughRuntimeStatus>("prepare_see_through_runtime");
+      setSeeThroughRuntime(runtime);
+      setStatus(runtime.message);
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setWorkspaceBusy(false);
+    }
+  }
+
+  async function runWorkspaceSeeThroughBatch() {
+    if (!expressionWorkspace || !workspaceFiles.source || !workspaceGeneratedStatus?.ready) {
+      setError("立ち絵とCodex成果物を先に揃えてください");
+      return;
+    }
+    if (!seeThroughRuntime?.ready) {
+      setError("See-Throughの初回セットアップを先に完了してください");
+      return;
+    }
+    setError("");
+    setWorkspaceBusy(true);
+    setSeeThroughStartedAt(Date.now());
+    setSeeThroughElapsedSeconds(0);
+    setSeeThroughProgress({ stage: "inference", percent: 0, message: "See-Through一括分解中" });
+    try {
+      const base = await invoke<SeeThroughRunResult>("run_see_through", {
+        sourcePath: workspaceFiles.source,
+        profile: seeThroughProfile,
+        splitParts: seeThroughSplitParts,
+        options: seeThroughOptions,
+      });
+      await invoke<string>("cache_codex_source_see_through", {
+        jobPath: expressionWorkspace.workPath,
+        psdPath: base.psdPath,
+      });
+      const defaultMapping = Object.fromEntries(base.slotLoad.adjustable_layers.map(layer => [layer.name, layer.default_target]));
+      setLoadResult(base.slotLoad);
+      setLayerMapping(defaultMapping);
+      setMappingPreview(base.mappingPreview);
+      setSeeThroughProgress({ stage: "inference", percent: 50, message: "Codex成果物をSee-Throughで分解しています" });
+      const extracted = await invoke<ExtractCodexGeneratedPartsResult>("extract_codex_generated_parts", {
+        jobPath: expressionWorkspace.workPath,
+        profile: seeThroughProfile,
+        splitParts: seeThroughSplitParts,
+        options: seeThroughOptions,
+      });
+      setWorkspaceExtractResult(extracted);
+      setWorkspaceCompositePreview(null);
+      setWorkspaceRifeResult(null);
+      setWorkspaceRifePreview(null);
+      await setWorkspaceStepAndPersist(4);
+      const allPreview = await invoke<MappingPreviewResult>("get_all_layers_preview");
+      setMappingPreview(allPreview);
+      await openUnifiedBaseEditorWithPreview(allPreview);
+      setSeeThroughProgress({ stage: "complete", percent: 100, message: "See-Through一括分解が完了しました" });
+      setStatus(`See-Through一括分解が完了しました: ${extracted.extractedParts.length}パーツ`);
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setWorkspaceBusy(false);
+      setSeeThroughStartedAt(null);
+    }
+  }
+
+  async function applyWorkspacePartAdjustment() {
+    if (!expressionWorkspace || !workspaceExtractResult) return;
+    setWorkspaceBusy(true);
+    try {
+      const result = await invoke<AdjustCodexExtractedPartsResult>("adjust_codex_extracted_parts", {
+        request: {
+          jobPath: expressionWorkspace.workPath,
+          offsetX: workspacePartOffsetX,
+          offsetY: workspacePartOffsetY,
+          scalePercent: workspacePartScale,
+        },
+      });
+      setWorkspaceExtractResult({
+        extractedPartsPath: result.extractedPartsPath,
+        extractedParts: result.adjustedParts,
+        warnings: workspaceExtractResult.warnings,
+      });
+      setWorkspaceRifeResult(null);
+      setWorkspaceRifePreview(null);
+      await refreshWorkspaceCompositePreview().catch(() => null);
+      await setWorkspaceStepAndPersist(5);
+      setStatus("差分位置を調整しました");
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setWorkspaceBusy(false);
+    }
+  }
+
+  async function generateWorkspaceRifeOutputs() {
+    if (!expressionWorkspace || !workspaceExtractResult) {
+      setError("先にSee-Through一括分解を完了してください");
+      return;
+    }
+    setWorkspaceBusy(true);
+    try {
+      await invoke<SaveCodexBasePartsResult>("save_codex_base_parts", {
+        jobPath: expressionWorkspace.workPath,
+      }).catch(() => null);
+      const result = await invoke<GenerateCodexRifeOutputResult>("generate_codex_rife_outputs", {
+        jobPath: expressionWorkspace.workPath,
+        frameCount,
+        profile: "auto",
+      });
+      setWorkspaceRifeResult(result);
+      await refreshWorkspaceRifePreview().catch(() => null);
+      await setWorkspaceStepAndPersist(6);
+      setStatus(`SpriTalk用フォルダへ出力しました: ${result.outputPath}`);
+      await revealItemInDir(result.outputPath).catch(() => {});
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setWorkspaceBusy(false);
+    }
+  }
+
   function returnToModeSelect() {
     if (mode === "interp" && interpStep !== 4 && hasInterpWork) {
-      const ok = window.confirm("現在のフレーム補間作業を終了してモード選択へ戻ります。入力、口マスク、生成プレビューはこの画面から離れると失われます。戻りますか？");
+      const ok = window.confirm("現在のフレーム補間作業を終了してモード選択へ戻ります。出力、口マスク、生成プレビューはこの画面から離れると失われます。戻りますか？");
       if (!ok) return;
     }
     setMode("select");
@@ -934,6 +1653,13 @@ function App() {
   }
 
   function returnFromBaseFlow() {
+    if (expressionWorkspace) {
+      setMode("workspace");
+      setWorkspaceStep(4);
+      setStatus("素体調整に戻りました。");
+      resetZoom();
+      return;
+    }
     setMode("select");
     setBaseStep(1);
     setStatus("モードを選択してください");
@@ -969,7 +1695,7 @@ function App() {
     return !!baseResult;
   }
 
-  const bodyCategory = mappingPreview?.categories.find(c => c.target === (mode === "correction" ? "free" : "body"));
+  const bodyCategory = mappingPreview?.categories.find(c => c.target === (mode === "correction" || !!expressionWorkspace ? "free" : "body"));
   const selectedLayerOpacity = selectedBodyLayer ? (layerOpacities[selectedBodyLayer] ?? 1) : 1;
 
   function getBodyOrderItem(name: string): (LayerInfo & { isPatch?: boolean }) | null {
@@ -1143,7 +1869,7 @@ function App() {
       if (data[i] > 0) { hasMask = true; break; }
     }
     if (!hasMask) {
-      setError("パッチにする範囲を塗ってください");
+      setError("切り出す範囲を塗ってください");
       return;
     }
 
@@ -1189,773 +1915,531 @@ function App() {
     await renderBody(nextOrder, nextEnabled, nextPatches, nextOpacities);
   }
 
+  function renderWorkspaceMode() {
+    const workspace = expressionWorkspace;
+    const steps = [
+      [1, "画像選択", "立ち絵と参照画像"],
+      [2, "Codex依頼", "依頼作成と成果物確認"],
+      [3, "See-Through", "一括分解"],
+      [4, "素体調整", "レイヤー確認"],
+      [5, "差分位置調整", "合成確認"],
+      [6, "RIFE補完", "SpriTalk出力"],
+    ] as Array<[WorkspaceStep, string, string]>;
+    const canOpenWorkspaceStep = (step: WorkspaceStep) => {
+      if (workspaceBusy) return false;
+      if (step === 1) return true;
+      if (step === 2) return !!workspaceFiles.source;
+      if (step === 3) return !!workspaceGeneratedStatus?.ready;
+      if (step === 4) return !!mappingPreview || !!workspaceFiles.source;
+      if (step === 5) return !!workspaceExtractResult && !!workspaceCompositePreview?.basePreview;
+      return !!workspaceExtractResult && !!workspaceCompositePreview?.basePreview;
+    };
+    const canAdvanceWorkspaceStep = () => {
+      if (workspaceBusy) return false;
+      if (workspaceStep === 1) return !!workspaceFiles.source;
+      if (workspaceStep === 2) return !!workspaceGeneratedStatus?.ready;
+      if (workspaceStep === 3) return !!mappingPreview;
+      if (workspaceStep === 4) return !!workspaceCompositePreview?.basePreview;
+      if (workspaceStep === 5) return !!workspaceExtractResult && !!workspaceCompositePreview?.basePreview;
+      return false;
+    };
+    const seeThroughRunning = workspaceBusy && !!seeThroughProgress && ["prepare", "inference", "load"].includes(seeThroughProgress.stage);
+    const activePreviewSet = workspaceStep >= 6 && workspaceRifePreview ? workspaceRifePreview : workspaceCompositePreview;
+    const selectedPreview = workspaceSelectedPreviewPart === "base"
+      ? null
+      : activePreviewSet?.previews.find(item => workspacePreviewItemKey(item) === workspaceSelectedPreviewPart) ?? null;
+    const mainPreviewImage = selectedPreview?.preview ?? activePreviewSet?.basePreview ?? "";
+    const mainPreviewLabel = selectedPreview ? workspacePreviewItemLabel(selectedPreview) : "base";
+    const goPreviousWorkspaceStep = () => {
+      if (workspaceStep === 1) {
+        returnToModeSelect();
+        return;
+      }
+      void setWorkspaceStepAndPersist((workspaceStep - 1) as WorkspaceStep);
+    };
+    const goNextWorkspaceStep = () => {
+      if (workspaceStep >= 6 || !canAdvanceWorkspaceStep()) return;
+      void setWorkspaceStepAndPersist((workspaceStep + 1) as WorkspaceStep);
+    };
+    if (!workspace) return null;
+
+    return (
+      <div className="workspace-flow-screen">
+        <nav className="workspace-flow-stepper" aria-label="表情セット作成ステップ">
+          {steps.map(([step, label, note]) => (
+            <button
+              key={step}
+              className={`workspace-flow-step${workspaceStep === step ? " active" : ""}${workspaceStep > step ? " done" : ""}`}
+              disabled={!canOpenWorkspaceStep(step)}
+              onClick={() => void setWorkspaceStepAndPersist(step)}
+            >
+              <b>{step}</b>
+              <span><strong>{label}</strong><small>{note}</small></span>
+            </button>
+          ))}
+        </nav>
+
+        <div className={`workspace-flow-layout${workspaceStep === 1 ? " step-one" : ""}${workspaceStep === 2 || workspaceStep === 3 ? " single-panel" : ""}`}>
+          <section className="workspace-flow-panel">
+            {workspaceStep === 1 && (
+              <div className="workspace-step-one">
+                <div className="workspace-panel-heading compact">
+                  <span>STEP 1</span>
+                  <h3>立ち絵と参照画像を選択</h3>
+                  <p>立ち絵は必須です。参照画像は目や口の中の色、質感をCodex生成で合わせたい場合だけ使います。</p>
+                </div>
+                <div className="workspace-image-picker-grid">
+                  <button className={`workspace-image-picker${workspaceFiles.source ? " ready" : ""}`} onClick={() => void pickWorkspaceImage("source")}>
+                    <span>立ち絵</span>
+                    {workspaceImagePreviews.source ? <img src={workspaceImagePreviews.source} alt="立ち絵プレビュー" /> : <strong>選択</strong>}
+                    <small>{workspaceFiles.source ? "選択済み" : "必須: 表情セットの元画像"}</small>
+                  </button>
+                  <button className={`workspace-image-picker${workspaceFiles.reference ? " ready" : ""}`} onClick={() => void pickWorkspaceImage("reference")}>
+                    <span>参照画像</span>
+                    {workspaceImagePreviews.reference ? <img src={workspaceImagePreviews.reference} alt="参照画像プレビュー" /> : <strong>選択</strong>}
+                    <small>{workspaceFiles.reference ? "選択済み" : "任意: 目や口内の色参照"}</small>
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {workspaceStep === 2 && (
+              <>
+                <div className="workspace-panel-heading">
+                  <span>STEP 2</span>
+                  <h3>Codex依頼を作成</h3>
+                  <p>依頼ファイルを作成し、Codexが生成した7枚を <code>02_generated_parts</code> に配置してから確認します。</p>
+                </div>
+                <div className="workspace-codex-steps">
+                  <section className="workspace-codex-card">
+                    <div>
+                      <span>1</span>
+                      <strong>依頼ファイル作成</strong>
+                      <p>Codexへ渡す説明書と元画像を <code>01_codex_request</code> に作成します。</p>
+                    </div>
+                    <div className="workspace-action-row">
+                      <button className="btn btn-secondary" onClick={() => revealItemInDir(workspace.codexRequestPath).catch(() => {})}>依頼フォルダを開く</button>
+                      <button className="btn btn-primary" disabled={workspaceBusy || !workspaceFiles.source} onClick={() => void prepareWorkspaceCodexRequest()}>依頼ファイルを作成</button>
+                    </div>
+                  </section>
+                  <section className="workspace-codex-card">
+                    <div>
+                      <span>2</span>
+                      <strong>成果物を確認</strong>
+                      <p>Codexが作成した素材を <code>02_generated_parts</code> に配置して、必要ファイルが揃ったか確認します。</p>
+                      <div className="workspace-status-card compact">
+                        <strong>{workspaceGeneratedStatus?.ready ? "成果物は揃っています" : "成果物待ちです"}</strong>
+                        <span>必要: {workspaceGeneratedStatus?.expectedParts.length ?? 7} / 配置済み: {workspaceGeneratedStatus?.presentParts.length ?? 0}</span>
+                        {!!workspaceGeneratedStatus?.missingParts.length && <small>不足: {workspaceGeneratedStatus.missingParts.join(", ")}</small>}
+                        {!!workspaceGeneratedStatus?.sizeMismatches.length && <small>サイズ不一致: {workspaceGeneratedStatus.sizeMismatches.join(", ")}</small>}
+                      </div>
+                    </div>
+                    <div className="workspace-action-row">
+                      <button className="btn btn-primary" disabled={workspaceBusy} onClick={() => void inspectWorkspaceGeneratedParts()}>成果物を確認</button>
+                    </div>
+                  </section>
+                </div>
+              </>
+            )}
+
+            {workspaceStep === 3 && (
+              <>
+                <div className="workspace-step3-header">
+                  <div className="workspace-panel-heading">
+                    <span>STEP 3</span>
+                    <h3>See-Throughを一括実行</h3>
+                    <p>立ち絵とCodex成果物をSee-Throughで分解します。</p>
+                  </div>
+                  <div className="workspace-step3-env">
+                    <div className="workspace-action-row">
+                      <button className="btn btn-secondary" disabled={workspaceBusy} onClick={() => void refreshWorkspaceSeeThroughStatus()}>環境を再確認</button>
+                      {seeThroughRuntime?.ready ? (
+                        <span className="workspace-action-done">セットアップ済み</span>
+                      ) : (
+                        <button className="btn btn-secondary" disabled={workspaceBusy} onClick={() => void prepareWorkspaceSeeThroughRuntime()}>初回セットアップ</button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+                <div className="workspace-seethrough-options">
+                  <div className="workspace-option-card">
+                    <span>実行プロファイル</span>
+                    <div className="workspace-segmented">
+                      <button className={seeThroughProfile === "low-vram" ? "active" : ""} disabled={workspaceBusy} onClick={() => setSeeThroughProfile("low-vram")}>省VRAM</button>
+                      <button className={seeThroughProfile === "standard" ? "active" : ""} disabled={workspaceBusy} onClick={() => setSeeThroughProfile("standard")}>高VRAM</button>
+                    </div>
+                  </div>
+                  <label className="workspace-toggle-option workspace-option-card">
+                    <input type="checkbox" checked={seeThroughSplitParts} disabled={workspaceBusy} onChange={(event) => setSeeThroughSplitParts(event.target.checked)} />
+                    <span>左右パーツ分解</span>
+                    <small>目や耳などを左右レイヤーに分けます。</small>
+                  </label>
+                  <div className="workspace-option-card workspace-option-card-wide">
+                    <div className="workspace-option-header">
+                      <span>See-Throughパラメータ</span>
+                      <button className="btn btn-secondary" disabled={workspaceBusy} onClick={() => setSeeThroughOptions(DEFAULT_SEE_THROUGH_OPTIONS)}>標準値に戻す</button>
+                    </div>
+                    <div className="workspace-option-grid">
+                      <label><span>Seed</span><input type="number" value={seeThroughOptions.seed} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, seed: Number(event.target.value) })} /></label>
+                      <label><span>LayerDiff解像度</span><input type="number" min={256} max={4096} step={64} value={seeThroughOptions.resolution} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, resolution: Number(event.target.value) })} /></label>
+                      <label><span>Depth解像度</span><input type="number" min={-1} max={4096} step={64} value={seeThroughOptions.resolutionDepth} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, resolutionDepth: Number(event.target.value) })} /></label>
+                      <label><span>LayerDiff step</span><input type="number" min={1} max={150} value={seeThroughOptions.inferenceSteps} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, inferenceSteps: Number(event.target.value) })} /></label>
+                      <label><span>Depth step</span><input type="number" min={-1} max={150} value={seeThroughOptions.inferenceStepsDepth} disabled={workspaceBusy || seeThroughProfile === "low-vram"} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, inferenceStepsDepth: Number(event.target.value) })} /></label>
+                      <label><span>Group offload</span><select value={seeThroughOptions.groupOffload} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, groupOffload: event.target.value as SeeThroughOptionMode })}><option value="default">標準</option><option value="on">有効</option><option value="off">無効</option></select></label>
+                      <label><span>CPU offload</span><select value={seeThroughOptions.cpuOffload} disabled={workspaceBusy || seeThroughProfile === "standard"} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, cpuOffload: event.target.value as SeeThroughOptionMode })}><option value="default">標準</option><option value="on">有効</option><option value="off">無効</option></select></label>
+                    </div>
+                  </div>
+                </div>
+                <div className="workspace-start-seethrough">
+                  <div><strong>分解処理を開始</strong><p>立ち絵、閉じ目、閉じ口、あいうえお口の素材をまとめて分解します。</p></div>
+                  <button className="btn btn-primary" disabled={workspaceBusy || !seeThroughRuntime?.ready || !workspaceGeneratedStatus?.ready} onClick={() => void runWorkspaceSeeThroughBatch()}>{seeThroughRunning ? "分解処理中..." : "一括分解を開始"}</button>
+                  {seeThroughRunning && (
+                    <div className="workspace-running-inline">
+                      <span>{displaySeeThroughMessage(seeThroughProgress)}</span>
+                      <small>経過: {formatElapsed(seeThroughElapsedSeconds)}</small>
+                      <div className="workspace-progress-bar" aria-label="See-Through進捗"><div style={{ width: `${Math.max(3, Math.min(100, seeThroughProgress.percent))}%` }} /></div>
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
+
+            {workspaceStep === 4 && (
+              <>
+                <div className="workspace-panel-heading"><span>STEP 4</span><h3>素体を調整</h3><p>分解済みレイヤーの前後関係を確認し、SpriTalkに渡す素体パーツを作成します。</p></div>
+                <div className="workspace-action-row"><button className="btn btn-primary" disabled={workspaceBusy} onClick={() => void openWorkspaceBaseAdjustment()}>素体調整を開く</button></div>
+              </>
+            )}
+
+            {workspaceStep === 5 && (
+              <>
+                <div className="workspace-panel-heading"><span>STEP 5</span><h3>差分位置を調整</h3><p>抽出済み差分にX/Y/Scale補正を適用し、素体と重ねた時の位置を確認します。</p></div>
+                <div className="workspace-action-row">
+                  <div className="workspace-adjust-grid">
+                    <label><span>X offset</span><input type="number" value={workspacePartOffsetX} onChange={e => setWorkspacePartOffsetX(Number(e.target.value))} /></label>
+                    <label><span>Y offset</span><input type="number" value={workspacePartOffsetY} onChange={e => setWorkspacePartOffsetY(Number(e.target.value))} /></label>
+                    <label><span>Scale %</span><input type="number" min={50} max={150} value={workspacePartScale} onChange={e => setWorkspacePartScale(Number(e.target.value))} /></label>
+                  </div>
+                  <button className="btn btn-secondary" disabled={workspaceBusy || !workspaceExtractResult} onClick={() => void updateWorkspaceCompositePreview()}>合成プレビューを更新</button>
+                  <button className="btn btn-primary" disabled={workspaceBusy || !workspaceExtractResult} onClick={() => void applyWorkspacePartAdjustment()}>位置調整を適用</button>
+                </div>
+              </>
+            )}
+
+            {workspaceStep === 6 && (
+              <>
+                <div className="workspace-panel-heading"><span>STEP 6</span><h3>RIFE補完してSpriTalk用に出力</h3><p>RIFEフレーム、素体、抽出差分を <code>04_spritalk_parts</code> にまとめます。</p></div>
+                <div className="workspace-rife-panel">
+                  <div className="workspace-frame-slider">
+                    <label><span>補間枚数</span><strong>{frameCount}枚</strong></label>
+                    <input type="range" min={RIFE_FRAME_MIN} max={RIFE_FRAME_MAX} value={frameCount} disabled={workspaceBusy} onChange={e => setFrameCount(Number(e.target.value))} />
+                    <small>SpriTalkでは {RIFE_FRAME_RECOMMENDED} 枚が扱いやすい目安です。</small>
+                  </div>
+                  <button className="btn btn-primary" disabled={workspaceBusy || !workspaceExtractResult || !workspaceCompositePreview?.basePreview} onClick={() => void generateWorkspaceRifeOutputs()}>{workspaceBusy ? "RIFE補完中..." : "RIFE補完を開始"}</button>
+                </div>
+              </>
+            )}
+          </section>
+
+          {workspaceStep >= 4 && (
+            <aside className="workspace-flow-preview">
+              <div className="preview-card-heading"><span>PREVIEW</span><strong>{mainPreviewLabel}</strong></div>
+              <div className="workspace-preview-stage">
+                {mainPreviewImage ? (
+                  <>
+                    <div className={`workspace-preview-pan${workspacePreviewDragging ? " dragging" : ""}`} onWheel={handleWorkspacePreviewWheel} onPointerDown={handleWorkspacePreviewPointerDown} onPointerMove={handleWorkspacePreviewPointerMove} onPointerUp={handleWorkspacePreviewPointerUp} onPointerCancel={handleWorkspacePreviewPointerUp} onLostPointerCapture={handleWorkspacePreviewLostPointerCapture}>
+                      <img src={mainPreviewImage} alt={`${mainPreviewLabel} プレビュー`} draggable={false} style={{ transform: `translate(${workspacePreviewPan.x}px, ${workspacePreviewPan.y}px) scale(${workspacePreviewZoom})` }} />
+                    </div>
+                    <div className="workspace-preview-zoom-controls">
+                      <button className="btn-zoom" type="button" onClick={() => setWorkspacePreviewZoom(prev => Math.min(8, prev * 1.25))}>+</button>
+                      <span className="zoom-level">{Math.round(workspacePreviewZoom * 100)}%</span>
+                      <button className="btn-zoom" type="button" onClick={() => setWorkspacePreviewZoom(prev => Math.max(0.25, prev * 0.8))}>-</button>
+                      <button className="btn-zoom btn-zoom-reset" type="button" onClick={resetWorkspacePreviewZoom}>リセット</button>
+                    </div>
+                  </>
+                ) : <span>{workspaceStep >= 5 ? "素体作成後にプレビューできます" : "この工程では画像プレビューはありません"}</span>}
+              </div>
+              {activePreviewSet?.previews.length ? (
+                <div className="workspace-preview-list">
+                  <button type="button" className={workspaceSelectedPreviewPart === "base" ? "active" : ""} onClick={() => setWorkspaceSelectedPreviewPart("base")}><span>base</span><img src={activePreviewSet.basePreview} alt="base プレビュー" /></button>
+                  {activePreviewSet.previews.map(item => (
+                    <button type="button" key={workspacePreviewItemKey(item)} className={workspaceSelectedPreviewPart === workspacePreviewItemKey(item) ? "active" : ""} onClick={() => setWorkspaceSelectedPreviewPart(workspacePreviewItemKey(item))}>
+                      <span>{workspacePreviewItemLabel(item)}</span><img src={item.preview} alt={`${workspacePreviewItemLabel(item)} preview`} />
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+            </aside>
+          )}
+        </div>
+
+        <div className="workspace-bottom-nav">
+          <button className="btn btn-secondary" onClick={goPreviousWorkspaceStep}>戻る</button>
+          {workspaceStep >= 6 ? (
+            <button className="btn btn-primary" disabled={workspaceBusy} onClick={() => revealItemInDir(workspaceRifeResult?.outputPath || workspace.spritalkPartsPath).catch(() => {})}>出力フォルダを開く</button>
+          ) : (
+            <button className="btn btn-primary" disabled={!canAdvanceWorkspaceStep()} onClick={goNextWorkspaceStep}>次へ</button>
+          )}
+        </div>
+        <div className="workspace-log-console" aria-live="polite">
+          <div className="workspace-log-title">LOG</div>
+          <div className="workspace-log-lines">
+            <div><span>step</span>{workspaceStep}/6 {steps[workspaceStep - 1]?.[1]}</div>
+            {workspaceBusy && <div><span>run</span>処理中...</div>}
+            {seeThroughProgress && <div><span>see-through</span>{seeThroughProgress.message}</div>}
+            {progress.total > 0 && <div><span>rife</span>{progress.pair_name} {progress.current}/{progress.total}</div>}
+            <div><span>{error ? "error" : "status"}</span>{error || status}</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+  void [
+    hairPreview, hairBackPreview, correctionOutputPath, baseStep, dragTarget,
+    frameCount, setFrameCount, outputPath, completedDiffs, diffPreviewTick, diffPreviewZoom, setDiffPreviewZoom,
+    interpPaths, interpOriginals, interpGenerating, interpStep, mouthMode, mouthMaskSettings, mouthMaskPreviews,
+    mouthMaskPreviewing, mouthPreviewZooms, mouthPreviewPans, activePreviewKey, canGenerate, anyMouthMaskPreviewing,
+    readyPairsForMask, missingMouthMaskCount, allReadyPairsHaveMasks, canOpenInterpStep, goInterpStep, activeMaskPair,
+    activeMaskSlot, activeMaskSetting, activeMaskPreview, activeMaskZoom, activeMaskPan, activeDiffPreview, hasInterpWork,
+    pingPongFrameIndex, pickInterpPsd, pickInterpOriginal, previewMouthMask, updateMouthMaskSetting, refreshMouthMaskPreview,
+    setMouthPreviewZoom, onMouthPreviewPointerDown, onMouthPreviewPointerMove, onMouthPreviewPointerUp,
+    resetMouthPreviewView, handleGenerateAll, openOutputFolder, handleCreateMouthMasks, discardMouthMask, returnFromInterpInput,
+    loadPsd, proceedToHairEdit, openHairEditorWithPreview, proceedToBodyEdit, loadCorrectionPsd,
+    setAllBodyOpacities, returnFromBaseFlow, goBaseStep, baseStepEnabled,
+  ];
+
+  function renderModeSelect() {
+    return (
+      <main className="mode-select-screen">
+        <section className="workspace-start-panel">
+          <button className="primary-workflow-card" onClick={() => void startExpressionWorkspace("new")}>
+            <div className="primary-workflow-copy">
+              <span className="workflow-kicker">NEW WORKSPACE</span>
+              <strong>はじめから</strong>
+              <p>作業フォルダを選択して、画像選択からSpriTalk用出力まで順番に進めます。</p>
+            </div>
+            <span className="primary-workflow-cta">作業フォルダを選択</span>
+          </button>
+          <button className="primary-workflow-card secondary" onClick={() => void startExpressionWorkspace("resume")}>
+            <div className="primary-workflow-copy">
+              <span className="workflow-kicker">RESUME</span>
+              <strong>つづきから</strong>
+              <p>既存の作業フォルダを選択して、保存済みの工程から再開します。</p>
+            </div>
+            <span className="primary-workflow-cta">既存フォルダを開く</span>
+          </button>
+        </section>
+      </main>
+    );
+  }
+
+  function renderSimpleInput(title: string, description: string, action: () => void | Promise<void>) {
+    return (
+      <main className="mode-select-screen base-input-screen">
+        <div className="input-card-center">
+          <h2 className="input-card-title">{title}</h2>
+          <p className="input-hint">{description}</p>
+          <div className="file-input-row-large">
+            <button className="btn btn-primary" onClick={() => void action()} disabled={loading}>PSDを選択</button>
+            <span className="slot-path-inline-large">{loadResult ? `${loadResult.detected_layers.length}レイヤー 読み込み済み` : "未選択"}</span>
+          </div>
+          {loading && <div className="progress-bar indeterminate" style={{ marginTop: 12 }}><div className="fill" /></div>}
+          <div className="step-nav-actions base-input-actions">
+            <button className="btn btn-secondary" onClick={returnToModeSelect}>戻る</button>
+          </div>
+        </div>
+      </main>
+    );
+  }
+
+  function renderLayerEditor() {
+    return (
+      <main className="panel-right base-edit-panel">
+        <div className="preview-and-layers">
+          <div
+            className="preview-viewport"
+            ref={previewRef}
+            onWheel={handleWheel}
+            onMouseDown={handleMouseDown}
+            onMouseMove={handleMouseMove}
+            onMouseUp={handleMouseUp}
+            onMouseLeave={handleMouseUp}
+          >
+            {bodyPreview ? (
+              <img src={bodyPreview} alt="合成プレビュー" className="preview-img" style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, cursor: isPanning ? "grabbing" : "grab" }} draggable={false} />
+            ) : <span className="placeholder">合成プレビュー</span>}
+            {bodyPreview && patchDraftSource && (
+              <canvas
+                ref={maskCanvasRef}
+                className="patch-mask-canvas"
+                style={previewImageStyle()}
+                onPointerDown={onPatchMaskPointerDown}
+                onPointerMove={onPatchMaskPointerMove}
+                onPointerUp={onPatchMaskPointerUp}
+                onPointerCancel={onPatchMaskPointerUp}
+                onPointerLeave={onPatchMaskPointerLeave}
+              />
+            )}
+            {bodyPreview && patchDraftSource && brushCursor.visible && <div className="patch-brush-cursor" style={brushCursorStyle()} />}
+          </div>
+
+          {bodyCategory && layerOrder.length > 0 && (
+            <div className="layer-sidebar" onPointerMove={onDragPointerMove} onPointerUp={onDragPointerUp}>
+              <div className="layer-sidebar-title-row">
+                <div>
+                  <div className="layer-sidebar-header">レイヤー順序</div>
+                  <div className="layer-sidebar-hint">上が手前</div>
+                </div>
+                {mode === "correction" && <button className="btn-layer-add" onClick={() => void addCorrectionLayerImage()} disabled={loading}>PNG追加</button>}
+              </div>
+              <div className="layer-bulk-row">
+                <button className="btn-layer-bulk" onClick={() => void setAllLayerVisibility(true)}>全ON</button>
+                <button className="btn-layer-bulk" onClick={() => void setAllLayerVisibility(false)}>全OFF</button>
+                {!!expressionWorkspace && <button className="btn-layer-bulk" onClick={() => void applyRecommendedLayerOrder()}>推奨順</button>}
+              </div>
+              <div className="layer-sidebar-list">
+                {layerOrder.map((name, idx) => {
+                  const layer = getBodyOrderItem(name);
+                  if (!layer) return null;
+                  const patch = layerPatches.find(p => p.id === name);
+                  const sourceName = patch?.sourceLayer ?? name;
+                  const opacity = layerOpacities[name] ?? 1;
+                  return (
+                    <div key={name} className={`layer-sidebar-item${draggedIdx === idx ? " dragging" : ""}${selectedBodyLayer === name ? " selected" : ""}${layer.isPatch ? " patch" : ""}`} onClick={() => setSelectedBodyLayer(name)}>
+                      <span className="drag-handle" onPointerDown={(e) => onDragPointerDown(e, idx)}>☰</span>
+                      <input type="checkbox" checked={enabledLayers[name] !== false} onChange={(e) => void handleLayerToggle(name, e.target.checked)} />
+                      <img src={layer.thumbnail} alt={layer.name} className="layer-sidebar-thumb" />
+                      <span className="layer-sidebar-name">{layer.name}</span>
+                      {opacity < 1 && <span className="layer-offset-badge">{Math.round(opacity * 100)}%</span>}
+                      {layer.isPatch ? (
+                        <button className="btn-layer-mini" onClick={(e) => { e.stopPropagation(); void removeLayerPatch(name); }}>削除</button>
+                      ) : (
+                        <button className="btn-layer-mini" onClick={(e) => { e.stopPropagation(); initPatchMask(sourceName); }}>切出</button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+              {patchDraftSource && (
+                <div className="layer-adjust-panel patch-panel">
+                  <div className="layer-adjust-title">切り出し作成: {patchDraftSource}</div>
+                  <div className="layer-adjust-values">塗った範囲を別レイヤーとして切り出し、元レイヤーから抜きます。</div>
+                  <div className="patch-tool-row">
+                    <button className={`btn-nudge ${patchTool === "paint" ? "active" : ""}`} onClick={() => setPatchTool("paint")}>塗る</button>
+                    <button className={`btn-nudge ${patchTool === "erase" ? "active" : ""}`} onClick={() => setPatchTool("erase")}>消す</button>
+                  </div>
+                  <input type="range" min={4} max={96} value={patchBrushSize} onChange={(e) => setPatchBrushSize(Number(e.target.value))} />
+                  <div className="patch-tool-row">
+                    <button className="btn-nudge btn-nudge-reset" onClick={clearPatchMask}>クリア</button>
+                    <button className="btn-nudge btn-nudge-reset" onClick={() => setPatchDraftSource("")}>取消</button>
+                    <button className="btn-nudge btn-nudge-reset" onClick={commitPatchMask}>追加</button>
+                  </div>
+                </div>
+              )}
+              {selectedBodyLayer && (
+                <div className="layer-adjust-panel opacity-panel">
+                  <div className="layer-adjust-title">表示透明度: {getBodyOrderItem(selectedBodyLayer)?.name ?? selectedBodyLayer}</div>
+                  <div className="layer-adjust-values">{Math.round(selectedLayerOpacity * 100)}%</div>
+                  <input
+                    type="range"
+                    min={0}
+                    max={100}
+                    value={Math.round(selectedLayerOpacity * 100)}
+                    onChange={(e) => updateLayerOpacityDraft(selectedBodyLayer, Number(e.target.value) / 100)}
+                    onPointerUp={() => void commitLayerOpacity()}
+                    onMouseUp={() => void commitLayerOpacity()}
+                    onTouchEnd={() => void commitLayerOpacity()}
+                    onBlur={() => void commitLayerOpacity()}
+                  />
+                  <div className="opacity-preset-row">
+                    <button className="btn-nudge btn-nudge-reset" onClick={() => void setSelectedBodyOpacity(0)}>このレイヤー0%</button>
+                    <button className="btn-nudge btn-nudge-reset" onClick={() => void setSelectedBodyOpacity(1)}>このレイヤー100%</button>
+                    <button className={`btn-nudge btn-nudge-reset opacity-highlight-toggle${overlapHighlightEnabled ? " active" : ""}`} onClick={() => void toggleOverlapHighlight()}>
+                      重なり表示 {overlapHighlightEnabled ? "ON" : "OFF"}
+                    </button>
+                  </div>
+                </div>
+              )}
+              <div className="layer-sidebar-hint">下が奥</div>
+            </div>
+          )}
+        </div>
+        {bodyPreview && (
+          <div className="zoom-controls">
+            <button className="btn-zoom" onClick={() => setZoom(prev => Math.min(10, prev * 1.3))}>+</button>
+            <span className="zoom-level">{Math.round(zoom * 100)}%</span>
+            <button className="btn-zoom" onClick={() => setZoom(prev => Math.max(0.1, prev * 0.7))}>-</button>
+            <button className="btn-zoom btn-zoom-reset" onClick={resetZoom}>リセット</button>
+          </div>
+        )}
+        <div className="base-flow-controls editing bottom-actions">
+          <div className="interp-action-panel base-flow-action body-action">
+            <div>
+              <div className="action-panel-title">{mode === "correction" ? "See-Through補正" : "素体レイヤー調整"}</div>
+              <div className="action-panel-hint">レイヤー順、ON/OFF、切り出し、透明度を確認して保存します。</div>
+            </div>
+            <div className="step-nav-actions base-output-actions">
+              <button className="btn btn-secondary" onClick={returnToModeSelect}>戻る</button>
+              {mode === "correction" ? (
+                <button className="btn btn-primary" onClick={handleExportCorrection} disabled={loading || !bodyPreview}>{loading ? "保存中..." : "PNG保存"}</button>
+              ) : (
+                <button className="btn btn-primary" onClick={handleCreateBase} disabled={loading || !bodyPreview}>{loading ? "出力中..." : "保存して戻る"}</button>
+              )}
+            </div>
+          </div>
+        </div>
+      </main>
+    );
+  }
+
+  function renderMainContent() {
+    if (mode === "select") return renderModeSelect();
+    if (mode === "workspace") return renderWorkspaceMode();
+    if (mode === "base_input") return renderSimpleInput("素体出力", "See-Throughで分解したPSDを読み込みます。", loadPsd);
+    if (mode === "hair_edit") return renderSimpleInput("Hairレイヤー確認", "この旧画面はワークスペースフローへ統合中です。", proceedToBodyEdit);
+    if (mode === "base_edit") return renderLayerEditor();
+    if (mode === "correction") return mappingPreview ? renderLayerEditor() : renderSimpleInput("See-Through補正", "補正したいPSDを読み込みます。", loadCorrectionPsd);
+    if (mode === "interp") return renderSimpleInput("フレーム補間", "旧補間モードはワークスペースフローへ統合中です。", returnFromInterpInput);
+    return null;
+  }
+
   return (
-    <div className="app">
+    <div className={`app theme-${themeMode}`}>
       <div className="app-header">
         <h1>PachiPakuGen</h1>
         <span className="version">v0.3.0</span>
+        <div className="app-header-actions">
+          <button className="btn btn-secondary theme-toggle-button" onClick={() => setThemeMode(prev => prev === "dark" ? "light" : "dark")}>
+            {themeMode === "dark" ? "ライトmode" : "ダークmode"}
+          </button>
+          {mode !== "select" && <button className="btn btn-secondary" onClick={returnToModeSelect}>制作ホーム</button>}
+        </div>
       </div>
 
       {(mode === "base_input" || mode === "hair_edit" || mode === "base_edit") && (
         <div className="interp-header base-flow-header">
-          <h2 className="interp-header-title">素体出力</h2>
-          <div className="interp-header-note">See-Throughで作成したPSDから body / hair / hair_back を出力します</div>
+          <h2 className="interp-header-title">{expressionWorkspace ? "Step 4 素体調整" : "素体出力"}</h2>
+          <div className="interp-header-note">分解済みレイヤーを確認し、作業フォルダへ保存します。</div>
         </div>
       )}
 
       {mode === "correction" && (
         <div className="interp-header base-flow-header">
           <h2 className="interp-header-title">See-Through補正</h2>
-          <div className="interp-header-note">See-Throughの分類結果を手動で切り出し、指定ファイル名でPNG保存します</div>
+          <div className="interp-header-note">See-Throughの分解結果を手動で切り出し、PNG保存します。</div>
         </div>
       )}
 
       <div className={`main-content${mode === "base_input" || mode === "hair_edit" || mode === "base_edit" || mode === "correction" ? " base-main-content" : ""}`}>
-        {/* ===== Mode Select ===== */}
-        {mode === "select" && (
-          <div className="mode-select-screen">
-            <div className="output-select-buttons">
-              <button className="btn-output" onClick={() => { setBaseStep(1); setMode("base_input"); setStatus("PSDを読み込んでください"); }}>
-                <span className="btn-output-title">素体出力</span>
-                <span className="btn-output-desc">See-Through PSD</span>
-                <span className="btn-output-desc">→ body / hair / hair_back</span>
-              </button>
-              <button className="btn-output" onClick={startCorrectionMode}>
-                <span className="btn-output-title">See-Through補正</span>
-                <span className="btn-output-desc">分類済みPSDを手動調整</span>
-                <span className="btn-output-desc">→ 指定PNG保存</span>
-              </button>
-              <button className="btn-output" onClick={() => proceedToInterp("eye")}>
-                <span className="btn-output-title">まばたき</span>
-                <span className="btn-output-desc">表情差分PSD × 2</span>
-                <span className="btn-output-desc">→ RIFE中間フレーム</span>
-              </button>
-              <button className="btn-output" onClick={() => proceedToInterp("mouth", "single")}>
-                <span className="btn-output-title">口パク mouthのみ</span>
-                <span className="btn-output-desc">表情差分PSD × 2</span>
-                <span className="btn-output-desc">→ mouth単品</span>
-              </button>
-              <button className="btn-output" onClick={() => proceedToInterp("mouth", "vowels")}>
-                <span className="btn-output-title">口パク あ〜お</span>
-                <span className="btn-output-desc">母音別PSD</span>
-                <span className="btn-output-desc">→ mouth_a〜o</span>
-              </button>
-            </div>
-          </div>
-        )}
-
-        {(mode === "base_input" || mode === "hair_edit" || mode === "base_edit") && (
-          <div className={`base-flow-controls${mode === "base_input" ? " input" : " editing"}`}>
-            <div className="interp-workflow-rail">
-              <button className={`workflow-step ${baseStep === 1 ? "active" : ""}${loadResult ? " done" : ""}`}
-                onClick={() => goBaseStep(1)}>1 入力</button>
-              <button className={`workflow-step ${baseStep === 2 ? "active" : ""}${hairPreview || hairBackPreview ? " done" : ""}`}
-                disabled={!baseStepEnabled(2)} onClick={() => goBaseStep(2)}>2 Hair</button>
-              <button className={`workflow-step ${baseStep === 3 ? "active" : ""}${bodyPreview ? " done" : ""}`}
-                disabled={!baseStepEnabled(3)} onClick={() => goBaseStep(3)}>3 Body</button>
-              <button className={`workflow-step ${baseStep === 4 ? "active" : ""}${baseResult ? " done" : ""}`}
-                disabled={!baseStepEnabled(4)} onClick={() => goBaseStep(4)}>4 確認</button>
-            </div>
-          </div>
-        )}
-
-        {mode === "correction" && !mappingPreview && (
-          <div className="mode-select-screen base-input-screen">
-            <div className="input-card-center">
-              <h2 className="input-card-title">See-Through補正 — ファイル読み込み</h2>
-              <div className="file-input-row-large">
-                <span className="file-input-label-large">PSD:</span>
-                <button className="btn btn-primary" onClick={loadCorrectionPsd} disabled={loading}>選択</button>
-                <span className="slot-path-inline-large">{loadResult ? `${loadResult.detected_layers.length}レイヤー ✓` : "未選択"}</span>
-              </div>
-              <p className="input-hint">See-Throughで分解したPSDを読み込み、任意のレイヤーを手動で補正します。</p>
-              {loading && (
-                <div className="progress-bar indeterminate" style={{ marginTop: 12 }}><div className="fill" /></div>
-              )}
-              <div className="step-nav-actions base-input-actions">
-                <button className="btn btn-secondary" onClick={() => { setMode("select"); setStatus("モードを選択してください"); }}>前へ</button>
-                <button className="btn btn-primary" disabled={!mappingPreview || loading} onClick={() => {}}>
-                  次へ
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {mode === "base_input" && (
-          <div className="mode-select-screen base-input-screen">
-            <div className="input-card-center">
-              <h2 className="input-card-title">素体出力 — ファイル読み込み</h2>
-              <div className="file-input-row-large">
-                <span className="file-input-label-large">PSD:</span>
-                <button className="btn btn-primary" onClick={loadPsd} disabled={loading}>選択</button>
-                <span className="slot-path-inline-large">{loadResult ? `${loadResult.detected_layers.length}レイヤー ✓` : "未選択"}</span>
-              </div>
-              <p className="input-hint">See-Throughで分解したPSDファイル</p>
-              {loading && (
-                <div className="progress-bar indeterminate" style={{ marginTop: 12 }}><div className="fill" /></div>
-              )}
-              <div className="step-nav-actions base-input-actions">
-                <button className="btn btn-secondary" onClick={returnFromBaseFlow}>前へ</button>
-                <button className="btn btn-primary"
-                  disabled={!loadResult || loading}
-                  onClick={proceedToHairEdit}>
-                  次へ
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* ===== Step 1/2: Hair Edit ===== */}
-        {mode === "hair_edit" && (
-          <div className="panel-right base-edit-panel">
-            <div className="preview-and-layers">
-              <div className="preview-viewport" ref={previewRef}
-                onWheel={handleWheel} onMouseDown={handleMouseDown}
-                onMouseMove={handleMouseMove} onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp}>
-                {(hairPreview || hairBackPreview) ? (<>
-                  {hairBackPreview && <img src={hairBackPreview} alt="Hair Back" className="preview-img"
-                    style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, position: "absolute" }}
-                    draggable={false} />}
-                  {hairPreview && <img src={hairPreview} alt="Hair" className="preview-img"
-                    style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, cursor: isPanning ? "grabbing" : "grab" }}
-                    draggable={false} />}
-                </>) : (
-                  <span className="placeholder">Hairプレビュー</span>
-                )}
-              </div>
-
-              <div className="layer-sidebar" onPointerMove={onDragPointerMove} onPointerUp={onDragPointerUp}>
-                {/* Hair (前髪) */}
-                {(() => {
-                  const hairCat = mappingPreview?.categories.find(c => c.target === "hair");
-                  return hairCat && hairLayerOrder.length > 0 ? (
-                    <div className="layer-sidebar-section">
-                      <div className="layer-sidebar-header">Hair (前髪)</div>
-                      <div className="layer-sidebar-hint">上が手前</div>
-                      <div className="layer-sidebar-list">
-                        {hairLayerOrder.map((name, idx) => {
-                          const layer = hairCat.layers.find(l => l.name === name);
-                          if (!layer) return null;
-                          return (
-                            <div key={layer.name} className={`layer-sidebar-item${dragTarget === "hair" && draggedIdx === idx ? " dragging" : ""}`}>
-                              <span className="drag-handle" onPointerDown={(e) => onDragPointerDown(e, idx, "hair")}>☰</span>
-                              <input type="checkbox" checked={hairEnabledLayers[layer.name] !== false}
-                                onChange={(e) => {
-                                  const en = { ...hairEnabledLayers, [layer.name]: e.target.checked };
-                                  setHairEnabledLayers(en);
-                                  renderHair(hairLayerOrder, en);
-                                }} />
-                              <img src={layer.thumbnail} alt={layer.name} className="layer-sidebar-thumb" />
-                              <span className="layer-sidebar-name">{layer.name}</span>
-                            </div>
-                          );
-                        })}
-                      </div>
-                      <div className="layer-sidebar-hint">下が奥</div>
-                    </div>
-                  ) : null;
-                })()}
-
-                {/* Hair Back (後ろ髪) */}
-                {(() => {
-                  const hairBackCat = mappingPreview?.categories.find(c => c.target === "hair_back");
-                  return hairBackCat && hairBackLayerOrder.length > 0 ? (
-                    <div className="layer-sidebar-section">
-                      <div className="layer-sidebar-header">Hair Back (後ろ髪)</div>
-                      <div className="layer-sidebar-hint">上が手前</div>
-                      <div className="layer-sidebar-list">
-                        {hairBackLayerOrder.map((name, idx) => {
-                          const layer = hairBackCat.layers.find(l => l.name === name);
-                          if (!layer) return null;
-                          return (
-                            <div key={layer.name} className={`layer-sidebar-item${dragTarget === "hair_back" && draggedIdx === idx ? " dragging" : ""}`}>
-                              <span className="drag-handle" onPointerDown={(e) => onDragPointerDown(e, idx, "hair_back")}>☰</span>
-                              <input type="checkbox" checked={hairBackEnabledLayers[layer.name] !== false}
-                                onChange={(e) => {
-                                  const en = { ...hairBackEnabledLayers, [layer.name]: e.target.checked };
-                                  setHairBackEnabledLayers(en);
-                                  renderHairBack(hairBackLayerOrder, en);
-                                }} />
-                              <img src={layer.thumbnail} alt={layer.name} className="layer-sidebar-thumb" />
-                              <span className="layer-sidebar-name">{layer.name}</span>
-                            </div>
-                          );
-                        })}
-                      </div>
-                      <div className="layer-sidebar-hint">下が奥</div>
-                    </div>
-                  ) : null;
-                })()}
-              </div>
-            </div>
-            <div className="base-flow-controls editing bottom-actions">
-              <div className="interp-action-panel base-flow-action">
-                <div>
-                  <div className="action-panel-title">Hairレイヤー確認</div>
-                  <div className="action-panel-hint">hair / hair_back の並び替えとON/OFFを確認してください。</div>
-                </div>
-                <div className="step-nav-actions">
-                  <button className="btn btn-secondary" onClick={() => goBaseStep(1)}>前へ</button>
-                  <button className="btn btn-primary" onClick={proceedToBodyEdit}>次へ</button>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* ===== フレーム補間: diff PSD input ===== */}
-        {mode === "interp" && (
-          <div className="interp-screen">
-            {/* Fixed header */}
-            <div className="interp-header">
-              <h2 className="interp-header-title">
-                {diffTarget === "eye" ? "まばたき フレーム補間" : "口パク フレーム補間"}
-              </h2>
-              <div className="interp-header-note">
-                {diffTarget === "mouth"
-                  ? "See-Throughで作成したPSDと、See-Throughに渡した元画像を使用します"
-                  : "See-Throughで作成した閉じ/開きPSDを使用します"}
-              </div>
-            </div>
-
-            {/* Scrollable content */}
-            <div className="interp-body">
-              <div className="interp-workbench">
-                <div className="interp-control-pane">
-                  <div className="interp-workflow-rail">
-                    <button className={`workflow-step ${interpStep === 1 ? "active" : ""}${visiblePairs.some(pair => !!interpPaths[pair.closed.key] && !!interpPaths[pair.open.key]) ? " done" : ""}`}
-                      onClick={() => goInterpStep(1)}>1 入力</button>
-                    {diffTarget === "mouth" && (
-                      <button className={`workflow-step ${interpStep === 2 ? "active" : ""}${visiblePairs.some(pair => !!mouthMaskPreviews[pair.open.key]) ? " done" : ""}`}
-                        disabled={!canOpenInterpStep(2)} onClick={() => goInterpStep(2)}>2 口マスク</button>
-                    )}
-                    <button className={`workflow-step ${interpStep === 3 || interpGenerating ? "active" : ""}${completedDiffs.length > 0 ? " done" : ""}`}
-                      disabled={!canOpenInterpStep(3)} onClick={() => goInterpStep(3)}>
-                      {diffTarget === "mouth" ? "3 生成" : "2 生成"}
-                    </button>
-                    <button className={`workflow-step ${interpStep === 4 ? "active" : ""}${diffPreviews.length > 0 ? " done" : ""}`}
-                      disabled={!canOpenInterpStep(4)} onClick={() => goInterpStep(4)}>
-                      {diffTarget === "mouth" ? "4 確認" : "3 確認"}
-                    </button>
-                  </div>
-                  {interpStep === 1 && (
-                  <div className={`interp-pairs-list${diffTarget === "mouth" && mouthMode === "vowels" ? " vowels" : ""}`}>
-                {visiblePairs.map(pair => {
-                  return (
-                  <div key={pair.name} className="interp-pair-block">
-                    <div className="interp-section-label">
-                      {pair.label}
-                    </div>
-                    <div className="interp-pair-row">
-                      <div className="interp-pair-item">
-                        <div className="interp-pair-item-row">
-                          <button className="btn btn-sm" onClick={() => pickInterpPsd(pair.closed.key)} disabled={interpGenerating}>
-                            {pair.closed.label} PSD
-                          </button>
-                          {interpPaths[pair.closed.key]
-                            ? <span className="interp-file-ok">✓</span>
-                            : <span className="interp-file-empty">未選択</span>}
-                        </div>
-                        <div className="interp-pair-item-row">
-                          {diffTarget === "mouth" && (<>
-                            <button className="btn btn-sm btn-secondary" onClick={() => pickInterpOriginal(pair.closed.key)} disabled={interpGenerating}>
-                              閉じ元画像
-                            </button>
-                            {interpOriginals[pair.closed.key]
-                              ? <span className="interp-file-ok">✓</span>
-                              : <span className="interp-file-empty">未選択</span>}
-                          </>)}
-                        </div>
-                      </div>
-                      <span className="interp-pair-arrow">↔</span>
-                      <div className="interp-pair-item">
-                        <div className="interp-pair-item-row">
-                          <button className="btn btn-sm" onClick={() => pickInterpPsd(pair.open.key)} disabled={interpGenerating}>
-                            {pair.open.label} PSD
-                          </button>
-                          {interpPaths[pair.open.key]
-                            ? <span className="interp-file-ok">✓</span>
-                            : <span className="interp-file-empty">未選択</span>}
-                        </div>
-                        <div className="interp-pair-item-row">
-                          {diffTarget === "mouth" && (<>
-                            <button className="btn btn-sm btn-secondary" onClick={() => pickInterpOriginal(pair.open.key)} disabled={interpGenerating}>
-                              開き元画像
-                            </button>
-                            {interpOriginals[pair.open.key]
-                              ? <span className="interp-file-ok">✓</span>
-                              : <span className="interp-file-empty">未選択</span>}
-                          </>)}
-                        </div>
-                      </div>
-                    </div>
-                    {diffTarget === "mouth" && (
-                      <div className={`pair-status-line ${mouthMaskPreviews[pair.open.key] ? "done" : ""}`}>
-                        {mouthMaskPreviews[pair.open.key] ? "口マスク作成済み" : "入力後に口マスクを作成"}
-                      </div>
-                    )}
-                  </div>
-                  );
-                })}
-                  </div>
-                  )}
-                  {interpStep === 2 && diffTarget === "mouth" && (
-                    <div className="interp-step-panel">
-                      <div className="action-panel-title">口マスク</div>
-                      <div className="action-panel-hint">入力済みペアの口マスクを作成します。作成後は右側で余白とぼかしを調整できます。</div>
-                      <div className="mask-target-list">
-                        {visiblePairs.map(pair => {
-                          const ready = isPairReady(pair);
-                          const done = !!mouthMaskPreviews[pair.open.key];
-                          return (
-                            <div
-                              key={pair.name}
-                              className={`mask-target-item${activeMaskPair?.name === pair.name ? " active" : ""}${done ? " done" : ""}${!ready ? " disabled" : ""}`}
-                              onClick={() => {
-                                if (ready) setActivePreviewKey(pair.name);
-                              }}
-                            >
-                              <span>{pair.label}</span>
-                              <div className="mask-target-status">
-                                <strong>{done ? "作成済み" : ready ? "未作成" : "入力待ち"}</strong>
-                                {done && (
-                                  <button
-                                    className="mask-discard-button"
-                                    title="口マスクを破棄"
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      discardMouthMask(pair);
-                                    }}
-                                  >
-                                    ×
-                                  </button>
-                                )}
-                              </div>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  )}
-                  <div className="interp-action-panel">
-                    {interpStep === 1 ? (
-                      <>
-                        <div className="action-panel-title">入力</div>
-                        <div className="action-panel-hint">
-                          {diffTarget === "mouth"
-                            ? (mouthMode === "vowels"
-                              ? "閉じ/開きのPSDと元画像を最低1組設定してください。"
-                              : "閉じ/開きのPSDと元画像を設定してください。")
-                            : "閉じ/開きPSDを設定してください。"}
-                        </div>
-                        <div className="step-nav-actions">
-                          <button className="btn btn-secondary" onClick={returnFromInterpInput}>前へ</button>
-                          <button className="btn btn-primary" disabled={!canOpenInterpStep(diffTarget === "mouth" ? 2 : 3)}
-                            onClick={() => goInterpStep(diffTarget === "mouth" ? 2 : 3)}>
-                            次へ
-                          </button>
-                        </div>
-                      </>
-                    ) : interpStep === 2 && diffTarget === "mouth" ? (
-                      <>
-                        <div className="action-panel-title">口マスク作成</div>
-                        <div className="action-panel-hint">
-                          {allReadyPairsHaveMasks ? "右側でマスクを確認し、必要なら余白とぼかしを調整してください。作り直す場合は作成済み行の×で破棄できます。" : "SAM3で口マスクを作成します。結果は右側に表示されます。"}
-                        </div>
-                        <button className="btn btn-primary" style={{ padding: "10px 40px", fontSize: "1rem" }}
-                          disabled={missingMouthMaskCount === 0 || interpGenerating || anyMouthMaskPreviewing}
-                          onClick={handleCreateMouthMasks}>
-                          {interpGenerating || anyMouthMaskPreviewing ? "作成中..." : "口マスク作成"}
-                        </button>
-                        <div className="step-nav-actions">
-                          <button className="btn btn-secondary" onClick={() => goInterpStep(1)}>前へ</button>
-                          <button className="btn btn-primary" disabled={!allReadyPairsHaveMasks} onClick={() => goInterpStep(3)}>
-                            次へ
-                          </button>
-                        </div>
-                      </>
-                    ) : interpStep === 3 ? (
-                      <>
-                        <div className="interp-footer-row">
-                          <span className="interp-footer-label">フレーム数:</span>
-                          <input type="range" min={2} max={16} value={frameCount}
-                            onChange={(e) => setFrameCount(Number(e.target.value))} style={{ flex: 1 }} />
-                          <span className="frame-count-value">{frameCount}</span>
-                        </div>
-                        {interpGenerating && (
-                          <div className="progress-bar" style={{ marginTop: 4 }}><div className="fill" style={{ width: `${progress.total > 0 ? (progress.current / progress.total) * 100 : 0}%` }} /></div>
-                        )}
-                        <div className="interp-footer-actions generate-actions">
-                          {completedDiffs.length > 0 && (
-                            <div className="completed-list">
-                              {completedDiffs.map(d => <span key={d} className="completed-badge">{d}</span>)}
-                            </div>
-                          )}
-                          <button className="btn btn-primary" style={{ padding: "10px 40px", fontSize: "1rem" }}
-                            disabled={!canGenerate || interpGenerating}
-                            onClick={handleGenerateAll}>
-                            {interpGenerating ? "生成中..." : "中間フレーム作成"}
-                          </button>
-                          <div className="step-nav-actions">
-                            <button className="btn btn-secondary" onClick={() => goInterpStep(diffTarget === "mouth" ? 2 : 1)}>前へ</button>
-                            <button className="btn btn-primary" disabled={diffPreviews.length === 0} onClick={() => goInterpStep(4)}>次へ</button>
-                          </div>
-                        </div>
-                      </>
-                    ) : (
-                      <>
-                        <div className="action-panel-title">確認</div>
-                        <div className="action-panel-hint">右側のプレビューで生成結果を確認してください。</div>
-                        <div className="interp-footer-actions confirm-actions">
-                          {completedDiffs.length > 0 && outputPath && (
-                            <button className="btn btn-open-folder" onClick={openOutputFolder}>出力フォルダを開く</button>
-                          )}
-                          <div className="step-nav-actions">
-                            <button className="btn btn-secondary" onClick={() => goInterpStep(3)}>前へ</button>
-                            <button className="btn btn-secondary" onClick={returnToModeSelect}>モード選択へ</button>
-                          </div>
-                        </div>
-                      </>
-                    )}
-                  </div>
-                </div>
-                <div className="interp-preview-pane">
-                  <div className="preview-pane-header">
-                    <span>{diffPreviews.length > 0 ? "生成プレビュー" : diffTarget === "mouth" ? "口マスクプレビュー" : "生成プレビュー"}</span>
-                    <small>{diffPreviews.length > 0 ? "差分部分を拡大再生" : diffTarget === "mouth" ? "口マスク作成後にここへ表示" : "生成後にここへ表示"}</small>
-                  </div>
-                  {diffPreviews.length > 0 ? (
-                    <>
-                      {diffPreviews.length > 1 && (
-                        <div className="preview-tabs">
-                          {diffPreviews.map(preview => (
-                            <button
-                              key={preview.pairName}
-                              className={`preview-tab${(activeDiffPreview?.pairName ?? "") === preview.pairName ? " active" : ""}`}
-                              onClick={() => setActivePreviewKey(preview.pairName)}
-                            >
-                              {preview.label.replace("口パク（", "").replace("）", "")}
-                            </button>
-                          ))}
-                        </div>
-                      )}
-                      {activeDiffPreview ? (() => {
-                        const frameIndex = pingPongFrameIndex(diffPreviewTick, activeDiffPreview.frames.length);
-                        const frame = activeDiffPreview.frames[frameIndex];
-                        return (
-                          <div className="diff-preview-card large">
-                            <div className="diff-preview-title">{activeDiffPreview.label}</div>
-                            <div className="diff-preview-stage">
-                              <img
-                                src={frame}
-                                alt={`${activeDiffPreview.label} preview`}
-                                style={{ transform: `scale(${diffPreviewZoom})` }}
-                                draggable={false}
-                              />
-                            </div>
-                            <div className="diff-preview-meta">
-                              {(frameIndex + 1).toString().padStart(3, "0")} / {activeDiffPreview.frames.length}
-                            </div>
-                            <div className="mouth-preview-zoom-controls">
-                              <button className="btn-zoom" onClick={() => setDiffPreviewZoom(prev => Math.max(1, prev - 0.25))}>-</button>
-                              <input type="range" min={1} max={5} step={0.05} value={diffPreviewZoom}
-                                onChange={(e) => setDiffPreviewZoom(Number(e.target.value))} />
-                              <button className="btn-zoom" onClick={() => setDiffPreviewZoom(prev => Math.min(5, prev + 0.25))}>+</button>
-                              <span className="zoom-level">{Math.round(diffPreviewZoom * 100)}%</span>
-                            </div>
-                          </div>
-                        );
-                      })() : null}
-                    </>
-                  ) : diffTarget === "mouth" && activeMaskPreview ? (
-                    <>
-                      {visiblePairs.filter(pair => mouthMaskPreviews[pair.open.key]).length > 1 && (
-                        <div className="preview-tabs">
-                          {visiblePairs.filter(pair => mouthMaskPreviews[pair.open.key]).map(pair => (
-                            <button
-                              key={pair.name}
-                              className={`preview-tab${activeMaskPair?.name === pair.name ? " active" : ""}`}
-                              onClick={() => setActivePreviewKey(pair.name)}
-                            >
-                              {pair.label.replace("口パク（", "").replace("）", "")}
-                            </button>
-                          ))}
-                        </div>
-                      )}
-                      <div className="mouth-mask-panel preview-side">
-                        <div className="mouth-mask-control-grid">
-                          <label className="mouth-mask-slider">
-                            <span>余白</span>
-                            <input type="range" min={0} max={40} value={activeMaskSetting.dilate}
-                              onChange={(e) => updateMouthMaskSetting(activeMaskSlot, { dilate: Number(e.target.value) })} />
-                            <strong>{activeMaskSetting.dilate}px</strong>
-                          </label>
-                          <label className="mouth-mask-slider">
-                            <span>ぼかし</span>
-                            <input type="range" min={0} max={16} value={activeMaskSetting.blur}
-                              onChange={(e) => updateMouthMaskSetting(activeMaskSlot, { blur: Number(e.target.value) })} />
-                            <strong>{activeMaskSetting.blur}px</strong>
-                          </label>
-                        </div>
-                        <div
-                          className="mouth-mask-preview-viewport right-preview"
-                          onPointerDown={(e) => onMouthPreviewPointerDown(e, activeMaskSlot)}
-                          onPointerMove={onMouthPreviewPointerMove}
-                          onPointerUp={onMouthPreviewPointerUp}
-                          onPointerCancel={onMouthPreviewPointerUp}
-                        >
-                          <img
-                            src={activeMaskPreview}
-                            alt={`${activeMaskPair?.label ?? "口"} 口マスク`}
-                            className="mouth-mask-preview"
-                            style={{ transform: `translate(${activeMaskPan.x}px, ${activeMaskPan.y}px) scale(${activeMaskZoom})` }}
-                            draggable={false}
-                          />
-                          <button className="mouth-preview-reset" onClick={(e) => { e.stopPropagation(); resetMouthPreviewView(activeMaskSlot); }}>
-                            リセット
-                          </button>
-                        </div>
-                        <div className="mouth-preview-zoom-controls">
-                          <button className="btn-zoom" onClick={() => setMouthPreviewZoom(activeMaskSlot, activeMaskZoom - 0.25)}>-</button>
-                          <input type="range" min={1} max={5} step={0.05} value={activeMaskZoom}
-                            onChange={(e) => setMouthPreviewZoom(activeMaskSlot, Number(e.target.value))} />
-                          <button className="btn-zoom" onClick={() => setMouthPreviewZoom(activeMaskSlot, activeMaskZoom + 0.25)}>+</button>
-                          <span className="zoom-level">{Math.round(activeMaskZoom * 100)}%</span>
-                        </div>
-                      </div>
-                    </>
-                  ) : (
-                    <div className="diff-preview-empty">
-                      {diffTarget === "mouth" ? "口マスク作成後、ここにマスク確認プレビューを表示します" : "RIFE生成後、目の差分だけを拡大して再生します"}
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* ===== Step 3A: base_edit / correction — Right Panel ===== */}
-        {(mode === "base_edit" || (mode === "correction" && !!mappingPreview)) && <div className="panel-right base-edit-panel">
-          <div className="preview-and-layers">
-            <div className="preview-viewport" ref={previewRef}
-              onWheel={handleWheel} onMouseDown={handleMouseDown}
-              onMouseMove={handleMouseMove} onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp}>
-              {bodyPreview ? (
-                <img src={bodyPreview} alt="Body" className="preview-img"
-                  style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, cursor: isPanning ? "grabbing" : "grab" }}
-                  draggable={false} />
-              ) : (
-                <span className="placeholder">{mode === "correction" ? "補正プレビュー" : "Bodyプレビュー"}</span>
-              )}
-              {bodyPreview && patchDraftSource && (
-                <canvas
-                  ref={maskCanvasRef}
-                  className="patch-mask-canvas"
-                  style={previewImageStyle()}
-                  onPointerDown={onPatchMaskPointerDown}
-                  onPointerMove={onPatchMaskPointerMove}
-                  onPointerUp={onPatchMaskPointerUp}
-                  onPointerCancel={onPatchMaskPointerUp}
-                  onPointerLeave={onPatchMaskPointerLeave}
-                />
-              )}
-              {bodyPreview && patchDraftSource && brushCursor.visible && (
-                <div
-                  className="patch-brush-cursor"
-                  style={brushCursorStyle()}
-                />
-              )}
-            </div>
-
-            {bodyCategory && layerOrder.length > 0 && (
-              <div className="layer-sidebar" onPointerMove={onDragPointerMove} onPointerUp={onDragPointerUp}>
-                <div className="layer-sidebar-title-row">
-                  <div>
-                    <div className="layer-sidebar-header">レイヤー順序</div>
-                    <div className="layer-sidebar-hint">上が手前</div>
-                  </div>
-                  {mode === "correction" && (
-                    <button className="btn-layer-add" onClick={() => void addCorrectionLayerImage()} disabled={loading}>
-                      PNG追加
-                    </button>
-                  )}
-                </div>
-                <div className="layer-bulk-row">
-                  <button className="btn-layer-bulk" onClick={() => void setAllLayerVisibility(true)}>全ON</button>
-                  <button className="btn-layer-bulk" onClick={() => void setAllLayerVisibility(false)}>全OFF</button>
-                </div>
-                <div className="layer-sidebar-list">
-                  {layerOrder.map((name, idx) => {
-                    const layer = getBodyOrderItem(name);
-                    if (!layer) return null;
-                    const patch = layerPatches.find(p => p.id === name);
-                    const sourceName = patch?.sourceLayer ?? name;
-                    const opacity = layerOpacities[name] ?? 1;
-                    return (
-                      <div
-                        key={name}
-                        className={`layer-sidebar-item${draggedIdx === idx ? " dragging" : ""}${selectedBodyLayer === name ? " selected" : ""}${layer.isPatch ? " patch" : ""}`}
-                        onClick={() => setSelectedBodyLayer(name)}
-                      >
-                        <span className="drag-handle" onPointerDown={(e) => onDragPointerDown(e, idx)}>☰</span>
-                        <input type="checkbox" checked={enabledLayers[name] !== false}
-                          onChange={(e) => handleLayerToggle(name, e.target.checked)} />
-                        <img src={layer.thumbnail} alt={layer.name} className="layer-sidebar-thumb" />
-                        <span className="layer-sidebar-name">{layer.name}</span>
-                        {opacity < 1 && (
-                          <span className="layer-offset-badge">{Math.round(opacity * 100)}%</span>
-                        )}
-                        {layer.isPatch ? (
-                          <button className="btn-layer-mini" onClick={(e) => { e.stopPropagation(); void removeLayerPatch(name); }}>
-                            削除
-                          </button>
-                        ) : (
-                          <button className="btn-layer-mini" onClick={(e) => { e.stopPropagation(); initPatchMask(sourceName); }}>
-                            切出
-                          </button>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-                {patchDraftSource && (
-                  <div className="layer-adjust-panel patch-panel">
-                    <div className="layer-adjust-title">パッチ作成: {patchDraftSource}</div>
-                    <div className="layer-adjust-values">塗った範囲を別レイヤーとして切り出し、元レイヤーから抜きます</div>
-                    <div className="patch-tool-row">
-                      <button className={`btn-nudge ${patchTool === "paint" ? "active" : ""}`} onClick={() => setPatchTool("paint")}>塗る</button>
-                      <button className={`btn-nudge ${patchTool === "erase" ? "active" : ""}`} onClick={() => setPatchTool("erase")}>消す</button>
-                    </div>
-                    <input
-                      type="range"
-                      min={4}
-                      max={96}
-                      value={patchBrushSize}
-                      onChange={(e) => setPatchBrushSize(Number(e.target.value))}
-                    />
-                    <div className="patch-tool-row">
-                      <button className="btn-nudge btn-nudge-reset" onClick={clearPatchMask}>クリア</button>
-                      <button className="btn-nudge btn-nudge-reset" onClick={() => setPatchDraftSource("")}>取消</button>
-                      <button className="btn-nudge btn-nudge-reset" onClick={commitPatchMask}>追加</button>
-                    </div>
-                  </div>
-                )}
-                {selectedBodyLayer && (
-                  <div className="layer-adjust-panel opacity-panel">
-                    <div className="layer-adjust-title">表示透明度: {getBodyOrderItem(selectedBodyLayer)?.name ?? selectedBodyLayer}</div>
-                    <div className="layer-adjust-values">{Math.round(selectedLayerOpacity * 100)}%</div>
-                    <input
-                      type="range"
-                      min={0}
-                      max={100}
-                      value={Math.round(selectedLayerOpacity * 100)}
-                      onChange={(e) => updateLayerOpacityDraft(selectedBodyLayer, Number(e.target.value) / 100)}
-                      onPointerUp={() => void commitLayerOpacity()}
-                      onMouseUp={() => void commitLayerOpacity()}
-                      onTouchEnd={() => void commitLayerOpacity()}
-                      onBlur={() => void commitLayerOpacity()}
-                    />
-                    <div className="opacity-preset-row layer-only">
-                      <button className="btn-nudge btn-nudge-reset" onClick={() => void setSelectedBodyOpacity(0)}>このレイヤー0%</button>
-                      <button className="btn-nudge btn-nudge-reset" onClick={() => void setSelectedBodyOpacity(0.5)}>このレイヤー50%</button>
-                      <button className="btn-nudge btn-nudge-reset" onClick={() => void setSelectedBodyOpacity(1)}>このレイヤー100%</button>
-                    </div>
-                    <div className="opacity-preset-row">
-                      <button className="btn-nudge btn-nudge-reset" onClick={() => void setAllBodyOpacities(0)}>全て0%</button>
-                      <button className="btn-nudge btn-nudge-reset" onClick={() => void setAllBodyOpacities(0.5)}>全て50%</button>
-                      <button className="btn-nudge btn-nudge-reset" onClick={() => void setAllBodyOpacities(1)}>全て100%</button>
-                    </div>
-                    <button
-                      className={`btn-nudge btn-nudge-reset opacity-highlight-toggle${overlapHighlightEnabled ? " active" : ""}`}
-                      onClick={() => void toggleOverlapHighlight()}
-                    >
-                      重なり表示 {overlapHighlightEnabled ? "ON" : "OFF"}
-                    </button>
-                  </div>
-                )}
-                <div className="layer-sidebar-hint">下が奥</div>
-              </div>
-            )}
-          </div>
-
-          {bodyPreview && (
-            <div className="zoom-controls">
-              <button className="btn-zoom" onClick={() => setZoom(prev => Math.min(10, prev * 1.3))}>+</button>
-              <span className="zoom-level">{Math.round(zoom * 100)}%</span>
-              <button className="btn-zoom" onClick={() => setZoom(prev => Math.max(0.1, prev * 0.7))}>-</button>
-              <button className="btn-zoom btn-zoom-reset" onClick={resetZoom}>リセット</button>
-            </div>
-          )}
-          <div className="base-flow-controls editing bottom-actions">
-            {mode === "correction" ? (
-              <div className="interp-action-panel base-flow-action body-action">
-                <div>
-                  <div className="action-panel-title">{correctionOutputPath ? "出力結果確認" : "See-Through補正"}</div>
-                  <div className="action-panel-hint">
-                    {correctionOutputPath
-                      ? "PNG保存が完了しました。出力先を開いて結果を確認できます。"
-                      : "レイヤーのON/OFF、並び替え、切り出しを調整してPNG保存します。"}
-                  </div>
-                </div>
-                {correctionOutputPath ? (
-                  <div className="confirm-actions">
-                    <button className="btn btn-open-folder" onClick={() => revealItemInDir(correctionOutputPath).catch(() => {})}>出力フォルダを開く</button>
-                    <div className="step-nav-actions">
-                      <button className="btn btn-primary" onClick={handleExportCorrection} disabled={loading || !bodyPreview}>
-                        {loading ? "保存中..." : "再保存"}
-                      </button>
-                      <button className="btn btn-secondary" onClick={returnToModeSelect}>モード選択へ</button>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="step-nav-actions base-output-actions">
-                    <button className="btn btn-secondary" onClick={() => { setMode("select"); setStatus("モードを選択してください"); }}>前へ</button>
-                    <button className="btn btn-primary" onClick={handleExportCorrection} disabled={loading || !bodyPreview}>
-                      {loading ? "保存中..." : "PNG保存"}
-                    </button>
-                  </div>
-                )}
-              </div>
-            ) : baseStep !== 4 ? (
-              <div className="interp-action-panel base-flow-action body-action">
-                <div>
-                  <div className="action-panel-title">Bodyレイヤー調整</div>
-                  <div className="action-panel-hint">レイヤー順、ON/OFF、切り出し、透明度を調整してから出力します。</div>
-                </div>
-                <div className="step-nav-actions base-output-actions">
-                  <button className="btn btn-secondary" onClick={() => goBaseStep(2)}>前へ</button>
-                  <button className="btn btn-primary" onClick={handleCreateBase} disabled={loading}>
-                    {loading ? "出力中..." : "出力して確認へ"}
-                  </button>
-                </div>
-              </div>
-            ) : (
-              <div className="interp-action-panel base-flow-action">
-                <div>
-                  <div className="action-panel-title">確認</div>
-                  <div className="action-panel-hint">素体出力が完了しました。出力先を開いて結果を確認できます。</div>
-                </div>
-                <div className="confirm-actions">
-                  {baseResult && <button className="btn btn-open-folder" onClick={() => revealItemInDir(baseResult.output_path).catch(() => {})}>出力フォルダを開く</button>}
-                  <div className="step-nav-actions">
-                    <button className="btn btn-secondary" onClick={() => setBaseStep(3)}>前へ</button>
-                    <button className="btn btn-secondary" onClick={returnToModeSelect}>モード選択へ</button>
-                  </div>
-                </div>
-              </div>
-            )}
-          </div>
-        </div>}
-
+        {renderMainContent()}
       </div>
 
-      <div className="status-bar">
-        {error && <span className="error-msg">{error}</span>}
-        {!error && status}
-      </div>
+      {mode !== "workspace" && (
+        <div className="status-bar">
+          {error && <span className="error-msg">{error}</span>}
+          {!error && status}
+        </div>
+      )}
     </div>
   );
 }

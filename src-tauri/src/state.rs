@@ -1,4 +1,4 @@
-use image::DynamicImage;
+use image::{DynamicImage, GrayImage};
 use ort::session::Session;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -9,6 +9,14 @@ pub struct AppState {
     // Per-slot imported layers from See-Through (PSD or folder).
     // Key "current": the most recently loaded PSD/folder's layers
     pub slot_layers: Mutex<HashMap<String, HashMap<String, DynamicImage>>>,
+
+    // Current See-Through PSD layer order, bottom/back first. HashMap alone
+    // cannot preserve this order, which is required for recomposition.
+    pub slot_layer_order: Mutex<Vec<String>>,
+
+    // Per-pixel See-Through depth maps for the current PSD. Lower values are
+    // closer to the viewer and allow local visibility clipping at overlaps.
+    pub slot_depth_maps: Mutex<HashMap<String, GrayImage>>,
 
     // User-confirmed mapping for adjustable layers.
     pub layer_mapping: Mutex<HashMap<String, String>>,
@@ -33,6 +41,9 @@ pub struct AppState {
     // Per-original cache so UI adjustments do not rerun SAM3 for vowel previews.
     pub cached_mouth_originals: Mutex<HashMap<String, DynamicImage>>,
     pub cached_mouth_raw_masks: Mutex<HashMap<String, Vec<u8>>>,
+
+    // PID of the currently running See-Through setup or inference process.
+    pub see_through_pid: Mutex<Option<u32>>,
 }
 
 impl Default for AppState {
@@ -40,6 +51,8 @@ impl Default for AppState {
         Self {
             rife_session: Mutex::new(None),
             slot_layers: Mutex::new(HashMap::new()),
+            slot_layer_order: Mutex::new(Vec::new()),
+            slot_depth_maps: Mutex::new(HashMap::new()),
             layer_mapping: Mutex::new(HashMap::new()),
             parts: Mutex::new(HashMap::new()),
             canvas_width: Mutex::new(0),
@@ -49,6 +62,7 @@ impl Default for AppState {
             cached_mouth_raw_mask: Mutex::new(None),
             cached_mouth_originals: Mutex::new(HashMap::new()),
             cached_mouth_raw_masks: Mutex::new(HashMap::new()),
+            see_through_pid: Mutex::new(None),
         }
     }
 }
