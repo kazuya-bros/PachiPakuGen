@@ -61,6 +61,10 @@ pub fn run() {
             commands::expression::save_codex_base_parts,
             commands::expression::adjust_codex_extracted_parts,
             commands::expression::generate_expression_set,
+            commands::motion_lab::load_motion_lab_parts,
+            commands::motion_lab::save_motion_lab_manifest,
+            commands::motion_lab::load_motion_lab_manifest,
+            commands::motion_lab::save_spritalk_motion_profile,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -234,8 +234,497 @@ const MOUTH_PAIRS_VOWELS = [
     required: false },
 ];
 
-type Mode = "select" | "workspace" | "base_input" | "hair_edit" | "base_edit" | "correction" | "interp";
+type Mode = "select" | "workspace" | "motion_lab" | "base_input" | "hair_edit" | "base_edit" | "correction" | "interp";
 type ThemeMode = "dark" | "light";
+type MotionLabMouthKey = "closed" | "a" | "i" | "u" | "e" | "o";
+type MotionLabMethod = "baseline" | "smooth" | "bridge";
+type MotionLabLayerMode = "simple" | "spring" | "mesh";
+type MotionLabPreset = "calm" | "normal" | "lively";
+type MotionLabVerdict = "undecided" | "promising" | "hold" | "reject";
+type MotionLabReviewKey =
+  | "mouthSmoothness"
+  | "vowelReadability"
+  | "bodyNaturalness"
+  | "hairBodySeparation"
+  | "settingSimplicity"
+  | "migrationConfidence";
+
+interface MotionLabPartsResult {
+  sourceDir: string;
+  width: number;
+  height: number;
+  body: string;
+  hair: string | null;
+  hairBack: string | null;
+  eyeFrames: string[];
+  mouths: Partial<Record<MotionLabMouthKey, string[]>>;
+  missing: string[];
+  warnings: string[];
+}
+
+interface MotionLabImageSet {
+  body: HTMLImageElement;
+  hair: HTMLImageElement | null;
+  hairBack: HTMLImageElement | null;
+  mouths: Partial<Record<MotionLabMouthKey, HTMLImageElement[]>>;
+}
+
+interface MotionLabMouthRuntime {
+  openY: number;
+  activeTarget: MotionLabMouthKey;
+  previousTarget: MotionLabMouthKey;
+  transitionStartMs: number;
+  lastMs: number;
+}
+
+interface MotionLabLayerTransform {
+  x: number;
+  y: number;
+  rotationDeg: number;
+  scaleX: number;
+  scaleY: number;
+}
+
+interface MotionLabStripWarpOptions {
+  rootYRatio: number;
+  swayX: number;
+  swayY: number;
+  wavePhase: number;
+  stripCount?: number;
+  alpha?: number;
+}
+
+interface MotionLabRenderSettings {
+  mouthMethod: MotionLabMethod;
+  layerMode: MotionLabLayerMode;
+  preset: MotionLabPreset;
+  attackMs: number;
+  releaseMs: number;
+  crossfadeMs: number;
+  restBias: number;
+  shapeSmoothing: number;
+  bridgeBias: number;
+  breathAmplitude: number;
+  bodySwayAmplitude: number;
+  hairFrontDelay: number;
+  hairBackDelay: number;
+}
+
+interface MotionLabManifest {
+  schema?: string;
+  sourcePartsDir?: string;
+  createdAt?: string;
+  methods?: {
+    baseline?: {
+      enabled?: boolean;
+    };
+    lipTimelineSmoother?: {
+      enabled?: boolean;
+      method?: MotionLabMethod;
+      attackMs?: number;
+      releaseMs?: number;
+      crossfadeMs?: number;
+      restBias?: number;
+      shapeSmoothing?: number;
+      bridgeBias?: number;
+    };
+    layeredSpring?: {
+      enabled?: boolean;
+      layerMode?: MotionLabLayerMode;
+      preset?: MotionLabPreset;
+      breathAmplitude?: number;
+      bodySwayAmplitude?: number;
+      hairFrontDelay?: number;
+      hairBackDelay?: number;
+    };
+  };
+  timeline?: { type?: string };
+  review?: {
+    verdict?: MotionLabVerdict;
+    note?: string;
+    scores?: Partial<Record<MotionLabReviewKey, number>>;
+  };
+}
+
+interface MotionLabManifestResult {
+  path: string;
+  manifest: MotionLabManifest;
+}
+
+interface SpritalkMotionProfile {
+  schema: string;
+  sourcePartsDir: string;
+  createdAt: string;
+  generatedBy: string;
+  blink: {
+    mode: "keepExisting";
+  };
+  lipSync: {
+    method: MotionLabMethod;
+    attackMs: number;
+    releaseMs: number;
+    crossfadeMs: number;
+    restBias: number;
+    shapeSmoothing: number;
+    bridgeBias: number;
+  };
+  layerMotion: {
+    mode: MotionLabLayerMode;
+    preset: MotionLabPreset;
+    breathAmplitude: number;
+    bodySwayAmplitude: number;
+    hairFrontDelayMs: number;
+    hairBackDelayMs: number;
+  };
+  spritalkProceduralAnimation: {
+    breathing: {
+      enabled: boolean;
+      amplitude: number;
+      speed: number;
+    };
+    idleSway: {
+      enabled: boolean;
+      amplitudeX: number;
+      amplitudeY: number;
+      speed: number;
+      reduceOnSpeech: boolean;
+    };
+    hairSway: {
+      enabled: boolean;
+      amplitude: number;
+      speed: number;
+      rotationAmount: number;
+    };
+    hairBackSway: {
+      enabled: boolean;
+      amplitude: number;
+      speed: number;
+      rotationAmount: number;
+    };
+  };
+  runtimeRequirements: {
+    lipSyncRenderer: "directLayerSwitch" | "smoothedFrameStepper" | "neutralBridgeOpacityBlend";
+    layerRenderer: "existingProceduralAnimator" | "stripWarpExtension";
+  };
+  review: {
+    verdict: MotionLabVerdict;
+    note: string;
+    scores: Record<MotionLabReviewKey, number>;
+  };
+}
+
+interface SpritalkMotionProfileResult {
+  path: string;
+  profile: SpritalkMotionProfile;
+}
+
+const MOTION_LAB_MOUTH_KEYS: MotionLabMouthKey[] = ["closed", "a", "i", "u", "e", "o"];
+const MOTION_LAB_VOWEL_KEYS: MotionLabMouthKey[] = ["a", "i", "u", "e", "o"];
+const MOTION_LAB_MOUTH_LABELS: Record<MotionLabMouthKey, string> = {
+  closed: "閉",
+  a: "あ",
+  i: "い",
+  u: "う",
+  e: "え",
+  o: "お",
+};
+const MOTION_LAB_TARGET_OPEN: Record<MotionLabMouthKey, number> = {
+  closed: 0,
+  a: 1,
+  i: 0.58,
+  u: 0.68,
+  e: 0.62,
+  o: 0.78,
+};
+const MOTION_LAB_DURATION_MS = 4200;
+const MOTION_LAB_TIMELINE: Array<{ timeMs: number; mouth: MotionLabMouthKey; energy: number }> = [
+  { timeMs: 0, mouth: "closed", energy: 0 },
+  { timeMs: 450, mouth: "a", energy: 0.85 },
+  { timeMs: 950, mouth: "i", energy: 0.65 },
+  { timeMs: 1450, mouth: "u", energy: 0.7 },
+  { timeMs: 1950, mouth: "e", energy: 0.6 },
+  { timeMs: 2450, mouth: "o", energy: 0.75 },
+  { timeMs: 3200, mouth: "closed", energy: 0.1 },
+];
+const MOTION_LAB_PRESET_FACTORS: Record<MotionLabPreset, { breath: number; body: number; hair: number }> = {
+  calm: { breath: 0.65, body: 0.55, hair: 0.55 },
+  normal: { breath: 1, body: 1, hair: 1 },
+  lively: { breath: 1.25, body: 1.35, hair: 1.45 },
+};
+const MOTION_LAB_DEFAULT_REVIEW_SCORES: Record<MotionLabReviewKey, number> = {
+  mouthSmoothness: 3,
+  vowelReadability: 3,
+  bodyNaturalness: 3,
+  hairBodySeparation: 3,
+  settingSimplicity: 3,
+  migrationConfidence: 3,
+};
+const MOTION_LAB_REVIEW_LABELS: Record<MotionLabReviewKey, string> = {
+  mouthSmoothness: "口の滑らかさ",
+  vowelReadability: "母音の読みやすさ",
+  bodyNaturalness: "身体の自然さ",
+  hairBodySeparation: "髪と身体の分離",
+  settingSimplicity: "設定の少なさ",
+  migrationConfidence: "移植しやすさ",
+};
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function motionLabTimelineAt(elapsedMs: number): { mouth: MotionLabMouthKey; energy: number; loopMs: number } {
+  const loopMs = ((elapsedMs % MOTION_LAB_DURATION_MS) + MOTION_LAB_DURATION_MS) % MOTION_LAB_DURATION_MS;
+  let current = MOTION_LAB_TIMELINE[0];
+  for (const event of MOTION_LAB_TIMELINE) {
+    if (event.timeMs <= loopMs) current = event;
+  }
+  return { mouth: current.mouth, energy: current.energy, loopMs };
+}
+
+function pickMotionLabMouthFrame(frames: HTMLImageElement[] | undefined, openY: number): HTMLImageElement | null {
+  if (!frames?.length) return null;
+  const index = frames.length === 1 ? 0 : Math.round(clamp(openY, 0, 1) * (frames.length - 1));
+  return frames[index] ?? frames[0] ?? null;
+}
+
+function loadMotionLabImage(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("画像プレビューを読み込めませんでした"));
+    image.src = src;
+  });
+}
+
+function validMotionLabPreset(value: unknown): MotionLabPreset {
+  return value === "calm" || value === "lively" || value === "normal" ? value : "normal";
+}
+
+function validMotionLabLayerMode(value: unknown): MotionLabLayerMode {
+  return value === "simple" || value === "mesh" || value === "spring" ? value : "spring";
+}
+
+function validMotionLabMethod(value: unknown): MotionLabMethod {
+  return value === "baseline" || value === "bridge" || value === "smooth" ? value : "smooth";
+}
+
+function validMotionLabVerdict(value: unknown): MotionLabVerdict {
+  return value === "promising" || value === "hold" || value === "reject" || value === "undecided"
+    ? value
+    : "undecided";
+}
+
+function drawMotionLabLayer(
+  ctx: CanvasRenderingContext2D,
+  image: HTMLImageElement,
+  width: number,
+  height: number,
+  transform: MotionLabLayerTransform,
+  alpha = 1,
+) {
+  const pivotX = width * 0.5;
+  const pivotY = height * 0.58;
+  ctx.save();
+  ctx.globalAlpha *= alpha;
+  ctx.translate(pivotX + transform.x, pivotY + transform.y);
+  ctx.rotate((transform.rotationDeg * Math.PI) / 180);
+  ctx.scale(transform.scaleX, transform.scaleY);
+  ctx.drawImage(image, -pivotX, -pivotY, width, height);
+  ctx.restore();
+}
+
+function drawMotionLabStripWarp(
+  ctx: CanvasRenderingContext2D,
+  image: HTMLImageElement,
+  width: number,
+  height: number,
+  transform: MotionLabLayerTransform,
+  options: MotionLabStripWarpOptions,
+) {
+  const pivotX = width * 0.5;
+  const pivotY = height * 0.58;
+  const stripCount = options.stripCount ?? 24;
+  const alpha = options.alpha ?? 1;
+  ctx.save();
+  ctx.globalAlpha *= alpha;
+  ctx.translate(pivotX + transform.x, pivotY + transform.y);
+  ctx.rotate((transform.rotationDeg * Math.PI) / 180);
+  ctx.scale(transform.scaleX, transform.scaleY);
+  for (let index = 0; index < stripCount; index += 1) {
+    const sourceY = Math.floor((height * index) / stripCount);
+    const nextY = Math.floor((height * (index + 1)) / stripCount);
+    const stripHeight = Math.max(1, nextY - sourceY);
+    const centerYRatio = (sourceY + stripHeight * 0.5) / height;
+    const tipRatio = clamp((centerYRatio - options.rootYRatio) / Math.max(0.001, 1 - options.rootYRatio), 0, 1);
+    const bend = Math.pow(tipRatio, 1.35);
+    const wave = 0.68 + Math.sin(options.wavePhase + centerYRatio * Math.PI * 4.2) * 0.32;
+    const dx = options.swayX * bend * wave;
+    const dy = options.swayY * bend;
+    ctx.drawImage(
+      image,
+      0,
+      sourceY,
+      width,
+      stripHeight,
+      -pivotX + dx,
+      -pivotY + sourceY + dy,
+      width,
+      stripHeight + 1,
+    );
+  }
+  ctx.restore();
+}
+
+function resetMotionLabRuntime(runtime: MotionLabMouthRuntime) {
+  runtime.openY = 0;
+  runtime.activeTarget = "closed";
+  runtime.previousTarget = "closed";
+  runtime.transitionStartMs = 0;
+  runtime.lastMs = 0;
+}
+
+function prepareMotionLabCanvas(canvas: HTMLCanvasElement | null, width: number, height: number): CanvasRenderingContext2D | null {
+  const ctx = canvas?.getContext("2d") ?? null;
+  if (!canvas || !ctx) return null;
+  canvas.width = width;
+  canvas.height = height;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  return ctx;
+}
+
+function drawMotionLabScene(
+  ctx: CanvasRenderingContext2D,
+  parts: MotionLabPartsResult,
+  images: MotionLabImageSet,
+  runtime: MotionLabMouthRuntime,
+  elapsedMs: number,
+  settings: MotionLabRenderSettings,
+) {
+  const target = motionLabTimelineAt(elapsedMs);
+  const dt = runtime.lastMs > 0 ? clamp((elapsedMs - runtime.lastMs) / 1000, 0, 0.08) : 0;
+  runtime.lastMs = elapsedMs;
+
+  if (runtime.activeTarget !== target.mouth) {
+    runtime.previousTarget = runtime.activeTarget;
+    runtime.activeTarget = target.mouth;
+    runtime.transitionStartMs = elapsedMs;
+  }
+
+  const targetOpenBase = MOTION_LAB_TARGET_OPEN[target.mouth];
+  const targetOpen = targetOpenBase * (1 - settings.restBias * (1 - target.energy));
+  if (settings.mouthMethod === "baseline") {
+    runtime.openY = targetOpenBase;
+    runtime.previousTarget = target.mouth;
+    runtime.activeTarget = target.mouth;
+    runtime.transitionStartMs = elapsedMs;
+  } else if (dt > 0) {
+    const speedMs = targetOpen > runtime.openY ? settings.attackMs : settings.releaseMs;
+    const smoothingScale = 1 + settings.shapeSmoothing * 1.4;
+    const rate = 1 - Math.exp(-dt / Math.max(0.001, (speedMs / 1000) * smoothingScale));
+    runtime.openY += (targetOpen - runtime.openY) * rate;
+  }
+
+  const width = parts.width;
+  const height = parts.height;
+  const time = elapsedMs / 1000;
+  const preset = MOTION_LAB_PRESET_FACTORS[settings.preset];
+  const breath = Math.sin((time / 3.6) * Math.PI * 2);
+  const sway = Math.sin(time * 1.35);
+  const voice = target.energy;
+  const bodyTransform: MotionLabLayerTransform = settings.layerMode === "simple"
+    ? {
+        x: 0,
+        y: breath * 1.4 * settings.breathAmplitude,
+        rotationDeg: sway * 0.35 * settings.bodySwayAmplitude,
+        scaleX: 1,
+        scaleY: 1,
+      }
+    : {
+        x: sway * 1.2 * settings.bodySwayAmplitude * preset.body,
+        y: breath * 3.2 * settings.breathAmplitude * preset.breath - voice * 1.4,
+        rotationDeg: sway * 1.05 * settings.bodySwayAmplitude * preset.body,
+        scaleX: 1 + breath * 0.002 * settings.breathAmplitude,
+        scaleY: 1 + breath * 0.006 * settings.breathAmplitude,
+      };
+  const hairFrontTransform: MotionLabLayerTransform = settings.layerMode === "simple"
+    ? bodyTransform
+    : {
+        x: Math.sin(time * 1.55 - settings.hairFrontDelay * 7) * 1.8 * preset.hair,
+        y: bodyTransform.y * 0.62 + Math.sin(time * 2.1 - settings.hairFrontDelay * 8) * 1.2 * preset.hair,
+        rotationDeg: bodyTransform.rotationDeg * 0.55 + Math.sin(time * 1.6 - settings.hairFrontDelay * 8) * 1.7 * preset.hair,
+        scaleX: 1,
+        scaleY: 1,
+      };
+  const hairBackTransform: MotionLabLayerTransform = settings.layerMode === "simple"
+    ? bodyTransform
+    : {
+        x: Math.sin(time * 1.25 - settings.hairBackDelay * 7) * 1.5 * preset.hair,
+        y: bodyTransform.y * 0.42 + Math.sin(time * 1.75 - settings.hairBackDelay * 8) * 1.4 * preset.hair,
+        rotationDeg: bodyTransform.rotationDeg * 0.35 + Math.sin(time * 1.35 - settings.hairBackDelay * 8) * 1.45 * preset.hair,
+        scaleX: 1,
+        scaleY: 1,
+      };
+
+  const meshPhase = time * 2.1 + voice * 0.9;
+  const meshFrontSwayX = Math.sin(time * 1.45 - settings.hairFrontDelay * 9) * 5.2 * preset.hair * settings.bodySwayAmplitude;
+  const meshBackSwayX = Math.sin(time * 1.16 - settings.hairBackDelay * 9) * 4.4 * preset.hair * settings.bodySwayAmplitude;
+  const meshFrontSwayY = Math.cos(time * 1.75 - settings.hairFrontDelay * 7) * 1.5 * preset.hair + bodyTransform.y * 0.18;
+  const meshBackSwayY = Math.cos(time * 1.32 - settings.hairBackDelay * 7) * 1.8 * preset.hair + bodyTransform.y * 0.12;
+
+  ctx.clearRect(0, 0, width, height);
+  if (images.hairBack) {
+    if (settings.layerMode === "mesh") {
+      drawMotionLabStripWarp(ctx, images.hairBack, width, height, hairBackTransform, {
+        rootYRatio: 0.12,
+        swayX: meshBackSwayX,
+        swayY: meshBackSwayY,
+        wavePhase: meshPhase - 0.55,
+      });
+    } else {
+      drawMotionLabLayer(ctx, images.hairBack, width, height, hairBackTransform);
+    }
+  }
+  drawMotionLabLayer(ctx, images.body, width, height, bodyTransform);
+
+  const transitionMs = settings.mouthMethod === "baseline"
+    ? 0
+    : settings.mouthMethod === "bridge"
+      ? Math.max(80, settings.crossfadeMs * (1 + settings.bridgeBias))
+      : Math.max(0, settings.crossfadeMs);
+  const blend = transitionMs > 0
+    ? clamp((elapsedMs - runtime.transitionStartMs) / transitionMs, 0, 1)
+    : 1;
+  const previousFrames = images.mouths[runtime.previousTarget] ?? images.mouths.closed;
+  const activeFrames = images.mouths[runtime.activeTarget] ?? images.mouths.closed;
+  const neutralFrames = images.mouths.closed ?? previousFrames ?? activeFrames;
+  const previousMouth = pickMotionLabMouthFrame(previousFrames, runtime.openY);
+  const activeMouth = pickMotionLabMouthFrame(activeFrames, runtime.openY);
+  const neutralMouth = pickMotionLabMouthFrame(neutralFrames, runtime.openY * (1 - settings.bridgeBias));
+  if (settings.mouthMethod === "bridge" && transitionMs > 0 && blend < 1) {
+    const easedBlend = blend * blend * (3 - 2 * blend);
+    const bridgeAlpha = Math.sin(easedBlend * Math.PI) * settings.bridgeBias;
+    if (previousMouth) drawMotionLabLayer(ctx, previousMouth, width, height, bodyTransform, (1 - easedBlend) * (1 - bridgeAlpha));
+    if (neutralMouth && bridgeAlpha > 0.01) drawMotionLabLayer(ctx, neutralMouth, width, height, bodyTransform, bridgeAlpha);
+    if (activeMouth) drawMotionLabLayer(ctx, activeMouth, width, height, bodyTransform, easedBlend * (1 - bridgeAlpha));
+  } else {
+    if (previousMouth && blend < 1) drawMotionLabLayer(ctx, previousMouth, width, height, bodyTransform, 1 - blend);
+    if (activeMouth) drawMotionLabLayer(ctx, activeMouth, width, height, bodyTransform, blend);
+  }
+
+  if (images.hair) {
+    if (settings.layerMode === "mesh") {
+      drawMotionLabStripWarp(ctx, images.hair, width, height, hairFrontTransform, {
+        rootYRatio: 0.16,
+        swayX: meshFrontSwayX,
+        swayY: meshFrontSwayY,
+        wavePhase: meshPhase,
+      });
+    } else {
+      drawMotionLabLayer(ctx, images.hair, width, height, hairFrontTransform);
+    }
+  }
+}
 
 function App() {
   const [mode, setMode] = useState<Mode>("select");
@@ -274,6 +763,46 @@ function App() {
   const [workspacePartOffsetX, setWorkspacePartOffsetX] = useState(0);
   const [workspacePartOffsetY, setWorkspacePartOffsetY] = useState(0);
   const [workspacePartScale, setWorkspacePartScale] = useState(100);
+
+  // === Motion Preview Lab ===
+  const [motionLabParts, setMotionLabParts] = useState<MotionLabPartsResult | null>(null);
+  const [motionLabImages, setMotionLabImages] = useState<MotionLabImageSet | null>(null);
+  const [motionLabImagesLoading, setMotionLabImagesLoading] = useState(false);
+  const [motionLabPlaying, setMotionLabPlaying] = useState(true);
+  const [motionLabMethod, setMotionLabMethod] = useState<MotionLabMethod>("smooth");
+  const [motionLabLayerMode, setMotionLabLayerMode] = useState<MotionLabLayerMode>("spring");
+  const [motionLabPreset, setMotionLabPreset] = useState<MotionLabPreset>("normal");
+  const [motionLabAttackMs, setMotionLabAttackMs] = useState(90);
+  const [motionLabReleaseMs, setMotionLabReleaseMs] = useState(160);
+  const [motionLabCrossfadeMs, setMotionLabCrossfadeMs] = useState(50);
+  const [motionLabRestBias, setMotionLabRestBias] = useState(0.25);
+  const [motionLabShapeSmoothing, setMotionLabShapeSmoothing] = useState(0.65);
+  const [motionLabBridgeBias, setMotionLabBridgeBias] = useState(0.45);
+  const [motionLabBreathAmplitude, setMotionLabBreathAmplitude] = useState(1);
+  const [motionLabBodySwayAmplitude, setMotionLabBodySwayAmplitude] = useState(1);
+  const [motionLabHairFrontDelay, setMotionLabHairFrontDelay] = useState(0.18);
+  const [motionLabHairBackDelay, setMotionLabHairBackDelay] = useState(0.28);
+  const [motionLabManifestPath, setMotionLabManifestPath] = useState("");
+  const [motionLabProfilePath, setMotionLabProfilePath] = useState("");
+  const [motionLabVerdict, setMotionLabVerdict] = useState<MotionLabVerdict>("undecided");
+  const [motionLabReviewScores, setMotionLabReviewScores] = useState<Record<MotionLabReviewKey, number>>(MOTION_LAB_DEFAULT_REVIEW_SCORES);
+  const [motionLabReviewNote, setMotionLabReviewNote] = useState("");
+  const motionLabBaselineCanvasRef = useRef<HTMLCanvasElement>(null);
+  const motionLabCandidateCanvasRef = useRef<HTMLCanvasElement>(null);
+  const motionLabBaselineRuntimeRef = useRef<MotionLabMouthRuntime>({
+    openY: 0,
+    activeTarget: "closed",
+    previousTarget: "closed",
+    transitionStartMs: 0,
+    lastMs: 0,
+  });
+  const motionLabCandidateRuntimeRef = useRef<MotionLabMouthRuntime>({
+    openY: 0,
+    activeTarget: "closed",
+    previousTarget: "closed",
+    transitionStartMs: 0,
+    lastMs: 0,
+  });
 
   useEffect(() => {
     window.localStorage.setItem("pachipakugen-theme", themeMode);
@@ -398,6 +927,124 @@ function App() {
     }, 160);
     return () => window.clearInterval(timer);
   }, [diffPreviews.length]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!motionLabParts) {
+      setMotionLabImages(null);
+      setMotionLabImagesLoading(false);
+      return;
+    }
+    const parts = motionLabParts;
+
+    setMotionLabImages(null);
+    setMotionLabImagesLoading(true);
+    async function loadImages() {
+      try {
+        const mouthEntries = await Promise.all(
+          MOTION_LAB_MOUTH_KEYS.map(async (key) => {
+            const sources = parts.mouths[key] ?? [];
+            const images = await Promise.all(sources.map(loadMotionLabImage));
+            return [key, images] as const;
+          }),
+        );
+        const nextImages: MotionLabImageSet = {
+          body: await loadMotionLabImage(parts.body),
+          hair: parts.hair ? await loadMotionLabImage(parts.hair) : null,
+          hairBack: parts.hairBack ? await loadMotionLabImage(parts.hairBack) : null,
+          mouths: Object.fromEntries(mouthEntries) as Partial<Record<MotionLabMouthKey, HTMLImageElement[]>>,
+        };
+        if (!cancelled) {
+          setMotionLabImages(nextImages);
+          setMotionLabImagesLoading(false);
+        }
+      } catch (loadError) {
+        if (!cancelled) {
+          setError(loadError instanceof Error ? loadError.message : String(loadError));
+          setMotionLabImagesLoading(false);
+        }
+      }
+    }
+    void loadImages();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [motionLabParts]);
+
+  useEffect(() => {
+    if (mode !== "motion_lab" || !motionLabParts || !motionLabImages) return;
+    const baselineCtx = prepareMotionLabCanvas(motionLabBaselineCanvasRef.current, motionLabParts.width, motionLabParts.height);
+    const candidateCtx = prepareMotionLabCanvas(motionLabCandidateCanvasRef.current, motionLabParts.width, motionLabParts.height);
+    if (!baselineCtx || !candidateCtx) return;
+
+    const baselineRuntime = motionLabBaselineRuntimeRef.current;
+    const candidateRuntime = motionLabCandidateRuntimeRef.current;
+    resetMotionLabRuntime(baselineRuntime);
+    resetMotionLabRuntime(candidateRuntime);
+
+    const startedAt = performance.now();
+    let animationId = 0;
+
+    const draw = (now: number) => {
+      const elapsedMs = motionLabPlaying ? now - startedAt : 0;
+      drawMotionLabScene(baselineCtx, motionLabParts, motionLabImages, baselineRuntime, elapsedMs, {
+        mouthMethod: "baseline",
+        layerMode: "simple",
+        preset: "calm",
+        attackMs: motionLabAttackMs,
+        releaseMs: motionLabReleaseMs,
+        crossfadeMs: 0,
+        restBias: 0,
+        shapeSmoothing: 0,
+        bridgeBias: 0,
+        breathAmplitude: motionLabBreathAmplitude,
+        bodySwayAmplitude: motionLabBodySwayAmplitude,
+        hairFrontDelay: 0,
+        hairBackDelay: 0,
+      });
+      drawMotionLabScene(candidateCtx, motionLabParts, motionLabImages, candidateRuntime, elapsedMs, {
+        mouthMethod: motionLabMethod,
+        layerMode: motionLabLayerMode,
+        preset: motionLabPreset,
+        attackMs: motionLabAttackMs,
+        releaseMs: motionLabReleaseMs,
+        crossfadeMs: motionLabCrossfadeMs,
+        restBias: motionLabRestBias,
+        shapeSmoothing: motionLabShapeSmoothing,
+        bridgeBias: motionLabBridgeBias,
+        breathAmplitude: motionLabBreathAmplitude,
+        bodySwayAmplitude: motionLabBodySwayAmplitude,
+        hairFrontDelay: motionLabHairFrontDelay,
+        hairBackDelay: motionLabHairBackDelay,
+      });
+
+      if (motionLabPlaying) {
+        animationId = window.requestAnimationFrame(draw);
+      }
+    };
+
+    animationId = window.requestAnimationFrame(draw);
+    return () => window.cancelAnimationFrame(animationId);
+  }, [
+    mode,
+    motionLabParts,
+    motionLabImages,
+    motionLabPlaying,
+    motionLabMethod,
+    motionLabLayerMode,
+    motionLabPreset,
+    motionLabAttackMs,
+    motionLabReleaseMs,
+    motionLabCrossfadeMs,
+    motionLabRestBias,
+    motionLabShapeSmoothing,
+    motionLabBridgeBias,
+    motionLabBreathAmplitude,
+    motionLabBodySwayAmplitude,
+    motionLabHairFrontDelay,
+    motionLabHairBackDelay,
+  ]);
 
   // --- Category rendering ---
   async function renderCategory(
@@ -1299,6 +1946,240 @@ function App() {
     }
   }
 
+  async function loadMotionLabPartsFromDir(dir: string) {
+    setError("");
+    setLoading(true);
+    try {
+      const result = await invoke<MotionLabPartsResult>("load_motion_lab_parts", { dir });
+      setMotionLabParts(result);
+      setMotionLabPlaying(true);
+      setMotionLabManifestPath("");
+      setMotionLabProfilePath("");
+      setStatus(`Motion Preview Lab: ${result.sourceDir}`);
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function pickMotionLabPartsDir() {
+    const selected = await open({
+      multiple: false,
+      directory: true,
+      title: "04_spritalk_parts フォルダを選択",
+    });
+    const dir = typeof selected === "string" ? selected : null;
+    if (!dir) return;
+    await loadMotionLabPartsFromDir(dir);
+  }
+
+  async function loadCurrentWorkspaceMotionLabParts() {
+    const dir = workspaceRifeResult?.outputPath || expressionWorkspace?.spritalkPartsPath;
+    if (!dir) return;
+    await loadMotionLabPartsFromDir(dir);
+  }
+
+  function buildMotionLabManifest(): MotionLabManifest | null {
+    if (!motionLabParts) return null;
+    return {
+      schema: "pachipakugen.motionPreview.v1",
+      sourcePartsDir: motionLabParts.sourceDir,
+      createdAt: new Date().toISOString(),
+      methods: {
+        baseline: { enabled: true },
+        lipTimelineSmoother: {
+          enabled: motionLabMethod !== "baseline",
+          method: motionLabMethod,
+          attackMs: motionLabAttackMs,
+          releaseMs: motionLabReleaseMs,
+          crossfadeMs: motionLabCrossfadeMs,
+          restBias: motionLabRestBias,
+          shapeSmoothing: motionLabShapeSmoothing,
+          bridgeBias: motionLabBridgeBias,
+        },
+        layeredSpring: {
+          enabled: true,
+          layerMode: motionLabLayerMode,
+          preset: motionLabPreset,
+          breathAmplitude: motionLabBreathAmplitude,
+          bodySwayAmplitude: motionLabBodySwayAmplitude,
+          hairFrontDelay: motionLabHairFrontDelay,
+          hairBackDelay: motionLabHairBackDelay,
+        },
+      },
+      timeline: { type: "builtInVowelTest" },
+      review: {
+        verdict: motionLabVerdict,
+        note: motionLabReviewNote,
+        scores: motionLabReviewScores,
+      },
+    };
+  }
+
+  function buildSpritalkMotionProfile(): SpritalkMotionProfile | null {
+    if (!motionLabParts) return null;
+    const preset = MOTION_LAB_PRESET_FACTORS[motionLabPreset];
+    const lipSyncRenderer = motionLabMethod === "baseline"
+      ? "directLayerSwitch"
+      : motionLabMethod === "bridge"
+        ? "neutralBridgeOpacityBlend"
+        : "smoothedFrameStepper";
+    const layerRenderer = motionLabLayerMode === "mesh" ? "stripWarpExtension" : "existingProceduralAnimator";
+    return {
+      schema: "spritalk.motionProfile.v1",
+      sourcePartsDir: motionLabParts.sourceDir,
+      createdAt: new Date().toISOString(),
+      generatedBy: "PachiPakuGen Motion Lab",
+      blink: {
+        mode: "keepExisting",
+      },
+      lipSync: {
+        method: motionLabMethod,
+        attackMs: motionLabAttackMs,
+        releaseMs: motionLabReleaseMs,
+        crossfadeMs: motionLabCrossfadeMs,
+        restBias: motionLabRestBias,
+        shapeSmoothing: motionLabShapeSmoothing,
+        bridgeBias: motionLabBridgeBias,
+      },
+      layerMotion: {
+        mode: motionLabLayerMode,
+        preset: motionLabPreset,
+        breathAmplitude: motionLabBreathAmplitude,
+        bodySwayAmplitude: motionLabBodySwayAmplitude,
+        hairFrontDelayMs: Math.round(motionLabHairFrontDelay * 1000),
+        hairBackDelayMs: Math.round(motionLabHairBackDelay * 1000),
+      },
+      spritalkProceduralAnimation: {
+        breathing: {
+          enabled: motionLabBreathAmplitude > 0,
+          amplitude: Number((4.5 * motionLabBreathAmplitude * preset.breath).toFixed(2)),
+          speed: 0.5,
+        },
+        idleSway: {
+          enabled: motionLabBodySwayAmplitude > 0,
+          amplitudeX: Number((2.4 * motionLabBodySwayAmplitude * preset.body).toFixed(2)),
+          amplitudeY: Number((1.4 * motionLabBodySwayAmplitude * preset.body).toFixed(2)),
+          speed: 0.9,
+          reduceOnSpeech: true,
+        },
+        hairSway: {
+          enabled: motionLabLayerMode !== "simple",
+          amplitude: Number((2.5 * motionLabBodySwayAmplitude * preset.hair).toFixed(2)),
+          speed: Number(clamp(0.95 - motionLabHairFrontDelay, 0.3, 1.2).toFixed(2)),
+          rotationAmount: Number((0.009 * preset.hair).toFixed(4)),
+        },
+        hairBackSway: {
+          enabled: motionLabLayerMode !== "simple",
+          amplitude: Number((2.1 * motionLabBodySwayAmplitude * preset.hair).toFixed(2)),
+          speed: Number(clamp(0.82 - motionLabHairBackDelay, 0.25, 1.0).toFixed(2)),
+          rotationAmount: Number((0.007 * preset.hair).toFixed(4)),
+        },
+      },
+      runtimeRequirements: {
+        lipSyncRenderer,
+        layerRenderer,
+      },
+      review: {
+        verdict: motionLabVerdict,
+        note: motionLabReviewNote,
+        scores: motionLabReviewScores,
+      },
+    };
+  }
+
+  function applyMotionLabManifest(manifest: MotionLabManifest) {
+    const lip = manifest.methods?.lipTimelineSmoother;
+    const spring = manifest.methods?.layeredSpring;
+    if (lip) {
+      setMotionLabMethod(lip.method ? validMotionLabMethod(lip.method) : lip.enabled === false ? "baseline" : "smooth");
+      if (typeof lip.attackMs === "number") setMotionLabAttackMs(clamp(Math.round(lip.attackMs), 40, 180));
+      if (typeof lip.releaseMs === "number") setMotionLabReleaseMs(clamp(Math.round(lip.releaseMs), 80, 260));
+      if (typeof lip.crossfadeMs === "number") setMotionLabCrossfadeMs(clamp(Math.round(lip.crossfadeMs), 0, 120));
+      if (typeof lip.restBias === "number") setMotionLabRestBias(clamp(lip.restBias, 0, 1));
+      if (typeof lip.shapeSmoothing === "number") setMotionLabShapeSmoothing(clamp(lip.shapeSmoothing, 0, 1));
+      if (typeof lip.bridgeBias === "number") setMotionLabBridgeBias(clamp(lip.bridgeBias, 0, 0.85));
+    }
+    if (spring) {
+      if (spring.layerMode) setMotionLabLayerMode(validMotionLabLayerMode(spring.layerMode));
+      setMotionLabPreset(validMotionLabPreset(spring.preset));
+      if (typeof spring.breathAmplitude === "number") setMotionLabBreathAmplitude(clamp(spring.breathAmplitude, 0, 1.6));
+      if (typeof spring.bodySwayAmplitude === "number") setMotionLabBodySwayAmplitude(clamp(spring.bodySwayAmplitude, 0, 1.8));
+      if (typeof spring.hairFrontDelay === "number") setMotionLabHairFrontDelay(clamp(spring.hairFrontDelay, 0, 0.6));
+      if (typeof spring.hairBackDelay === "number") setMotionLabHairBackDelay(clamp(spring.hairBackDelay, 0, 0.8));
+    }
+    if (manifest.review) {
+      setMotionLabVerdict(validMotionLabVerdict(manifest.review.verdict));
+      setMotionLabReviewNote(typeof manifest.review.note === "string" ? manifest.review.note : "");
+      const scores = manifest.review.scores ?? {};
+      setMotionLabReviewScores({
+        mouthSmoothness: typeof scores.mouthSmoothness === "number" ? clamp(Math.round(scores.mouthSmoothness), 1, 5) : MOTION_LAB_DEFAULT_REVIEW_SCORES.mouthSmoothness,
+        vowelReadability: typeof scores.vowelReadability === "number" ? clamp(Math.round(scores.vowelReadability), 1, 5) : MOTION_LAB_DEFAULT_REVIEW_SCORES.vowelReadability,
+        bodyNaturalness: typeof scores.bodyNaturalness === "number" ? clamp(Math.round(scores.bodyNaturalness), 1, 5) : MOTION_LAB_DEFAULT_REVIEW_SCORES.bodyNaturalness,
+        hairBodySeparation: typeof scores.hairBodySeparation === "number" ? clamp(Math.round(scores.hairBodySeparation), 1, 5) : MOTION_LAB_DEFAULT_REVIEW_SCORES.hairBodySeparation,
+        settingSimplicity: typeof scores.settingSimplicity === "number" ? clamp(Math.round(scores.settingSimplicity), 1, 5) : MOTION_LAB_DEFAULT_REVIEW_SCORES.settingSimplicity,
+        migrationConfidence: typeof scores.migrationConfidence === "number" ? clamp(Math.round(scores.migrationConfidence), 1, 5) : MOTION_LAB_DEFAULT_REVIEW_SCORES.migrationConfidence,
+      });
+    }
+  }
+
+  async function saveMotionLabManifest() {
+    if (!motionLabParts) return;
+    const manifest = buildMotionLabManifest();
+    if (!manifest) return;
+    setError("");
+    setLoading(true);
+    try {
+      const result = await invoke<MotionLabManifestResult>("save_motion_lab_manifest", {
+        request: { sourceDir: motionLabParts.sourceDir, manifest },
+      });
+      setMotionLabManifestPath(result.path);
+      setStatus(`Motion Lab設定を保存しました: ${result.path}`);
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadMotionLabManifest() {
+    if (!motionLabParts) return;
+    setError("");
+    setLoading(true);
+    try {
+      const result = await invoke<MotionLabManifestResult>("load_motion_lab_manifest", {
+        sourceDir: motionLabParts.sourceDir,
+      });
+      applyMotionLabManifest(result.manifest);
+      setMotionLabManifestPath(result.path);
+      setStatus(`Motion Lab設定を読み込みました: ${result.path}`);
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function saveSpritalkMotionProfile() {
+    if (!motionLabParts) return;
+    const profile = buildSpritalkMotionProfile();
+    if (!profile) return;
+    setError("");
+    setLoading(true);
+    try {
+      const result = await invoke<SpritalkMotionProfileResult>("save_spritalk_motion_profile", {
+        request: { sourceDir: motionLabParts.sourceDir, profile },
+      });
+      setMotionLabProfilePath(result.path);
+      setStatus(`SpriTalk motion profileを保存しました: ${result.path}`);
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function persistWorkspaceStep(step: WorkspaceStep, workspaceOverride?: ExpressionWorkspaceResult) {
     const workspace = workspaceOverride ?? expressionWorkspace;
     if (!workspace) return;
@@ -2194,6 +3075,210 @@ function App() {
       </div>
     );
   }
+  function renderMotionLabMode() {
+    const availableMouths = MOTION_LAB_VOWEL_KEYS.filter(key => (motionLabParts?.mouths[key]?.length ?? 0) > 0);
+    const sourceLabel = motionLabParts?.sourceDir ?? "未選択";
+    const canUseWorkspaceOutput = !!(workspaceRifeResult?.outputPath || expressionWorkspace?.spritalkPartsPath);
+    const layerSummary = motionLabLayerMode === "mesh" ? "mesh strip" : motionLabLayerMode === "spring" ? "layer spring" : "simple";
+    const mouthSummary = motionLabMethod === "bridge" ? "bridge" : motionLabMethod === "smooth" ? "smooth" : "direct";
+    const candidateLabel = `${mouthSummary} + ${layerSummary}`;
+    const smoothingSummary = motionLabMethod === "smooth"
+      ? `${motionLabAttackMs}/${motionLabReleaseMs}ms + ${motionLabCrossfadeMs}ms`
+      : motionLabMethod === "bridge"
+        ? `${motionLabAttackMs}/${motionLabReleaseMs}ms + bridge ${Math.round(motionLabBridgeBias * 100)}%`
+      : "mouth target direct";
+    const renderRange = (
+      label: string,
+      value: number,
+      min: number,
+      max: number,
+      step: number,
+      onChange: (next: number) => void,
+      suffix = "",
+    ) => (
+      <label className="motion-lab-range">
+        <span>{label}<b>{value}{suffix}</b></span>
+        <input type="range" min={min} max={max} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} />
+      </label>
+    );
+    const renderReviewRange = (key: MotionLabReviewKey) => (
+      <label className="motion-lab-review-range">
+        <span>{MOTION_LAB_REVIEW_LABELS[key]}<b>{motionLabReviewScores[key]}/5</b></span>
+        <input
+          type="range"
+          min={1}
+          max={5}
+          step={1}
+          value={motionLabReviewScores[key]}
+          onChange={(event) => setMotionLabReviewScores(prev => ({ ...prev, [key]: Number(event.target.value) }))}
+        />
+      </label>
+    );
+
+    return (
+      <main className="motion-lab-screen">
+        <section className="motion-lab-control-panel">
+          <div className="motion-lab-heading">
+            <span>MOTION LAB</span>
+            <h2>モーション比較</h2>
+          </div>
+
+          <div className="motion-lab-source">
+            <button className="btn btn-primary" disabled={loading} onClick={() => void pickMotionLabPartsDir()}>
+              素材フォルダを選択
+            </button>
+            {canUseWorkspaceOutput && (
+              <button className="btn btn-secondary" disabled={loading} onClick={() => void loadCurrentWorkspaceMotionLabParts()}>
+                現在の出力を読む
+              </button>
+            )}
+            <strong title={sourceLabel}>{sourceLabel}</strong>
+          </div>
+
+          <div className="motion-lab-manifest-actions">
+            <button className="btn btn-secondary" disabled={loading || !motionLabParts} onClick={() => void loadMotionLabManifest()}>
+              設定読込
+            </button>
+            <button className="btn btn-primary" disabled={loading || !motionLabParts} onClick={() => void saveMotionLabManifest()}>
+              設定保存
+            </button>
+            <small title={motionLabManifestPath}>{motionLabManifestPath || "motion-preview-manifest.json"}</small>
+            <button className="btn btn-secondary" disabled={loading || !motionLabParts} onClick={() => void saveSpritalkMotionProfile()}>
+              SpriTalk用出力
+            </button>
+            <small title={motionLabProfilePath}>{motionLabProfilePath || "spritalk-motion-profile.json"}</small>
+          </div>
+
+          {motionLabParts && (
+            <div className="motion-lab-status-grid">
+              <span><b>{motionLabParts.width}x{motionLabParts.height}</b><small>canvas</small></span>
+              <span><b>{availableMouths.map(key => MOTION_LAB_MOUTH_LABELS[key]).join(" ") || "-"}</b><small>mouth</small></span>
+              <span><b>{motionLabParts.eyeFrames.length}</b><small>eye frames</small></span>
+              <span><b>{motionLabParts.hair ? "front" : "-"} / {motionLabParts.hairBack ? "back" : "-"}</b><small>hair</small></span>
+            </div>
+          )}
+
+          {motionLabParts?.warnings.length ? <div className="motion-lab-note">{motionLabParts.warnings.join(" / ")}</div> : null}
+          {motionLabParts?.missing.length ? <div className="motion-lab-note warning">不足: {motionLabParts.missing.join(", ")}</div> : null}
+
+          <div className="motion-lab-section">
+            <div className="motion-lab-section-title">
+              <strong>口パク</strong>
+              <div className="motion-lab-segmented three">
+                <button className={motionLabMethod === "baseline" ? "active" : ""} onClick={() => setMotionLabMethod("baseline")}>直接</button>
+                <button className={motionLabMethod === "smooth" ? "active" : ""} onClick={() => setMotionLabMethod("smooth")}>スムーズ</button>
+                <button className={motionLabMethod === "bridge" ? "active" : ""} onClick={() => setMotionLabMethod("bridge")}>ブリッジ</button>
+              </div>
+            </div>
+            {renderRange("attack", motionLabAttackMs, 40, 180, 5, setMotionLabAttackMs, "ms")}
+            {renderRange("release", motionLabReleaseMs, 80, 260, 5, setMotionLabReleaseMs, "ms")}
+            {renderRange("crossfade", motionLabCrossfadeMs, 0, 120, 5, setMotionLabCrossfadeMs, "ms")}
+            {renderRange("rest", Math.round(motionLabRestBias * 100), 0, 100, 1, value => setMotionLabRestBias(value / 100), "%")}
+            {renderRange("smooth", Math.round(motionLabShapeSmoothing * 100), 0, 100, 1, value => setMotionLabShapeSmoothing(value / 100), "%")}
+            {renderRange("bridge", Math.round(motionLabBridgeBias * 100), 0, 85, 1, value => setMotionLabBridgeBias(value / 100), "%")}
+          </div>
+
+          <div className="motion-lab-section">
+            <div className="motion-lab-section-title">
+              <strong>髪・身体</strong>
+              <div className="motion-lab-segmented three">
+                <button className={motionLabPreset === "calm" ? "active" : ""} onClick={() => setMotionLabPreset("calm")}>calm</button>
+                <button className={motionLabPreset === "normal" ? "active" : ""} onClick={() => setMotionLabPreset("normal")}>normal</button>
+                <button className={motionLabPreset === "lively" ? "active" : ""} onClick={() => setMotionLabPreset("lively")}>lively</button>
+              </div>
+            </div>
+            <div className="motion-lab-segmented">
+              <button className={motionLabLayerMode === "spring" ? "active" : ""} onClick={() => setMotionLabLayerMode("spring")}>spring</button>
+              <button className={motionLabLayerMode === "mesh" ? "active" : ""} onClick={() => setMotionLabLayerMode("mesh")}>mesh</button>
+            </div>
+            {renderRange("breath", Math.round(motionLabBreathAmplitude * 100), 0, 160, 1, value => setMotionLabBreathAmplitude(value / 100), "%")}
+            {renderRange("body sway", Math.round(motionLabBodySwayAmplitude * 100), 0, 180, 1, value => setMotionLabBodySwayAmplitude(value / 100), "%")}
+            {renderRange("hair front lag", Number(motionLabHairFrontDelay.toFixed(2)), 0, 0.6, 0.01, setMotionLabHairFrontDelay, "s")}
+            {renderRange("hair back lag", Number(motionLabHairBackDelay.toFixed(2)), 0, 0.8, 0.01, setMotionLabHairBackDelay, "s")}
+          </div>
+
+          <div className="motion-lab-section">
+            <div className="motion-lab-section-title">
+              <strong>評価</strong>
+              <select value={motionLabVerdict} onChange={(event) => setMotionLabVerdict(event.target.value as MotionLabVerdict)}>
+                <option value="undecided">未判断</option>
+                <option value="promising">有力</option>
+                <option value="hold">保留</option>
+                <option value="reject">除外</option>
+              </select>
+            </div>
+            {renderReviewRange("mouthSmoothness")}
+            {renderReviewRange("vowelReadability")}
+            {renderReviewRange("bodyNaturalness")}
+            {renderReviewRange("hairBodySeparation")}
+            {renderReviewRange("settingSimplicity")}
+            {renderReviewRange("migrationConfidence")}
+            <textarea
+              className="motion-lab-review-note"
+              value={motionLabReviewNote}
+              onChange={(event) => setMotionLabReviewNote(event.target.value)}
+              rows={3}
+              placeholder="採用/保留理由"
+            />
+          </div>
+        </section>
+
+        <section className="motion-lab-preview-panel">
+          <div className="motion-lab-preview-toolbar">
+            <button className="btn btn-secondary" disabled={!motionLabParts} onClick={() => setMotionLabPlaying(prev => !prev)}>
+              {motionLabPlaying ? "停止" : "再生"}
+            </button>
+            <button className="btn btn-secondary" disabled={!motionLabParts} onClick={() => {
+              motionLabBaselineRuntimeRef.current.lastMs = 0;
+              motionLabCandidateRuntimeRef.current.lastMs = 0;
+              setMotionLabPlaying(false);
+              window.setTimeout(() => setMotionLabPlaying(true), 0);
+            }}>
+              リセット
+            </button>
+          </div>
+
+          <div className="motion-lab-stage">
+            {motionLabParts ? (
+              <>
+                <div className="motion-lab-stage-comparison">
+                  <div className="motion-lab-preview-lane">
+                    <div className="motion-lab-lane-label"><strong>基準</strong><span>直切替 / 一体揺れ</span></div>
+                    <canvas ref={motionLabBaselineCanvasRef} />
+                  </div>
+                  <div className="motion-lab-preview-lane">
+                    <div className="motion-lab-lane-label"><strong>候補</strong><span>{candidateLabel}</span></div>
+                    <canvas ref={motionLabCandidateCanvasRef} />
+                  </div>
+                </div>
+                {motionLabImagesLoading && <span className="motion-lab-placeholder">画像読込中...</span>}
+              </>
+            ) : (
+              <span className="motion-lab-placeholder">04_spritalk_parts</span>
+            )}
+          </div>
+
+          <div className="motion-lab-mouth-strip">
+            {MOTION_LAB_MOUTH_KEYS.map(key => {
+              const count = motionLabParts?.mouths[key]?.length ?? 0;
+              return (
+                <span key={key} className={count > 0 ? "ready" : ""}>
+                  <b>{MOTION_LAB_MOUTH_LABELS[key]}</b>
+                  <small>{count}</small>
+                </span>
+              );
+            })}
+          </div>
+          <div className="motion-lab-metric-strip">
+            <span><b>timeline</b><small>{MOTION_LAB_TIMELINE.length} events / {MOTION_LAB_DURATION_MS}ms</small></span>
+            <span><b>mouth</b><small>{smoothingSummary}</small></span>
+            <span><b>layer</b><small>{motionLabLayerMode}, {motionLabPreset}, front {motionLabHairFrontDelay.toFixed(2)}s / back {motionLabHairBackDelay.toFixed(2)}s</small></span>
+          </div>
+        </section>
+      </main>
+    );
+  }
+
   void [
     hairPreview, hairBackPreview, correctionOutputPath, baseStep, dragTarget,
     frameCount, setFrameCount, outputPath, completedDiffs, diffPreviewTick, diffPreviewZoom, setDiffPreviewZoom,
@@ -2227,6 +3312,14 @@ function App() {
               <p>既存の作業フォルダを選択して、保存済みの工程から再開します。</p>
             </div>
             <span className="primary-workflow-cta">既存フォルダを開く</span>
+          </button>
+          <button className="primary-workflow-card secondary motion-lab-entry" onClick={() => { setMode("motion_lab"); setStatus("Motion Preview Lab"); }}>
+            <div className="primary-workflow-copy">
+              <span className="workflow-kicker">MOTION LAB</span>
+              <strong>モーション比較</strong>
+              <p>作成済みのSpriTalk素材で、口パク補正と髪・身体の揺れを試します。</p>
+            </div>
+            <span className="primary-workflow-cta">比較を開く</span>
           </button>
         </section>
       </main>
@@ -2395,6 +3488,7 @@ function App() {
   function renderMainContent() {
     if (mode === "select") return renderModeSelect();
     if (mode === "workspace") return renderWorkspaceMode();
+    if (mode === "motion_lab") return renderMotionLabMode();
     if (mode === "base_input") return renderSimpleInput("素体出力", "See-Throughで分解したPSDを読み込みます。", loadPsd);
     if (mode === "hair_edit") return renderSimpleInput("Hairレイヤー確認", "この旧画面はワークスペースフローへ統合中です。", proceedToBodyEdit);
     if (mode === "base_edit") return renderLayerEditor();

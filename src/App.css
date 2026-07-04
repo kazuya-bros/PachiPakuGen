@@ -3569,6 +3569,11 @@ body {
   opacity: 0.72;
 }
 
+.primary-workflow-card.motion-lab-entry {
+  grid-column: 1 / -1;
+  min-height: 132px;
+}
+
 .workspace-path-strip {
   display: flex;
   align-items: center;
@@ -3663,6 +3668,354 @@ body {
   font-size: 0.78rem;
   font-weight: 900;
   white-space: nowrap;
+}
+
+.motion-lab-screen {
+  display: grid;
+  grid-template-columns: 360px minmax(0, 1fr);
+  gap: 12px;
+  width: 100%;
+  min-width: 980px;
+  height: calc(100vh - 118px);
+  min-height: 0;
+}
+
+.motion-lab-control-panel,
+.motion-lab-preview-panel {
+  min-height: 0;
+  border: 1px solid var(--border-color);
+  background: var(--panel-bg);
+}
+
+.motion-lab-control-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  overflow-y: auto;
+}
+
+.motion-lab-heading span {
+  color: var(--accent-color);
+  font-size: 11px;
+  font-weight: 900;
+}
+
+.motion-lab-heading h2 {
+  margin-top: 4px;
+  color: var(--text-primary);
+  font-size: 22px;
+}
+
+.motion-lab-source {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.motion-lab-source strong {
+  grid-column: 1 / -1;
+  overflow: hidden;
+  padding: 8px;
+  border: 1px solid var(--border-color);
+  background: var(--surface-bg);
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.motion-lab-manifest-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.motion-lab-manifest-actions small {
+  grid-column: 1 / -1;
+  overflow: hidden;
+  padding: 7px 8px;
+  border: 1px solid var(--border-color);
+  background: var(--surface-bg);
+  color: var(--text-muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.motion-lab-status-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.motion-lab-status-grid span,
+.motion-lab-mouth-strip span {
+  display: grid;
+  gap: 2px;
+  padding: 8px;
+  border: 1px solid var(--border-color);
+  background: var(--surface-bg);
+}
+
+.motion-lab-status-grid b,
+.motion-lab-mouth-strip b {
+  overflow: hidden;
+  color: var(--text-primary);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.motion-lab-status-grid small,
+.motion-lab-mouth-strip small {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.motion-lab-note {
+  padding: 8px 10px;
+  border-left: 3px solid var(--accent-color);
+  background: rgba(45, 145, 255, 0.1);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.motion-lab-note.warning {
+  border-left-color: #f0b84b;
+  background: rgba(240, 184, 75, 0.1);
+}
+
+.motion-lab-section {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid var(--border-color);
+  background: var(--surface-bg);
+}
+
+.motion-lab-section-title {
+  display: grid;
+  gap: 8px;
+}
+
+.motion-lab-section-title strong {
+  color: var(--text-primary);
+  font-size: 14px;
+}
+
+.motion-lab-section-title select {
+  width: 100%;
+  height: 32px;
+  border: 1px solid var(--border-color);
+  background: var(--panel-bg);
+  color: var(--text-primary);
+  padding: 0 8px;
+  font: inherit;
+  font-size: 12px;
+}
+
+.motion-lab-segmented {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.motion-lab-segmented.three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.motion-lab-segmented button {
+  min-height: 30px;
+  border: 1px solid var(--border-color);
+  background: var(--panel-bg);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.motion-lab-segmented button.active {
+  border-color: var(--accent-color);
+  background: rgba(45, 145, 255, 0.14);
+  color: var(--accent-color);
+}
+
+.motion-lab-range {
+  display: grid;
+  gap: 6px;
+}
+
+.motion-lab-range span,
+.motion-lab-review-range span {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.motion-lab-range b,
+.motion-lab-review-range b {
+  color: var(--text-primary);
+}
+
+.motion-lab-range input,
+.motion-lab-review-range input {
+  width: 100%;
+  accent-color: var(--primary);
+}
+
+.motion-lab-review-range {
+  display: grid;
+  gap: 5px;
+}
+
+.motion-lab-review-note {
+  width: 100%;
+  min-height: 72px;
+  resize: vertical;
+  border: 1px solid var(--border-color);
+  background: var(--panel-bg);
+  color: var(--text-primary);
+  padding: 8px;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.motion-lab-preview-panel {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  padding: 14px;
+}
+
+.motion-lab-preview-toolbar {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.motion-lab-stage {
+  position: relative;
+  display: grid;
+  min-height: 0;
+  place-items: center;
+  overflow: hidden;
+  border: 1px solid var(--border-color);
+  background: var(--checker), var(--surface-sunken);
+  background-size: 16px 16px;
+}
+
+.motion-lab-stage-comparison {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  padding: 10px;
+}
+
+.motion-lab-preview-lane {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+  min-height: 0;
+}
+
+.motion-lab-lane-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 32px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-color);
+  background: var(--panel-bg);
+}
+
+.motion-lab-lane-label strong {
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.motion-lab-lane-label span {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.motion-lab-preview-lane canvas {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  border: 1px solid var(--border-color);
+  background: var(--checker), var(--surface-sunken);
+  background-size: 14px 14px;
+  object-fit: contain;
+}
+
+.motion-lab-placeholder {
+  position: absolute;
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.motion-lab-mouth-strip,
+.motion-lab-metric-strip {
+  display: grid;
+  gap: 8px;
+}
+
+.motion-lab-mouth-strip {
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+
+.motion-lab-mouth-strip span {
+  opacity: 0.48;
+  text-align: center;
+}
+
+.motion-lab-mouth-strip span.ready {
+  border-color: rgba(69, 212, 131, 0.45);
+  opacity: 1;
+}
+
+.motion-lab-metric-strip {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.motion-lab-metric-strip span {
+  min-width: 0;
+  padding: 8px;
+  border: 1px solid var(--border-color);
+  background: var(--surface-bg);
+}
+
+.motion-lab-metric-strip b,
+.motion-lab-metric-strip small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.motion-lab-metric-strip b {
+  color: var(--text-primary);
+  font-size: 11px;
+}
+
+.motion-lab-metric-strip small {
+  margin-top: 2px;
+  color: var(--text-secondary);
+  font-size: 10px;
 }
 
 .utility-section {
