@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SpriTalk Animation Lab — パラメータ軸パペット比較</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header id="app-header">
+  <h1>Animation Lab</h1>
+  <div class="header-controls">
+    <label class="btn" for="folder-input">📁 素材フォルダ読込</label>
+    <input type="file" id="folder-input" webkitdirectory multiple hidden>
+    <button class="btn" id="mock-btn">🧪 モック素材で試す</button>
+    <button class="btn" id="port-ui-btn" disabled>🎛 移植UI案</button>
+    <span id="asset-info" class="info-chip">素材未読込</span>
+  </div>
+  <div class="header-stats">
+    <span id="fps-display" class="stat">FPS: --</span>
+    <span id="pixi-count" class="stat">pixi: 0</span>
+    <span id="mem-display" class="stat">mem: --</span>
+  </div>
+</header>
+
+<main id="app-main">
+  <aside id="param-panel">
+    <h2>パラメータ</h2>
+    <div id="param-sections"></div>
+  </aside>
+
+  <section id="stage-area">
+    <div id="drop-zone">
+      <p>ここにPachiPakuGen出力フォルダをドラッグ＆ドロップ<br>
+      （body.png / hair.png / eye/ / mouth_a〜o/ / axis_*/）<br>
+      または「モック素材で試す」で即開始</p>
+    </div>
+    <div class="grid-controls hidden" id="grid-controls">
+      <label>表示:
+        <select id="grid-mode">
+          <option value="1">1画面</option>
+          <option value="2" selected>2分割</option>
+          <option value="4">2×2</option>
+        </select>
+      </label>
+      <label>まばたき:
+        <select id="blink-mode">
+          <option value="auto" selected>自動瞬き</option>
+          <option value="half">半目保持（ジト目）</option>
+          <option value="sleepy">眠気（ゆっくり閉眼）</option>
+          <option value="off">なし</option>
+        </select>
+      </label>
+      <button class="btn small" id="mesh-edit-btn" disabled>✏️ A3対応点編集</button>
+    </div>
+    <div id="grid" class="hidden"></div>
+    <div id="axis-rack-wrap" class="hidden">
+      <h3>パラメータ軸ラック（axis_* / 顔向きデモ）</h3>
+      <div id="axis-rack"></div>
+    </div>
+  </section>
+</main>
+
+<footer id="transport" class="hidden">
+  <button class="btn" id="play-btn">▶ 再生</button>
+  <button class="btn" id="stop-btn">■ 停止</button>
+  <label class="chk"><input type="checkbox" id="loop-chk" checked> ループ</label>
+  <input type="range" id="seek-bar" min="0" max="1000" value="0">
+  <span id="time-display">0.00 / 0.00s</span>
+  <select id="pattern-select"></select>
+  <span class="vv-group">
+    <input type="text" id="vv-text" placeholder="VOICEVOXテキスト（任意）" size="24">
+    <button class="btn small" id="vv-btn" disabled>🔊 合成</button>
+    <span id="vv-status" class="info-chip">VOICEVOX: 確認中</span>
+  </span>
+</footer>
+
+<!-- pixi.js v8: vendor優先、なければCDN -->
+<script src="vendor/pixi.min.js"></script>
+<script>
+  if (!window.PIXI) {
+    document.write('<script src="https://cdn.jsdelivr.net/npm/pixi.js@8/dist/pixi.min.js"><\/script>');
+  }
+</script>
+
+<script src="js/00-namespace.js"></script>
+<script src="js/01-types.js"></script>
+<script src="js/02-utils.js"></script>
+<script src="js/03-mora-data.js"></script>
+<script src="js/04-mock-assets.js"></script>
+<script src="js/10-asset-loader.js"></script>
+<script src="js/11-mora-player.js"></script>
+<script src="js/12-axis-scrubber.js"></script>
+<script src="js/20-mouth-methods.js"></script>
+<script src="js/21-mouth-mesh-a3.js"></script>
+<script src="js/22-mesh-editor.js"></script>
+<script src="js/23-axis-demos.js"></script>
+<script src="js/30-body-methods.js"></script>
+<script src="js/31-hair-mesh-b3.js"></script>
+<script src="js/32-arm-sway.js"></script>
+<script src="js/40-compositor-dom.js"></script>
+<script src="js/41-compositor-pixi.js"></script>
+<script src="js/50-voicevox.js"></script>
+<script src="js/51-ui.js"></script>
+<script src="js/52-port-ui.js"></script>
+<script src="js/90-main.js"></script>
+</body>
+</html>
