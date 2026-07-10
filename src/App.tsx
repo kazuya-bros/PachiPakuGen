@@ -111,6 +111,7 @@ import {
   prepareMotionLabCanvas,
   drawMotionLabScene,
 } from "./motionLab/render";
+import { MotionTunePanel } from "./motionLab/MotionTunePanel";
 
 type Mode = "select" | "workspace" | "motion_lab" | "base_input" | "hair_edit" | "base_edit" | "correction" | "interp";
 type ThemeMode = "dark" | "light";
@@ -1594,7 +1595,7 @@ function App() {
       setWorkspaceCompositePreview(null);
       setWorkspaceRifeResult(null);
       setWorkspaceRifePreview(null);
-      setWorkspaceStep(Math.min(Math.max(workspace.project.currentStep || 1, 1), 6) as WorkspaceStep);
+      setWorkspaceStep(Math.min(Math.max(workspace.project.currentStep || 1, 1), 7) as WorkspaceStep);
       setMode("workspace");
       setStatus(`作業フォルダ: ${workspace.workPath}`);
       if (kind === "resume") {
@@ -2035,7 +2036,7 @@ function App() {
   }
 
   async function restoreWorkspaceProgress(workspace: ExpressionWorkspaceResult) {
-    let restoredStep = Math.min(Math.max(workspace.project.currentStep || 1, 1), 6) as WorkspaceStep;
+    let restoredStep = Math.min(Math.max(workspace.project.currentStep || 1, 1), 7) as WorkspaceStep;
     try {
       const generated = await invoke<WorkspaceGeneratedPartsStatus>("inspect_workspace_generated_parts", {
         workPath: workspace.workPath,
@@ -2059,9 +2060,15 @@ function App() {
       if (loaded.rifeOutput) {
         await refreshWorkspaceRifePreview(workspace).catch(() => null);
       }
-      if (loaded.rifeOutput) restoredStep = 6;
-      else if (loaded.extractedParts) restoredStep = Math.max(restoredStep, 5) as WorkspaceStep;
-      else if (loaded.generatedParts.ready) restoredStep = Math.max(restoredStep, 3) as WorkspaceStep;
+      // project.jsonが7を保持していれば7で復帰。rifeOutputがあるのに6未満なら6へ引き上げ。
+      // rifeOutputが無いのに7が保存されていた場合（出力を削除した等）は6へ落とす
+      if (loaded.rifeOutput) {
+        restoredStep = Math.max(restoredStep, 6) as WorkspaceStep;
+      } else {
+        if (restoredStep > 6) restoredStep = 6;
+        if (loaded.extractedParts) restoredStep = Math.max(restoredStep, 5) as WorkspaceStep;
+        else if (loaded.generatedParts.ready) restoredStep = Math.max(restoredStep, 3) as WorkspaceStep;
+      }
     } catch {
       // Not all workspaces are valid Codex jobs until Step 2 has been prepared.
     }
@@ -2349,9 +2356,9 @@ function App() {
       });
       setWorkspaceRifeResult(result);
       await refreshWorkspaceRifePreview().catch(() => null);
-      await setWorkspaceStepAndPersist(6);
-      setStatus(`SpriTalk用フォルダへ出力しました: ${result.outputPath}`);
-      await revealItemInDir(result.outputPath).catch(() => {});
+      // RIFE完了後は自動でSTEP7（モーション調整）へ進む
+      await setWorkspaceStepAndPersist(7);
+      setStatus(`SpriTalk用フォルダへ出力しました: ${result.outputPath}。モーション調整に進みます`);
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -2708,6 +2715,7 @@ function App() {
       [4, "素体調整", "レイヤー確認"],
       [5, "差分位置調整", "合成確認"],
       [6, "RIFE補完", "SpriTalk出力"],
+      [7, "モーション調整", "揺れ・口パクの仕上げ"],
     ] as Array<[WorkspaceStep, string, string]>;
     const canOpenWorkspaceStep = (step: WorkspaceStep) => {
       if (workspaceBusy) return false;
@@ -2716,7 +2724,8 @@ function App() {
       if (step === 3) return !!workspaceGeneratedStatus?.ready;
       if (step === 4) return !!mappingPreview || !!workspaceFiles.source;
       if (step === 5) return !!workspaceExtractResult && !!workspaceCompositePreview?.basePreview;
-      return !!workspaceExtractResult && !!workspaceCompositePreview?.basePreview;
+      if (step === 6) return !!workspaceExtractResult && !!workspaceCompositePreview?.basePreview;
+      return !!workspaceRifeResult;
     };
     const canAdvanceWorkspaceStep = () => {
       if (workspaceBusy) return false;
@@ -2725,6 +2734,7 @@ function App() {
       if (workspaceStep === 3) return !!mappingPreview;
       if (workspaceStep === 4) return !!workspaceCompositePreview?.basePreview;
       if (workspaceStep === 5) return !!workspaceExtractResult && !!workspaceCompositePreview?.basePreview;
+      if (workspaceStep === 6) return !!workspaceRifeResult;
       return false;
     };
     const seeThroughRunning = workspaceBusy && !!seeThroughProgress && ["prepare", "inference", "load"].includes(seeThroughProgress.stage);
@@ -2742,7 +2752,7 @@ function App() {
       void setWorkspaceStepAndPersist((workspaceStep - 1) as WorkspaceStep);
     };
     const goNextWorkspaceStep = () => {
-      if (workspaceStep >= 6 || !canAdvanceWorkspaceStep()) return;
+      if (workspaceStep >= 7 || !canAdvanceWorkspaceStep()) return;
       void setWorkspaceStepAndPersist((workspaceStep + 1) as WorkspaceStep);
     };
     if (!workspace) return null;
@@ -2763,7 +2773,10 @@ function App() {
           ))}
         </nav>
 
-        <div className={`workspace-flow-layout${workspaceStep === 1 ? " step-one" : ""}${workspaceStep === 2 || workspaceStep === 3 ? " single-panel" : ""}`}>
+        <div
+          className={`workspace-flow-layout${workspaceStep === 1 ? " step-one" : ""}${workspaceStep === 2 || workspaceStep === 3 ? " single-panel" : ""}`}
+          style={workspaceStep === 7 ? { display: "none" } : undefined}
+        >
           <section className="workspace-flow-panel">
             {workspaceStep === 1 && (
               <div className="workspace-step-one">
@@ -2943,7 +2956,7 @@ function App() {
             )}
           </section>
 
-          {workspaceStep >= 4 && (
+          {workspaceStep >= 4 && workspaceStep <= 6 && (
             <aside className="workspace-flow-preview">
               <div className="preview-card-heading"><span>PREVIEW</span><strong>{mainPreviewLabel}</strong></div>
               <div className="workspace-preview-stage">
@@ -2982,9 +2995,20 @@ function App() {
           )}
         </div>
 
+        {workspaceRifeResult && (
+          <div className="workspace-motion-tune" style={workspaceStep === 7 ? undefined : { display: "none" }}>
+            <MotionTunePanel
+              partsDir={workspaceRifeResult.outputPath || workspace.spritalkPartsPath}
+              active={workspaceStep === 7}
+              onNotify={setStatus}
+              onError={setError}
+            />
+          </div>
+        )}
+
         <div className="workspace-bottom-nav">
           <button className="btn btn-secondary" onClick={goPreviousWorkspaceStep}>戻る</button>
-          {workspaceStep >= 6 ? (
+          {workspaceStep >= 7 ? (
             <button className="btn btn-primary" disabled={workspaceBusy} onClick={() => revealItemInDir(workspaceRifeResult?.outputPath || workspace.spritalkPartsPath).catch(() => {})}>出力フォルダを開く</button>
           ) : (
             <button className="btn btn-primary" disabled={!canAdvanceWorkspaceStep()} onClick={goNextWorkspaceStep}>次へ</button>
@@ -2993,7 +3017,7 @@ function App() {
         <div className="workspace-log-console" aria-live="polite">
           <div className="workspace-log-title">LOG</div>
           <div className="workspace-log-lines">
-            <div><span>step</span>{workspaceStep}/6 {steps[workspaceStep - 1]?.[1]}</div>
+            <div><span>step</span>{workspaceStep}/7 {steps[workspaceStep - 1]?.[1]}</div>
             {workspaceBusy && <div><span>run</span>処理中...</div>}
             {seeThroughProgress && <div><span>see-through</span>{seeThroughProgress.message}</div>}
             {progress.total > 0 && <div><span>rife</span>{progress.pair_name} {progress.current}/{progress.total}</div>}

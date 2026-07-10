@@ -32,6 +32,8 @@ import { toRenderSettings, useMotionLabSettings } from "./useMotionLabSettings";
 export interface MotionTunePanelProps {
   /** 読み込む素材フォルダ（04_spritalk_parts / rife_output）。null=未選択 */
   partsDir: string | null;
+  /** false=非表示中（display:none）。rAF描画を止めて調整stateは保持する */
+  active?: boolean;
   /** ステータス通知（親のステータスバーへ） */
   onNotify?: (message: string) => void;
   /** エラー通知（親のエラーバナーへ） */
@@ -54,7 +56,7 @@ function createRuntime(): MotionLabMouthRuntime {
  * 旧Motion Preview Lab（2レーン比較実験画面）を製品向けの1レーン調整画面へ再構成したもの。
  * 素材の読込・物理プレビュー・設定の保存/読込・SpriTalk用設定JSONの出力まで自己完結する。
  */
-export function MotionTunePanel({ partsDir, onNotify, onError }: MotionTunePanelProps) {
+export function MotionTunePanel({ partsDir, active = true, onNotify, onError }: MotionTunePanelProps) {
   const [parts, setParts] = useState<MotionLabPartsResult | null>(null);
   const [images, setImages] = useState<MotionLabImageSet | null>(null);
   const [imagesLoading, setImagesLoading] = useState(false);
@@ -170,9 +172,9 @@ export function MotionTunePanel({ partsDir, onNotify, onError }: MotionTunePanel
     resetMotionLabRuntime(runtimeRef.current);
   }, [images]);
 
-  // 描画ループ（1レーン）
+  // 描画ループ（1レーン）。非表示中（active=false）は止める
   useEffect(() => {
-    if (!parts || !images) return;
+    if (!active || !parts || !images) return;
     const ctx = prepareMotionLabCanvas(canvasRef.current, parts.width, parts.height);
     if (!ctx) return;
     const runtime = runtimeRef.current;
@@ -192,7 +194,7 @@ export function MotionTunePanel({ partsDir, onNotify, onError }: MotionTunePanel
     };
     animationId = window.requestAnimationFrame(draw);
     return () => window.cancelAnimationFrame(animationId);
-  }, [parts, images, playing, settings, pivotEditPart, customTimeline]);
+  }, [active, parts, images, playing, settings, pivotEditPart, customTimeline]);
 
   function restartPlayback() {
     resetMotionLabRuntime(runtimeRef.current);

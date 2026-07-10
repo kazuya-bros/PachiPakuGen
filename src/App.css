@@ -5444,3 +5444,9 @@ body {
   word-break: break-all;
   font-size: 11px;
 }
+
+/* STEP7 モーション調整（workspace-flow-screen の1frセルを占有） */
+.workspace-motion-tune {
+  min-height: 0;
+  height: 100%;
+}

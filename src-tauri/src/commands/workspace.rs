@@ -327,7 +327,7 @@ fn update_expression_workspace_step_inner(
 
 fn update_project_step(root: &Path, current_step: u32) -> Result<(), AppError> {
     let mut project = read_or_create_project(root)?;
-    project.current_step = project.current_step.max(current_step.clamp(1, 6));
+    project.current_step = project.current_step.max(current_step.clamp(1, 7));
     project.updated_at = unix_time();
     write_project(&root.join(PROJECT_FILE), &project)
 }
@@ -576,6 +576,13 @@ mod tests {
 
         let updated = update_expression_workspace_step_inner(&root.to_string_lossy(), 2).unwrap();
         assert_eq!(updated.project.current_step, 4);
+
+        // STEP7（モーション調整）まで保存でき、範囲外は7へクランプされる
+        let updated = update_expression_workspace_step_inner(&root.to_string_lossy(), 7).unwrap();
+        assert_eq!(updated.project.current_step, 7);
+
+        let updated = update_expression_workspace_step_inner(&root.to_string_lossy(), 99).unwrap();
+        assert_eq!(updated.project.current_step, 7);
 
         let _ = fs::remove_dir_all(root);
     }

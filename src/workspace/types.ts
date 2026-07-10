@@ -20,7 +20,7 @@ export type PreviewPan = { x: number; y: number };
 export type DiffPreview = { pairName: string; label: string; frames: string[] };
 export type InterpStep = 1 | 2 | 3 | 4;
 export type BaseStep = 1 | 2 | 3 | 4;
-export type WorkspaceStep = 1 | 2 | 3 | 4 | 5 | 6;
+export type WorkspaceStep = 1 | 2 | 3 | 4 | 5 | 6 | 7;
 export type SeeThroughProfile = "low-vram" | "standard";
 export type SeeThroughOptionMode = "default" | "on" | "off";
 
