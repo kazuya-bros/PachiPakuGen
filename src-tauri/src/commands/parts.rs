@@ -163,6 +163,12 @@ pub struct MouthMaskPreviewResult {
     pub mouth_preview: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Sam3SelectResult {
+    pub mask_png: String,
+}
+
 // ── Commands ─────────────────────────────────────────────────────────
 
 /// Load a See-Through output (PSD file or folder of PNGs) into the current slot.
@@ -186,6 +192,9 @@ pub async fn create_base(
     hair_layer_order: Vec<String>, // user's custom hair layer order (top=front)
     hair_back_layer_order: Vec<String>, // user's custom hair_back layer order (top=front)
     output_path: String,
+    // 胸を切出（オプション）: 切出ツールで塗ったマスクPNG。塗った範囲を body から
+    // 除去し chest として独立出力する（See-Throughにchestレイヤーが無いための手動抽出導線）
+    chest_mask_png: Option<String>,
 ) -> Result<CreateBaseResult, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
         create_base_inner(
@@ -199,6 +208,7 @@ pub async fn create_base(
             hair_layer_order,
             hair_back_layer_order,
             output_path,
+            chest_mask_png,
         )
     })
     .await
@@ -302,6 +312,19 @@ pub async fn import_correction_layer(
     })
     .await
     .map_err(|e| AppError::General(format!("Task join error: {}", e)))?
+}
+
+/// Segment a region from a click point using SAM3 (切出ツールのクリック選択モード).
+/// `image_data_url` is the currently-displayed composite preview (what the user
+/// clicked on); `points` are pixel coordinates on that same image.
+#[tauri::command]
+pub async fn sam3_select_region(
+    image_data_url: String,
+    points: Vec<(f64, f64)>,
+) -> Result<Sam3SelectResult, AppError> {
+    tauri::async_runtime::spawn_blocking(move || sam3_select_region_inner(&image_data_url, &points))
+        .await
+        .map_err(|e| AppError::General(format!("Task join error: {}", e)))?
 }
 
 /// Export arbitrary corrected layer composition to an exact PNG path.
@@ -613,7 +636,10 @@ pub(crate) fn load_slot_inner(app: AppHandle, path: String) -> Result<SlotLoadRe
         } else {
             img.clone()
         };
-        resized_layers.insert(name.clone(), img);
+        // 低アルファノイズ除去（852話氏 Anime2.5DRig の自動リグ前処理と同方針）。
+        // See-Through分解レイヤーはキャンバス全面に低アルファの斑点を残すことがあり、
+        // 放置すると合成のかすれ・目/口マスクの全面化・位置検出の破綻を招く
+        resized_layers.insert(name.clone(), clean_layer_alpha_noise(&img));
     }
     let depth_maps = load_depth_maps_for_psd(&path, &resized_layers, w, h);
 
@@ -701,6 +727,7 @@ fn create_base_inner(
     hair_layer_order: Vec<String>,
     hair_back_layer_order: Vec<String>,
     output_path: String,
+    chest_mask_png: Option<String>,
 ) -> Result<CreateBaseResult, AppError> {
     let state = app.state::<AppState>();
 
@@ -817,6 +844,15 @@ fn create_base_inner(
     } else {
         body_layer_order.clone()
     };
+    // arm_l / arm_r / sway_* へ分離されたレイヤーは body 合成から除外（二重描画防止）
+    let body_order: Vec<String> = body_order
+        .into_iter()
+        .filter(|layer_name| {
+            layer_order_entry_target(layer_name, &body_layer_patches, &full_mapping)
+                .map(|target| !target.starts_with("arm_") && !target.starts_with("sway_"))
+                .unwrap_or(true)
+        })
+        .collect();
     let hair_order = if uses_unified_layer_order {
         filter_layer_order_for_target(
             &body_layer_order,
@@ -837,6 +873,83 @@ fn create_base_inner(
     } else {
         hair_back_layer_order.clone()
     };
+
+    // グループ間z順（背面→前面）を保持。save_codex_base_parts が layer-order.json
+    // として素材フォルダへ出力し、Motion Lab / SpriTalk が固定z順の代わりに使う
+    *state.base_layer_group_order.lock().unwrap() = if uses_unified_layer_order {
+        derive_group_draw_order(&body_layer_order, &body_layer_patches, &full_mapping)
+    } else {
+        Vec::new()
+    };
+
+    // 腕分離（オプション）: mapping で arm_l / arm_r に割り当てられたレイヤーを
+    // 独立パーツとして合成する。未割り当てなら None = 従来どおり body に統合
+    for arm_target in ["arm_l", "arm_r"] {
+        let arm_order = filter_layer_order_for_target(
+            &body_layer_order,
+            &body_layer_patches,
+            &full_mapping,
+            arm_target,
+        );
+        let arm_img = if !arm_order.is_empty() {
+            let mut order_reversed = arm_order;
+            order_reversed.reverse();
+            let render_layers =
+                collect_ordered_render_layers(current, &order_reversed, &[], &HashMap::new(), None);
+            Some(compose_depth_gated_layers(render_layers, &depth_maps, w, h))
+        } else {
+            merge_layers_for_target(
+                current,
+                &depth_maps,
+                &full_mapping,
+                arm_target,
+                &source_layer_order,
+                w,
+                h,
+            )
+        };
+        if let Some(img) = arm_img {
+            parts.insert(arm_target.to_string(), img);
+        }
+    }
+
+    // 汎用揺れパーツ分離: mapping で "sway_" から始まるターゲットへ割り当てた
+    // レイヤーを独立パーツとして合成する（例: ears-l → sway_ear_l → sway_ear_l.png）
+    let mut sway_targets: Vec<String> = full_mapping
+        .values()
+        .filter(|target| target.starts_with("sway_"))
+        .cloned()
+        .collect();
+    sway_targets.sort();
+    sway_targets.dedup();
+    for sway_target in sway_targets {
+        let sway_order = filter_layer_order_for_target(
+            &body_layer_order,
+            &body_layer_patches,
+            &full_mapping,
+            &sway_target,
+        );
+        let sway_img = if !sway_order.is_empty() {
+            let mut order_reversed = sway_order;
+            order_reversed.reverse();
+            let render_layers =
+                collect_ordered_render_layers(current, &order_reversed, &[], &HashMap::new(), None);
+            Some(compose_depth_gated_layers(render_layers, &depth_maps, w, h))
+        } else {
+            merge_layers_for_target(
+                current,
+                &depth_maps,
+                &full_mapping,
+                &sway_target,
+                &source_layer_order,
+                w,
+                h,
+            )
+        };
+        if let Some(img) = sway_img {
+            parts.insert(sway_target.clone(), img);
+        }
+    }
 
     if is_base_export {
         // === 素体モード: body/hair/hair_back を出力 ===
@@ -859,7 +972,7 @@ fn create_base_inner(
             )
         };
         // hair_back: merge layers using user's custom order
-        let hair_back = if !hair_back_order.is_empty() {
+        let mut hair_back = if !hair_back_order.is_empty() {
             let mut order_reversed = hair_back_order.clone();
             order_reversed.reverse();
             let render_layers =
@@ -878,7 +991,7 @@ fn create_base_inner(
         };
 
         // body: merge layers using user's custom order
-        let body_img = if !body_order.is_empty() {
+        let mut body_img = if !body_order.is_empty() {
             let effective_order = if uses_unified_layer_order {
                 body_order.clone()
             } else {
@@ -931,6 +1044,28 @@ fn create_base_inner(
                 );
             }
         }
+        if let Some(hair_back_img) = hair_back.as_mut() {
+            let promoted_pixels = promote_hair_back_foreground_over_body(
+                &body_img,
+                hair_back_img,
+                &mut hair,
+                current,
+                &depth_maps,
+                &full_mapping,
+                w,
+                h,
+            );
+            if promoted_pixels > 0 {
+                eprintln!(
+                    "[PachiPakuGen] Promoted {} hair_back-over-body pixels into front hair",
+                    promoted_pixels
+                );
+            }
+        }
+
+        // 胸を切出（オプション・852話式: See-Throughにchestレイヤーが無いため手動抽出）。
+        // 塗った範囲を body から除去し、chest として独立出力する
+        body_img = cut_chest_from_body(body_img, chest_mask_png.as_deref(), &mut parts, w, h)?;
 
         parts.insert("body".to_string(), body_img);
         if let Some(img) = hair {
@@ -943,7 +1078,7 @@ fn create_base_inner(
         // Export static layers
         let out_dir = Path::new(&output_path);
         fs::create_dir_all(out_dir)?;
-        for key in &["body", "hair", "hair_back"] {
+        for key in &["body", "hair", "hair_back", "arm_l", "arm_r", "chest"] {
             if let Some(img) = parts.get(*key) {
                 img.save(out_dir.join(format!("{}.png", key)))?;
                 file_count += 1;
@@ -1012,7 +1147,7 @@ fn create_base_inner(
             )
         };
 
-        let hair_back = if !hair_back_order.is_empty() {
+        let mut hair_back = if !hair_back_order.is_empty() {
             let mut order_reversed = hair_back_order.clone();
             order_reversed.reverse();
             let render_layers =
@@ -1047,7 +1182,27 @@ fn create_base_inner(
                 );
             }
         }
+        if let Some(hair_back_img) = hair_back.as_mut() {
+            let promoted_pixels = promote_hair_back_foreground_over_body(
+                &body,
+                hair_back_img,
+                &mut hair,
+                current,
+                &depth_maps,
+                &full_mapping,
+                w,
+                h,
+            );
+            if promoted_pixels > 0 {
+                eprintln!(
+                    "[PachiPakuGen] Promoted {} hair_back-over-body pixels into front hair",
+                    promoted_pixels
+                );
+            }
+        }
 
+        // 胸を切出（workspace flow=素体をsave_codex_base_partsで保存する経路もここ）
+        let body = cut_chest_from_body(body, chest_mask_png.as_deref(), &mut parts, w, h)?;
         parts.insert("body".to_string(), body);
         if body_order.is_empty() {
             if let Some(neck) =
@@ -1367,6 +1522,8 @@ pub(crate) fn get_mapping_preview_inner(
         ("mouth", "Mouth (口)"),
         ("hair", "Hair 前髪"),
         ("hair_back", "Hair 後髪"),
+        ("arm_l", "Arm 左腕"),
+        ("arm_r", "Arm 右腕"),
         ("skip", "スキップ"),
     ];
 
@@ -1449,7 +1606,7 @@ pub(crate) fn get_mapping_preview_inner(
 
     // Full composite preview
     let mut composite_parts: HashMap<String, DynamicImage> = HashMap::new();
-    for target in &["body", "eye", "mouth", "hair", "hair_back"] {
+    for target in &["body", "eye", "mouth", "hair", "hair_back", "arm_l", "arm_r"] {
         if let Some(mut img) = merge_layers_for_target(
             current,
             &depth_maps,
@@ -1867,10 +2024,62 @@ fn body_order_item_alpha_images(
     images
 }
 
+/// 低アルファノイズ除去。
+/// 1) alpha < 16 を透明化（実測: ノイズはalpha中央値1・p99=6、実体は128以上に集中）
+/// 2) alpha < 128 かつ 3x3近傍に実体級(alpha>=64)の画素が2つ未満の孤立点を除去
+///    （アンチエイリアスされた実体エッジは実体画素に隣接しているため保護される）
+fn clean_layer_alpha_noise(image: &DynamicImage) -> DynamicImage {
+    const ALPHA_FLOOR: u8 = 16;
+    const SOLID_LEVEL: u8 = 64;
+    const EDGE_LEVEL: u8 = 128;
+    let mut rgba = image.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    for pixel in rgba.pixels_mut() {
+        if pixel[3] < ALPHA_FLOOR {
+            pixel[3] = 0;
+        }
+    }
+    let alpha: Vec<u8> = rgba.pixels().map(|pixel| pixel[3]).collect();
+    for y in 0..h as i64 {
+        for x in 0..w as i64 {
+            let index = (y * w as i64 + x) as usize;
+            if alpha[index] == 0 || alpha[index] >= EDGE_LEVEL {
+                continue;
+            }
+            let mut solid_neighbors = 0;
+            for dy in -1..=1i64 {
+                for dx in -1..=1i64 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let nx = x + dx;
+                    let ny = y + dy;
+                    if nx >= 0
+                        && ny >= 0
+                        && (nx as u32) < w
+                        && (ny as u32) < h
+                        && alpha[(ny * w as i64 + nx) as usize] >= SOLID_LEVEL
+                    {
+                        solid_neighbors += 1;
+                    }
+                }
+            }
+            if solid_neighbors < 2 {
+                rgba.get_pixel_mut(x as u32, y as u32)[3] = 0;
+            }
+        }
+    }
+    DynamicImage::ImageRgba8(rgba)
+}
+
 fn get_mapping_target<'a>(
     layer_name: &str,
     full_mapping: &'a HashMap<String, String>,
 ) -> Option<&'a str> {
+    // 完全一致を優先: "handwear-l" → arm_l のような左右別ターゲットを許可
+    if let Some(target) = full_mapping.get(layer_name) {
+        return Some(target.as_str());
+    }
     let base = normalize_layer_name(layer_name);
     full_mapping.get(base).map(|s| s.as_str())
 }
@@ -1886,6 +2095,10 @@ fn build_full_mapping(user_mapping: &HashMap<String, String>) -> HashMap<String,
             .cloned()
             .unwrap_or_else(|| default_target.to_string());
         full.insert(name.to_string(), target);
+    }
+    // ベース名以外のユーザー指定（"handwear-l" 等のサフィックス付きキー）も保持する
+    for (name, target) in user_mapping {
+        full.insert(name.clone(), target.clone());
     }
     full
 }
@@ -2187,6 +2400,53 @@ fn layer_order_entry_target<'a>(
         .map(|patch| patch.source_layer.as_str())
         .unwrap_or(layer_name);
     get_mapping_target(source_name, mapping)
+}
+
+/// unifiedレイヤー順（top=front）からグループ間の描画順（背面→前面）を導出する。
+/// 各グループの深さ=所属レイヤーのインデックス平均（大きいほど背面）。
+/// eye/mouth/chest は顔・胸の付随パーツとして body の直前面に固定挿入する。
+pub(crate) fn derive_group_draw_order(
+    unified_order: &[String],
+    patches: &[LayerPatch],
+    mapping: &HashMap<String, String>,
+) -> Vec<String> {
+    const GROUPS: &[&str] = &["hair_back", "hair", "body", "arm_l", "arm_r"];
+    let mut sums: HashMap<&str, (f64, u32)> = HashMap::new();
+    for (index, layer_name) in unified_order.iter().enumerate() {
+        let Some(target) = layer_order_entry_target(layer_name, patches, mapping) else {
+            continue;
+        };
+        // sway_* 分離パーツは一括の "sways" グループとして位置づける
+        let group = if target.starts_with("sway_") {
+            Some(&"sways")
+        } else {
+            GROUPS.iter().find(|group| **group == target)
+        };
+        if let Some(group) = group {
+            let entry = sums.entry(group).or_insert((0.0, 0));
+            entry.0 += index as f64;
+            entry.1 += 1;
+        }
+    }
+    if sums.is_empty() {
+        return Vec::new();
+    }
+    let mut order: Vec<(&str, f64)> = sums
+        .into_iter()
+        .map(|(group, (sum, count))| (group, sum / count as f64))
+        .collect();
+    // top=front なのでインデックス平均の降順 = 背面→前面
+    order.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut result: Vec<String> = Vec::new();
+    for (group, _) in order {
+        result.push(group.to_string());
+        if group == "body" {
+            result.push("chest".into());
+            result.push("eye".into());
+            result.push("mouth".into());
+        }
+    }
+    result
 }
 
 fn filter_layer_order_for_target(
@@ -2505,6 +2765,74 @@ fn promote_body_foreground_over_hair(
     promoted_pixels
 }
 
+/// 体より手前にある後ろ髪ピクセルを前髪カテゴリへ昇格する。
+/// 肩の前へ垂れる房は深度上 body より手前だが、SpriTalkの固定z順
+/// （hair_back < body）では body の裏に隠れて「髪が欠けた」ように見える。
+/// 深度マップに基づき該当ピクセルを hair_back から除去し hair の下層へ移す
+fn promote_hair_back_foreground_over_body(
+    body: &DynamicImage,
+    hair_back: &mut DynamicImage,
+    hair: &mut Option<DynamicImage>,
+    slot_layers: &HashMap<String, DynamicImage>,
+    depth_maps: &HashMap<String, GrayImage>,
+    mapping: &HashMap<String, String>,
+    width: u32,
+    height: u32,
+) -> u64 {
+    let body_depth =
+        closest_depth_for_target(slot_layers, depth_maps, mapping, "body", width, height);
+    let back_depth =
+        closest_depth_for_target(slot_layers, depth_maps, mapping, "hair_back", width, height);
+    let body_rgba = body.to_rgba8();
+    let back_rgba = hair_back.to_rgba8();
+    let mut foreground_mask = GrayImage::new(width, height);
+    let tolerance = DEPTH_VISIBILITY_TOLERANCE as u16;
+    let mut promoted_pixels = 0u64;
+
+    for y in 0..height {
+        for x in 0..width {
+            let index = (y * width + x) as usize;
+            if back_rgba.get_pixel(x, y)[3] == 0
+                || body_rgba.get_pixel(x, y)[3] == 0
+                || body_depth[index] == u16::MAX
+                || back_depth[index] == u16::MAX
+            {
+                continue;
+            }
+            if back_depth[index].saturating_add(tolerance) < body_depth[index] {
+                foreground_mask.put_pixel(x, y, image::Luma([255]));
+                promoted_pixels += 1;
+            }
+        }
+    }
+
+    if promoted_pixels == 0 {
+        return 0;
+    }
+
+    let foreground_mask = image::imageops::blur(&foreground_mask, DEPTH_VISIBILITY_FEATHER_SIGMA);
+    // 非破壊コピー方式: hair_back からは削らず、前景分だけを hair 側へ複製する。
+    // 削る方式は深度マップの誤りやフェザーの滲みで髪に透明穴を開けるため廃止。
+    // 同一ピクセルの重ね描きになるので静止時の見た目は変わらず、
+    // z順の問題（bodyの裏に隠れて髪が欠ける）だけが前髪側の複製で解消される
+    let mut foreground = back_rgba.clone();
+    for y in 0..height {
+        for x in 0..width {
+            let mask = foreground_mask.get_pixel(x, y)[0] as u16;
+            let pixel = foreground.get_pixel_mut(x, y);
+            pixel[3] = ((pixel[3] as u16 * mask + 127) / 255) as u8;
+        }
+    }
+    // 昇格分は既存の前髪の「下」に敷く（前髪そのものが常に最前面）
+    let mut combined = foreground;
+    if let Some(existing_hair) = hair.take() {
+        alpha_composite_onto(&mut combined, &existing_hair.to_rgba8(), width, height);
+    }
+    *hair = Some(DynamicImage::ImageRgba8(combined));
+    let _ = back_rgba;
+    promoted_pixels
+}
+
 fn closest_depth_for_target(
     slot_layers: &HashMap<String, DynamicImage>,
     depth_maps: &HashMap<String, GrayImage>,
@@ -2586,6 +2914,58 @@ fn alpha_composite_onto(
             }
         }
     }
+}
+
+fn sam3_select_region_inner(
+    image_data_url: &str,
+    points: &[(f64, f64)],
+) -> Result<Sam3SelectResult, AppError> {
+    let image = decode_data_url_image(image_data_url)?;
+    let checkpoint = neck_extract::find_sam3_checkpoint();
+    let mask = neck_extract::extract_mask_with_sam3_point(&image, points, checkpoint.as_deref())?;
+    let (width, height) = (image.width(), image.height());
+    // ブラシと同じ表示色(233,69,96)でRGBAマスクを作り、パッチマスクcanvasへ
+    // そのまま合成できる形にする（アルファ=SAM3マスク値）
+    let mut rgba = RgbaImage::new(width, height);
+    for (index, pixel) in rgba.pixels_mut().enumerate() {
+        let value = mask.get(index).copied().unwrap_or(0);
+        *pixel = image::Rgba([233, 69, 96, value]);
+    }
+    Ok(Sam3SelectResult {
+        mask_png: image_utils::image_to_base64_png(&DynamicImage::ImageRgba8(rgba)),
+    })
+}
+
+/// 胸を切出（852話式・コピー方式）。塗ったマスク範囲を body から chest として複製する。
+/// body からは**抜かない** — 胸の背後に体が残るため、揺れても穴が空かず自然に見える
+/// （852話 Anime2.5DRig と同方式）。マスク無しなら body をそのまま返す
+fn cut_chest_from_body(
+    body: DynamicImage,
+    chest_mask_png: Option<&str>,
+    parts: &mut HashMap<String, DynamicImage>,
+    width: u32,
+    height: u32,
+) -> Result<DynamicImage, AppError> {
+    let Some(mask_png) = chest_mask_png.filter(|s| !s.is_empty()) else {
+        return Ok(body);
+    };
+    let mask = decode_mask_png(mask_png, width, height)?;
+    let body_rgba = body.to_rgba8();
+    let chest_rgba = apply_mask_to_rgba(&body_rgba, &mask, false);
+    parts.insert("chest".to_string(), DynamicImage::ImageRgba8(chest_rgba));
+    Ok(body)
+}
+
+fn decode_data_url_image(data_uri: &str) -> Result<DynamicImage, AppError> {
+    let encoded = data_uri
+        .split_once(',')
+        .map(|(_, data)| data)
+        .unwrap_or(data_uri);
+    let bytes = STANDARD
+        .decode(encoded)
+        .map_err(|e| AppError::General(format!("画像のデコードに失敗: {}", e)))?;
+    image::load_from_memory(&bytes)
+        .map_err(|e| AppError::General(format!("画像の読み込みに失敗: {}", e)))
 }
 
 fn decode_mask_png(data_uri: &str, width: u32, height: u32) -> Result<image::GrayImage, AppError> {
@@ -2681,7 +3061,7 @@ fn generate_composite_preview(
 ) -> String {
     let mut result = image::RgbaImage::new(width, height);
     // Layer order: hair_back → body → eye → mouth → hair
-    for key in &["hair_back", "body"] {
+    for key in &["hair_back", "body", "chest", "arm_l", "arm_r"] {
         if let Some(img) = parts.get(*key) {
             alpha_composite_onto(&mut result, &img.to_rgba8(), width, height);
         }
@@ -2709,6 +3089,47 @@ fn generate_composite_preview(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn derive_group_draw_order_reflects_unified_order() {
+        // top=front: 前髪の前に犬耳(headwear→hair)、腕はbodyの背面
+        let unified: Vec<String> = [
+            "headwear",   // hair
+            "front_hair", // hair
+            "face",       // body
+            "neck",       // body
+            "back_hair",  // hair_back
+            "handwear-l", // arm_l
+            "handwear-r", // arm_r
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let mut mapping = HashMap::new();
+        mapping.insert("headwear".to_string(), "hair".to_string());
+        mapping.insert("front_hair".to_string(), "hair".to_string());
+        mapping.insert("face".to_string(), "body".to_string());
+        mapping.insert("neck".to_string(), "body".to_string());
+        mapping.insert("back_hair".to_string(), "hair_back".to_string());
+        mapping.insert("handwear-l".to_string(), "arm_l".to_string());
+        mapping.insert("handwear-r".to_string(), "arm_r".to_string());
+
+        let order = derive_group_draw_order(&unified, &[], &mapping);
+
+        // 背面→前面: arm_r, arm_l, hair_back, body(+chest/eye/mouth), hair
+        assert_eq!(
+            order,
+            vec![
+                "arm_r", "arm_l", "hair_back", "body", "chest", "eye", "mouth", "hair"
+            ]
+        );
+    }
+
+    #[test]
+    fn derive_group_draw_order_empty_without_known_targets() {
+        let order = derive_group_draw_order(&["unknown".to_string()], &[], &HashMap::new());
+        assert!(order.is_empty());
+    }
 
     fn solid(r: u8, g: u8, b: u8) -> DynamicImage {
         DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(

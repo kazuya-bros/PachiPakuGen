@@ -36,6 +36,7 @@ pub fn run() {
             commands::parts::get_all_layers_preview,
             commands::parts::import_correction_layer,
             commands::parts::export_corrected_layer,
+            commands::parts::sam3_select_region,
             commands::see_through::load_expression_source_preview,
             commands::see_through::get_see_through_runtime_status,
             commands::see_through::prepare_see_through_runtime,

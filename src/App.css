@@ -2163,6 +2163,26 @@ body {
   color: var(--primary);
 }
 
+.btn-layer-bulk.active {
+  border-color: var(--primary);
+  background: rgba(233, 69, 96, 0.16);
+  color: var(--primary);
+}
+
+.layer-arm-split-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 8px 8px;
+  font-size: 0.7rem;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.layer-arm-split-toggle input {
+  accent-color: var(--primary);
+}
+
 .layer-sidebar-list {
   flex: 1;
   overflow-y: auto;
@@ -2390,6 +2410,14 @@ body {
   display: flex;
   gap: 6px;
   justify-content: center;
+}
+
+.patch-brush-size-label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 0.68rem;
+  color: var(--text-secondary, var(--text));
 }
 
 .btn-nudge-reset {
@@ -3785,6 +3813,116 @@ body {
 .motion-lab-note.warning {
   border-left-color: #f0b84b;
   background: rgba(240, 184, 75, 0.1);
+}
+
+.motion-lab-simple {
+  border-color: var(--primary);
+  background: rgba(233, 69, 96, 0.06);
+}
+
+.motion-lab-simple-toggles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 0.75rem;
+  color: var(--text);
+}
+
+.motion-lab-simple-toggles label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+
+/* エフェクト単位ON/OFFリスト（かんたん設定）。1列＋各行に強さスライダーとソロボタン */
+.motion-lab-effect-list {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 3px;
+  font-size: 0.75rem;
+  color: var(--text);
+}
+
+.motion-lab-effect-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+
+.motion-lab-effect-row > label {
+  flex: 0 0 128px;
+}
+
+.motion-lab-effect-slider {
+  flex: 1;
+  min-width: 60px;
+  accent-color: var(--accent, #e94560);
+}
+
+.motion-lab-effect-slider-spacer {
+  flex: 1;
+}
+
+.motion-lab-effect-value {
+  flex: 0 0 44px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.8;
+}
+
+.motion-lab-effect-row:hover {
+  background: rgba(233, 69, 96, 0.06);
+}
+
+.motion-lab-effect-row label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.motion-lab-effect-solo {
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text);
+  font-size: 0.68rem;
+  padding: 1px 8px;
+  border-radius: 10px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.motion-lab-effect-solo:hover {
+  background: var(--accent, #e94560);
+  color: #fff;
+  border-color: transparent;
+}
+
+.motion-lab-advanced {
+  border: 1px solid var(--border-color);
+}
+
+.motion-lab-advanced summary {
+  cursor: pointer;
+  padding: 10px 12px;
+  font-weight: 700;
+  font-size: 0.8rem;
+  color: var(--text);
+}
+
+.motion-lab-advanced[open] summary {
+  border-bottom: 1px solid var(--border-color);
+}
+
+.motion-lab-advanced > .motion-lab-section {
+  border-left: none;
+  border-right: none;
+  border-top: none;
 }
 
 .motion-lab-section {
@@ -5226,4 +5364,21 @@ body {
     align-items: stretch;
     flex-direction: column;
   }
+}
+
+.motion-lab-text-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.motion-lab-text-row input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface2);
+  color: var(--text);
+  font-size: 0.75rem;
+  padding: 6px 8px;
 }

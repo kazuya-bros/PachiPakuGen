@@ -44,6 +44,10 @@ pub struct AppState {
 
     // PID of the currently running See-Through setup or inference process.
     pub see_through_pid: Mutex<Option<u32>>,
+
+    // Step4のunifiedレイヤー順から導出したグループ間の描画順（背面→前面）。
+    // 空 = 従来の固定z順。save_codex_base_parts が layer-order.json として出力する。
+    pub base_layer_group_order: Mutex<Vec<String>>,
 }
 
 impl Default for AppState {
@@ -63,6 +67,7 @@ impl Default for AppState {
             cached_mouth_originals: Mutex::new(HashMap::new()),
             cached_mouth_raw_masks: Mutex::new(HashMap::new()),
             see_through_pid: Mutex::new(None),
+            base_layer_group_order: Mutex::new(Vec::new()),
         }
     }
 }

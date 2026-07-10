@@ -172,7 +172,9 @@ fn prepare_workspace_codex_request_inner(
     let codex_dir = root.join(CODEX_REQUEST_DIR);
     let generated_dir = root.join(GENERATED_PARTS_DIR);
     let source_copy = codex_dir.join("source.png");
-    image::open(&source)?.save(&source_copy)?;
+    let source_image = image::open(&source)?;
+    let (source_width, source_height) = (source_image.width(), source_image.height());
+    source_image.save(&source_copy)?;
 
     let reference_copy = request
         .reference_image_path
@@ -201,6 +203,8 @@ fn prepare_workspace_codex_request_inner(
             &generated_dir,
             &expected_parts,
             &request,
+            source_width,
+            source_height,
         ),
     )?;
     fs::write(
@@ -213,7 +217,11 @@ fn prepare_workspace_codex_request_inner(
             "formatVersion": 1,
             "mode": "workspace-codex-request",
             "source": source_copy.to_string_lossy(),
-            "reference": reference_copy.as_ref().map(|path| path.to_string_lossy().into_owned()),
+            // 参照画像未指定時は source を参照とする（画風・目口表現の参照先を常に明示）
+            "reference": reference_copy
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_else(|| source_copy.to_string_lossy().into_owned()),
             "generatedPartsDirectory": generated_dir.to_string_lossy(),
             "expectedGeneratedParts": expected_parts,
             "mouthCorner": request.mouth_corner,
@@ -262,14 +270,21 @@ fn inspect_workspace_generated_parts_inner(
         present_parts.push(part.clone());
         match image::open(&path) {
             Ok(image) if image.dimensions() == source.dimensions() => {}
-            Ok(image) => size_mismatches.push(format!(
-                "{}.png: {}x{} (expected {}x{})",
-                part,
-                image.width(),
-                image.height(),
-                source.width(),
-                source.height()
-            )),
+            Ok(image) => {
+                // 同アスペクト比なら抽出時に自動リサイズするため受け入れる
+                let source_aspect = source.width() as f64 / source.height() as f64;
+                let part_aspect = image.width() as f64 / image.height() as f64;
+                if (source_aspect - part_aspect).abs() > 0.01 {
+                    size_mismatches.push(format!(
+                        "{}.png: {}x{} (expected {}x{} または同アスペクト比)",
+                        part,
+                        image.width(),
+                        image.height(),
+                        source.width(),
+                        source.height()
+                    ));
+                }
+            }
             Err(error) => size_mismatches.push(format!("{}.png: {error}", part)),
         }
     }
@@ -387,47 +402,74 @@ fn workspace_codex_request_text(
     generated_dir: &Path,
     expected_parts: &[String],
     request: &PrepareWorkspaceCodexRequest,
+    source_width: u32,
+    source_height: u32,
 ) -> String {
     let expected = expected_parts
         .iter()
         .map(|part| format!("- `{part}.png`"))
         .collect::<Vec<_>>()
         .join("\n");
+    // 参照画像未指定時は元画像を参照として明示する
+    // （「元画像＋依頼文だけ」で他のCodex環境でも再現できる形に保つ）
+    let reference_display = reference_path
+        .unwrap_or(source_path)
+        .display()
+        .to_string();
     format!(
-        r#"# PachiPakuGen Codex生成依頼
+        r#"# PachiPakuGen ImageGen生成依頼
+
+## 目的
+元画像から、後続処理で目または口だけを切り出すための差分用フルフレームPNGを生成してください。
 
 ## 入力
-- 元画像: `{}`
-- 参照画像: `{}`
+- 元画像: `{source}`
+- 参照画像: `{reference}`
+- 参照画像をキャラクター、画風、線、塗り、口内表現、目元表現の参照として使ってください。
 
-## 出力先
-生成したPNGをこのフォルダへ保存してください。
+## 重要
+- 新しいコード、スクリプト、手描き合成、SVG的な図形描画、ローカル画像処理は使わず、画像生成/画像編集だけで生成してください。
+- 後続処理で目または口だけを切り出すため、髪・服・背景・細部の完全一致は不要です。
+- ただし、顔向き、表情の雰囲気、キャラクター性、画風、目口の位置は元画像に近づけてください。
+- 生成結果は自然なラスターアニメ塗りにしてください。SVG風、ベクター風、単純な図形、硬い塗りつぶしは禁止です。
+- 出力解像度は元画像と同じ {width}x{height} にしてください。
 
-`{}`
+## 出力
+以下のPNGを生成し、このフォルダへ保存してください。
 
-## 必要ファイル
-{}
+`{generated_dir}`
 
-## 生成ルール
-- 元画像と同じキャンバスサイズで出力してください。
-- キャラクター、服、髪、ポーズ、カメラ、背景、照明は維持してください。
-- 指定された目または口だけを変更してください。
-- mouth-closed は閉じ口、mouth-a/i/u/e/o は日本語母音の口形、eyes-closed は閉眼です。
-- 口角: `{}`
-- 口サイズ: `{}`
+{expected}
+
+## 口形ルール
+- 口角: {mouth_corner}
+- 口サイズ: {mouth_size}
+- `mouth-closed`: 自然な閉じ口
+- `mouth-a`: 日本語「あ」、自然な縦開き
+- `mouth-i`: 日本語「い」、横に広い口、歯が見えてよい
+- `mouth-u`: 日本語「う」、小さめの丸口、キス口にしない
+- `mouth-e`: 日本語「え」、横に広く、いより少し開く
+- `mouth-o`: 日本語「お」、うより大きい丸口、歯なし
+- `eyes-closed`: 自然な閉眼、眉や口は変えすぎない
+
+## 優先順位
+1. 目または口の差分が自然で、元画像の画風に馴染むこと
+2. 目口の位置が元画像から大きくズレないこと
+3. キャラクター性が保たれていること
+4. 全体の完全一致は求めない
 
 ## 追加指示
-{}
+{prompt}
 "#,
-        source_path.display(),
-        reference_path
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "なし".to_string()),
-        generated_dir.display(),
-        expected,
-        request.mouth_corner,
-        request.mouth_size,
-        request.prompt
+        source = source_path.display(),
+        reference = reference_display,
+        width = source_width,
+        height = source_height,
+        generated_dir = generated_dir.display(),
+        expected = expected,
+        mouth_corner = request.mouth_corner,
+        mouth_size = request.mouth_size,
+        prompt = request.prompt
     )
 }
 

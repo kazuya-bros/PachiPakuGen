@@ -176,6 +176,9 @@ pub struct AdjustCodexExtractedPartsRequest {
     pub offset_x: i32,
     pub offset_y: i32,
     pub scale_percent: u32,
+    /// 指定時はそのパーツだけを調整（パーツ個別補正）。None=全パーツ一括
+    #[serde(default)]
+    pub part: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -598,6 +601,7 @@ fn save_codex_base_parts_inner(
         .ok_or_else(|| AppError::General("保存できる素体パーツがまだありません".into()))?;
     let output_dir = base_parts_dir(&job_dir);
     save_base_parts(&parts, &output_dir)?;
+    save_layer_draw_order(app, &output_dir)?;
     save_eyes_open_extracted_part(&job_dir, &parts, &extracted_parts_dir(&job_dir))?;
     let mut saved_parts = parts.keys().cloned().collect::<Vec<_>>();
     saved_parts.sort();
@@ -605,6 +609,34 @@ fn save_codex_base_parts_inner(
         base_parts_path: output_dir.to_string_lossy().into_owned(),
         saved_parts,
     })
+}
+
+/// Step4のunifiedレイヤー順から導出したグループ描画順（背面→前面）を
+/// layer-order.json として素材フォルダへ保存する。順序情報が無ければ
+/// 古いファイルを消す（固定z順フォールバック）。
+fn save_layer_draw_order(app: &AppHandle, output_dir: &Path) -> Result<(), AppError> {
+    let group_order = app
+        .state::<AppState>()
+        .base_layer_group_order
+        .lock()
+        .unwrap()
+        .clone();
+    let path = output_dir.join("layer-order.json");
+    if group_order.is_empty() {
+        if path.exists() {
+            fs::remove_file(path)?;
+        }
+        return Ok(());
+    }
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "formatVersion": 1,
+            "drawOrder": group_order,
+        }))
+        .map_err(|error| AppError::General(format!("layer-order.json作成失敗: {error}")))?,
+    )?;
+    Ok(())
 }
 
 fn adjust_codex_extracted_parts_inner(
@@ -630,12 +662,23 @@ fn adjust_codex_extracted_parts_inner(
     }
     let originals_dir = extracted_dir.join("original_extracted_parts");
     fs::create_dir_all(&originals_dir)?;
+    // eyes-open は source 由来で最初から位置が合っているため補正対象外
+    // （Codex成果物向けの補正を適用すると逆にズレる）
+    let target_parts: Vec<&str> = match request.part.as_deref() {
+        Some(part) => {
+            if !GENERATED_PART_TARGETS.contains(&part) {
+                return Err(AppError::General(format!(
+                    "調整対象外のパーツです: {part}"
+                )));
+            }
+            vec![part]
+        }
+        None => GENERATED_PART_TARGETS.to_vec(),
+    };
+    // パーツ個別の調整値を保持（v2）。一括適用時は全パーツを同値で上書きする
+    let mut part_adjustments = read_part_adjustments(&extracted_dir);
     let mut adjusted_parts = Vec::new();
-    for part in GENERATED_PART_TARGETS
-        .iter()
-        .copied()
-        .chain(["eyes-open"].into_iter())
-    {
+    for part in target_parts {
         let current_path = extracted_dir.join(format!("{part}.png"));
         if !current_path.is_file() {
             continue;
@@ -652,17 +695,26 @@ fn adjust_codex_extracted_parts_inner(
             request.scale_percent,
         );
         adjusted.save(&current_path)?;
+        part_adjustments.insert(
+            part.to_string(),
+            json!({
+                "offsetX": request.offset_x,
+                "offsetY": request.offset_y,
+                "scalePercent": request.scale_percent,
+            }),
+        );
         adjusted_parts.push(part.to_string());
     }
     let manifest_path = extracted_dir.join("adjustment.json");
     fs::write(
         manifest_path,
         serde_json::to_vec_pretty(&json!({
-            "formatVersion": 1,
+            "formatVersion": 2,
             "offsetX": request.offset_x,
             "offsetY": request.offset_y,
             "scalePercent": request.scale_percent,
             "adjustedParts": adjusted_parts,
+            "parts": serde_json::Value::Object(part_adjustments.clone().into_iter().collect()),
         }))
         .map_err(|error| AppError::General(format!("adjustment.json作成失敗: {error}")))?,
     )?;
@@ -673,6 +725,21 @@ fn adjust_codex_extracted_parts_inner(
         offset_y: request.offset_y,
         scale_percent: request.scale_percent,
     })
+}
+
+/// adjustment.json（v2）からパーツ個別の調整値を読む
+fn read_part_adjustments(
+    extracted_dir: &Path,
+) -> std::collections::BTreeMap<String, serde_json::Value> {
+    fs::read(extracted_dir.join("adjustment.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|manifest| manifest.get("parts").cloned())
+        .and_then(|parts| match parts {
+            serde_json::Value::Object(map) => Some(map.into_iter().collect()),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 fn transform_extracted_part(
@@ -730,11 +797,20 @@ fn current_base_parts(app: &AppHandle) -> Option<HashMap<String, DynamicImage>> 
         "neck",
         "hair",
         "hair_back",
+        "arm_l",
+        "arm_r",
+        "chest",
         "eye_open",
         "mouth_closed",
     ] {
         if let Some(image) = parts.get(key) {
             cloned.insert(key.to_string(), image.clone());
+        }
+    }
+    // 汎用揺れパーツ（sway_*）はマッピング由来で名前が動的
+    for (key, image) in parts.iter() {
+        if key.starts_with("sway_") {
+            cloned.insert(key.clone(), image.clone());
         }
     }
     Some(cloned)
@@ -750,6 +826,9 @@ fn save_base_parts(
         "neck",
         "hair",
         "hair_back",
+        "arm_l",
+        "arm_r",
+        "chest",
         "eye_open",
         "mouth_closed",
     ] {
@@ -759,6 +838,28 @@ fn save_base_parts(
         }
         if let Some(image) = parts.get(key) {
             image.save(path)?;
+        }
+    }
+    // 汎用揺れパーツ（sway_*）: 旧ファイルを掃除してから今回分を保存
+    if let Ok(entries) = fs::read_dir(output_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let is_stale_sway = path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.to_ascii_lowercase().starts_with("sway_")
+                            && name.to_ascii_lowercase().ends_with(".png")
+                    });
+            if is_stale_sway {
+                fs::remove_file(path)?;
+            }
+        }
+    }
+    for (key, image) in parts.iter() {
+        if key.starts_with("sway_") {
+            image.save(output_dir.join(format!("{key}.png")))?;
         }
     }
     Ok(())
@@ -782,7 +883,12 @@ fn save_eyes_open_extracted_part(
         base_eye.clone()
     };
     fs::create_dir_all(extracted_dir)?;
-    eyes_open.save(extracted_dir.join("eyes-open.png"))?;
+    // 抽出済み eyes-open.png は source 由来（抽出工程で生成）を正とし、
+    // 無い場合のみグローバル状態のeye_openで補完する
+    let extracted_eyes_open = extracted_dir.join("eyes-open.png");
+    if !extracted_eyes_open.is_file() {
+        eyes_open.save(&extracted_eyes_open)?;
+    }
     let base_dir = base_parts_dir(job_dir);
     fs::create_dir_all(&base_dir)?;
     eyes_open.save(base_dir.join("eye_open.png"))?;
@@ -890,6 +996,56 @@ fn extract_codex_generated_parts_inner(
     let mut warnings = Vec::new();
     let total = status.expected_parts.len() as u32;
 
+    // 直前に実行された source の See-Through 分解をスナップショット。
+    // 生成素材の分解でグローバル状態が上書きされるため、eyes-open生成・
+    // 位置合わせアンカー・後工程（素体調整）のすべてがこのスナップショットを正とする
+    let source_snapshot = match snapshot_current_decomposition(&app) {
+        Some(snapshot)
+            if snapshot.width == source_image.width()
+                && snapshot.height == source_image.height() =>
+        {
+            snapshot
+        }
+        _ => {
+            see_through::run_inference(
+                &app,
+                &source_path.to_string_lossy(),
+                profile,
+                split_parts,
+                options.clone(),
+            )?;
+            snapshot_current_decomposition(&app).ok_or_else(|| {
+                AppError::General("元画像のSee-Through分解結果を取得できません".into())
+            })?
+        }
+    };
+
+    // eyes-open は常に source から再生成（生成素材の分解結果に依存させない）。
+    // 位置補正の対象外なので original_extracted_parts 側も同時に更新する
+    regenerate_eyes_open_from_source(&source_image, &source_snapshot, &extracted_dir, &mut warnings)?;
+
+    // 位置合わせアンカー: source の目・口レイヤーのアルファ重心
+    // （852話氏のアンカー自動検出と同方式。bbox中心より外れ値に強い）
+    let source_eye_anchor = extract_named_expression_layers(
+        &source_snapshot.layers,
+        EYE_LAYER_NAMES,
+        source_snapshot.width,
+        source_snapshot.height,
+    )
+    .as_ref()
+    .and_then(alpha_centroid);
+    let source_mouth_anchor = extract_named_expression_layers(
+        &source_snapshot.layers,
+        &["mouth"],
+        source_snapshot.width,
+        source_snapshot.height,
+    )
+    .as_ref()
+    .and_then(alpha_centroid);
+
+    let previous_alignment = read_extraction_alignment(&extracted_dir);
+    let mut alignment = serde_json::Map::new();
+
     for (index, part) in status.expected_parts.iter().enumerate() {
         app.emit(
             "generation-progress",
@@ -903,9 +1059,13 @@ fn extract_codex_generated_parts_inner(
 
         let generated_path = generated_parts_dir.join(format!("{part}.png"));
         let output_path = extracted_dir.join(format!("{part}.png"));
+        // 位置合わせ済み（alignment記録あり）の場合のみ再利用可
         if extracted_part_is_fresh(part, &generated_path, &output_path) {
-            extracted_parts.push(part.clone());
-            continue;
+            if let Some(previous) = previous_alignment.get(part.as_str()) {
+                alignment.insert(part.clone(), previous.clone());
+                extracted_parts.push(part.clone());
+                continue;
+            }
         }
         let generated_image = image::open(&generated_path).map_err(|error| {
             AppError::General(format!(
@@ -936,63 +1096,92 @@ fn extract_codex_generated_parts_inner(
         } else {
             extract_named_expression_layers(&layers, &["mouth"], width, height)
         };
-        if let Some(extracted) = extracted_from_layers {
-            extracted.save(&output_path)?;
-            extracted_parts.push(part.clone());
-            continue;
-        }
-        if part.starts_with("mouth-") {
-            warnings.push(format!(
-                "{}: See-Through mouth layer was not found ({})",
-                part, see_through_result.psd_path
-            ));
-            continue;
-        }
-        if width == 0 || height == 0 {
-            return Err(AppError::General(
-                "See-Through分解結果のキャンバスサイズが不正です".into(),
-            ));
-        }
-
-        let mut mask = if part.starts_with("eyes-") {
-            expression_mask(&layers, EYE_LAYER_NAMES, width, height, 12, 3)
+        let extracted = if let Some(extracted) = extracted_from_layers {
+            Some(extracted)
         } else {
-            mouth_expression_mask(&layers, width, height)
-        };
-        if part.starts_with("mouth-") {
-            mask = refine_mouth_mask_with_difference(
-                &mask,
-                &source_image,
-                &generated_image,
-                width,
-                height,
-            );
-        }
-        let min_area = if part.starts_with("eyes-") { 80 } else { 40 };
-        if !mask_has_minimum_edit_area(&mask, min_area) {
-            warnings.push(format!(
-                "{}: 対象レイヤーを十分に抽出できませんでした ({})",
-                part, see_through_result.psd_path
-            ));
-            continue;
-        }
+            if part.starts_with("mouth-") {
+                warnings.push(format!(
+                    "{}: See-Through mouth layer was not found ({})",
+                    part, see_through_result.psd_path
+                ));
+                continue;
+            }
+            if width == 0 || height == 0 {
+                return Err(AppError::General(
+                    "See-Through分解結果のキャンバスサイズが不正です".into(),
+                ));
+            }
 
-        let part_image = if generated_image.width() != width || generated_image.height() != height {
-            generated_image.resize_exact(width, height, image::imageops::FilterType::Lanczos3)
-        } else {
-            generated_image
+            let mut mask = if part.starts_with("eyes-") {
+                expression_mask(&layers, EYE_LAYER_NAMES, width, height, 12, 3)
+            } else {
+                mouth_expression_mask(&layers, width, height)
+            };
+            if part.starts_with("mouth-") {
+                mask = refine_mouth_mask_with_difference(
+                    &mask,
+                    &source_image,
+                    &generated_image,
+                    width,
+                    height,
+                );
+            }
+            let min_area = if part.starts_with("eyes-") { 80 } else { 40 };
+            if !mask_has_minimum_edit_area(&mask, min_area) {
+                warnings.push(format!(
+                    "{}: 対象レイヤーを十分に抽出できませんでした ({})",
+                    part, see_through_result.psd_path
+                ));
+                continue;
+            }
+
+            let part_image =
+                if generated_image.width() != width || generated_image.height() != height {
+                    generated_image.resize_exact(width, height, image::imageops::FilterType::Lanczos3)
+                } else {
+                    generated_image
+                };
+            Some(cut_image_with_mask(&part_image, &mask))
         };
-        let extracted = cut_image_with_mask(&part_image, &mask);
-        extracted.save(&output_path)?;
+        let Some(extracted) = extracted else { continue };
+
+        // 出力は source 解像度に正規化（生成素材が同アスペクト別解像度でも後段が揃う）
+        let extracted = if extracted.width() != source_snapshot.width
+            || extracted.height() != source_snapshot.height
+        {
+            extracted.resize_exact(
+                source_snapshot.width,
+                source_snapshot.height,
+                image::imageops::FilterType::Lanczos3,
+            )
+        } else {
+            extracted
+        };
+
+        // 自動位置合わせ: 抽出パーツのalpha bbox中心を source の対応領域中心へ平行移動
+        let anchor = if part.starts_with("eyes-") {
+            source_eye_anchor
+        } else {
+            source_mouth_anchor
+        };
+        let (aligned, dx, dy) = align_extracted_to_anchor(&extracted, anchor, source_snapshot.width);
+        aligned.save(&output_path)?;
+        alignment.insert(part.clone(), json!({ "dx": dx, "dy": dy }));
         extracted_parts.push(part.clone());
     }
 
+    // 生成素材の分解で上書きされた状態を source の分解結果へ戻す
+    // （この後の素体調整が source を対象に動くようにする）
+    restore_decomposition_snapshot(&app, &source_snapshot);
+
     let manifest = json!({
-        "formatVersion": 1,
+        "formatVersion": 2,
         "mode": "codex-generated-parts-extracted",
         "sourceJob": job_dir.to_string_lossy(),
         "extractedPartsDirectory": extracted_dir.to_string_lossy(),
         "extractedParts": extracted_parts,
+        "alignment": serde_json::Value::Object(alignment),
+        "eyesOpenSource": "source-image",
         "warnings": warnings,
     });
     fs::write(
@@ -1006,6 +1195,162 @@ fn extract_codex_generated_parts_inner(
         extracted_parts,
         warnings,
     })
+}
+
+struct DecompositionSnapshot {
+    layers: HashMap<String, DynamicImage>,
+    order: Vec<String>,
+    depth_maps: HashMap<String, GrayImage>,
+    width: u32,
+    height: u32,
+}
+
+fn snapshot_current_decomposition(app: &AppHandle) -> Option<DecompositionSnapshot> {
+    let state = app.state::<AppState>();
+    let layers = state.slot_layers.lock().unwrap().get("current").cloned()?;
+    if layers.is_empty() {
+        return None;
+    }
+    let width = *state.canvas_width.lock().unwrap();
+    let height = *state.canvas_height.lock().unwrap();
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let order = state.slot_layer_order.lock().unwrap().clone();
+    let depth_maps = state.slot_depth_maps.lock().unwrap().clone();
+    Some(DecompositionSnapshot {
+        layers,
+        order,
+        depth_maps,
+        width,
+        height,
+    })
+}
+
+fn restore_decomposition_snapshot(app: &AppHandle, snapshot: &DecompositionSnapshot) {
+    let state = app.state::<AppState>();
+    state
+        .slot_layers
+        .lock()
+        .unwrap()
+        .insert("current".to_string(), snapshot.layers.clone());
+    *state.slot_layer_order.lock().unwrap() = snapshot.order.clone();
+    *state.slot_depth_maps.lock().unwrap() = snapshot.depth_maps.clone();
+    *state.canvas_width.lock().unwrap() = snapshot.width;
+    *state.canvas_height.lock().unwrap() = snapshot.height;
+}
+
+/// eyes-open.png を元画像から再生成する。RIFEの開き目始点は常に source 由来とし、
+/// 生成素材（閉じ目）の分解結果が混入しないようにする
+fn regenerate_eyes_open_from_source(
+    source_image: &DynamicImage,
+    snapshot: &DecompositionSnapshot,
+    extracted_dir: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<(), AppError> {
+    let mask = expression_mask(
+        &snapshot.layers,
+        EYE_LAYER_NAMES,
+        snapshot.width,
+        snapshot.height,
+        12,
+        3,
+    );
+    if !mask_has_minimum_edit_area(&mask, 80) {
+        warnings.push(
+            "eyes-open: 元画像の目レイヤーを十分に抽出できませんでした。既存のeyes-open.pngを維持します".into(),
+        );
+        return Ok(());
+    }
+    // サニティ: マスクが広すぎる場合は目領域として信用しない
+    // （分解結果の目レイヤーが全面に漏れると eyes-open がフル画像化して以降の合成が壊れる）
+    let mask_area = mask.pixels().filter(|pixel| pixel[0] > 0).count() as u64;
+    let canvas_area = (snapshot.width as u64) * (snapshot.height as u64);
+    let mask_bbox = mask_bounds(mask.as_raw(), snapshot.width, snapshot.height);
+    let mask_too_large = mask_area * 100 > canvas_area * 15
+        || mask_bbox.is_some_and(|(min_x, min_y, max_x, max_y)| {
+            (max_x - min_x) > snapshot.width * 2 / 3 || (max_y - min_y) > snapshot.height / 2
+        });
+    if mask_too_large {
+        warnings.push(
+            "eyes-open: 目マスクが広すぎるため再生成をスキップしました。See-Through分解の目レイヤーを確認してください".into(),
+        );
+        return Ok(());
+    }
+    let source_resized = if source_image.width() != snapshot.width
+        || source_image.height() != snapshot.height
+    {
+        source_image.resize_exact(
+            snapshot.width,
+            snapshot.height,
+            image::imageops::FilterType::Lanczos3,
+        )
+    } else {
+        source_image.clone()
+    };
+    let eyes_open = cut_image_with_mask(&source_resized, &mask);
+    eyes_open.save(extracted_dir.join("eyes-open.png"))?;
+    // 位置補正前の原本も source 由来へ更新（過去の壊れたコピーを残さない）
+    let originals_dir = extracted_dir.join("original_extracted_parts");
+    fs::create_dir_all(&originals_dir)?;
+    eyes_open.save(originals_dir.join("eyes-open.png"))?;
+    Ok(())
+}
+
+/// 既存 manifest.json から位置合わせ記録を読む（無ければ空 = 全パーツ再処理）
+fn read_extraction_alignment(extracted_dir: &Path) -> serde_json::Map<String, serde_json::Value> {
+    fs::read(extracted_dir.join("manifest.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|manifest| manifest.get("alignment").cloned())
+        .and_then(|alignment| match alignment {
+            serde_json::Value::Object(map) => Some(map),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// 抽出パーツのアルファ重心を source 側アンカー（レイヤー重心）へ平行移動する。
+/// 重心方式は散在ピクセルに引きずられにくい（852話式アンカー検出と同方針）。
+/// ずれ量が width/6 を超える場合は検出不良とみなし補正しない
+fn align_extracted_to_anchor(
+    image: &DynamicImage,
+    anchor: Option<(f64, f64)>,
+    width: u32,
+) -> (DynamicImage, i32, i32) {
+    let Some((anchor_x, anchor_y)) = anchor else {
+        return (image.clone(), 0, 0);
+    };
+    let Some((center_x, center_y)) = alpha_centroid(image) else {
+        return (image.clone(), 0, 0);
+    };
+    let limit = (width as i32 / 6).max(1);
+    let dx = (anchor_x - center_x).round() as i32;
+    let dy = (anchor_y - center_y).round() as i32;
+    if dx.abs() > limit || dy.abs() > limit {
+        return (image.clone(), 0, 0);
+    }
+    if dx == 0 && dy == 0 {
+        return (image.clone(), 0, 0);
+    }
+    (transform_extracted_part(image, dx, dy, 100), dx, dy)
+}
+
+/// アルファ加重の重心（位置合わせアンカー用）
+fn alpha_centroid(image: &DynamicImage) -> Option<(f64, f64)> {
+    let rgba = image.to_rgba8();
+    let mut weight_sum = 0f64;
+    let mut x_sum = 0f64;
+    let mut y_sum = 0f64;
+    for (x, y, pixel) in rgba.enumerate_pixels() {
+        let alpha = pixel[3] as f64;
+        if alpha > 8.0 {
+            weight_sum += alpha;
+            x_sum += x as f64 * alpha;
+            y_sum += y as f64 * alpha;
+        }
+    }
+    (weight_sum > 0.0).then(|| (x_sum / weight_sum, y_sum / weight_sum))
 }
 
 fn cut_image_with_mask(image: &DynamicImage, mask: &GrayImage) -> DynamicImage {
@@ -1039,12 +1384,13 @@ fn preview_codex_composite_inner(
         ));
     }
     if let Some(base_parts) = load_job_base_parts(&job_dir)? {
-        return preview_from_base_parts(&base_parts, &early_extracted_dir);
+        return preview_from_base_parts(&base_parts, &early_extracted_dir, &base_parts_dir(&job_dir));
     }
     if let Some(base_parts) = current_base_parts(&app) {
         let base_parts_dir = base_parts_dir(&job_dir);
         save_base_parts(&base_parts, &base_parts_dir)?;
-        return preview_from_base_parts(&base_parts, &early_extracted_dir);
+        save_layer_draw_order(&app, &base_parts_dir)?;
+        return preview_from_base_parts(&base_parts, &early_extracted_dir, &base_parts_dir);
     }
     see_through::run_inference(&app, &source_path.to_string_lossy(), profile, true, None)?;
     let state = app.state::<AppState>();
@@ -1145,6 +1491,9 @@ fn load_job_base_parts(job_dir: &Path) -> Result<Option<HashMap<String, DynamicI
         "neck",
         "hair",
         "hair_back",
+        "arm_l",
+        "arm_r",
+        "chest",
         "eye_open",
         "mouth_closed",
     ] {
@@ -1159,18 +1508,89 @@ fn load_job_base_parts(job_dir: &Path) -> Result<Option<HashMap<String, DynamicI
             parts.insert(key.to_string(), image);
         }
     }
+    // 汎用揺れパーツ（sway_*、獣耳等）も合成対象に含める
+    if let Ok(entries) = fs::read_dir(&base_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let is_sway_png = path.is_file()
+                && stem.to_ascii_lowercase().starts_with("sway_")
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("png"));
+            if is_sway_png {
+                if let Ok(image) = image::open(&path) {
+                    parts.insert(stem.to_string(), image);
+                }
+            }
+        }
+    }
     Ok(parts.contains_key("body").then_some(parts))
+}
+
+/// base_parts/layer-order.json のグループ描画順を読む（無ければ空=既定順）
+fn read_base_layer_order(base_dir: &Path) -> Vec<String> {
+    let path = base_dir.join("layer-order.json");
+    let Ok(bytes) = fs::read(&path) else {
+        return Vec::new();
+    };
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|value| {
+            value.get("drawOrder").and_then(|order| {
+                order.as_array().map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| entry.as_str().map(str::to_string))
+                        .collect()
+                })
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// layer-order.json の順序に既定順の不足グループ（neck/sways等）を補完する。
+/// アルゴリズムはフロント drawMotionLabOrderedLayers と同じ（既定順で直前の要素の直後へ挿入）
+fn resolve_base_draw_order(custom: &[String]) -> Vec<String> {
+    const DEFAULT: [&str; 10] = [
+        "hair_back", "body", "neck", "chest", "arm_l", "arm_r", "sways", "eye", "mouth", "hair",
+    ];
+    let mut order: Vec<String> = custom
+        .iter()
+        .filter(|key| DEFAULT.contains(&key.as_str()))
+        .cloned()
+        .collect();
+    for (index, key) in DEFAULT.iter().enumerate() {
+        if order.iter().any(|entry| entry == key) {
+            continue;
+        }
+        let mut insert_at = order.len();
+        for prev_index in (0..index).rev() {
+            if let Some(pos) = order.iter().position(|entry| entry == DEFAULT[prev_index]) {
+                insert_at = pos + 1;
+                break;
+            }
+        }
+        order.insert(insert_at, key.to_string());
+    }
+    order
 }
 
 fn preview_from_base_parts(
     base_parts: &HashMap<String, DynamicImage>,
     extracted_dir: &Path,
+    base_dir: &Path,
 ) -> Result<PreviewCodexCompositeResult, AppError> {
     let body = base_parts
         .get("body")
         .ok_or_else(|| AppError::General("base_parts/body.png が見つかりません".into()))?;
     let width = body.width();
     let height = body.height();
+    // Step4のレイヤー調整で決めたグループ描画順（layer-order.json）を尊重する
+    let draw_order = resolve_base_draw_order(&read_base_layer_order(base_dir));
     let mut part_names = Vec::new();
     if extracted_dir.join("eyes-open.png").is_file() {
         part_names.push("eyes-open".to_string());
@@ -1197,16 +1617,15 @@ fn preview_from_base_parts(
             ))
         })?;
         let part_rgba = resized_rgba(&part_image, width, height);
-        let mut composite = compose_base_parts_for_part(base_parts, &part, width, height);
-        alpha_composite_onto(&mut composite, &part_rgba, width, height);
-        if let Some(hair) = base_parts.get("hair") {
-            alpha_composite_onto(
-                &mut composite,
-                &resized_rgba(hair, width, height),
-                width,
-                height,
-            );
-        }
+        let is_eye_part = part.starts_with("eyes-");
+        let composite = compose_base_parts_ordered(
+            base_parts,
+            width,
+            height,
+            &draw_order,
+            is_eye_part.then_some(&part_rgba),
+            (!is_eye_part).then_some(&part_rgba),
+        );
         previews.push(CodexCompositePreviewItem {
             part,
             preview: image_data_url(&DynamicImage::ImageRgba8(composite))?,
@@ -1214,8 +1633,8 @@ fn preview_from_base_parts(
     }
 
     Ok(PreviewCodexCompositeResult {
-        base_preview: image_data_url(&DynamicImage::ImageRgba8(compose_base_parts_neutral(
-            base_parts, width, height,
+        base_preview: image_data_url(&DynamicImage::ImageRgba8(compose_base_parts_ordered(
+            base_parts, width, height, &draw_order, None, None,
         )))?,
         previews,
     })
@@ -1231,6 +1650,7 @@ fn preview_codex_rife_outputs_inner(job_path: &str) -> Result<PreviewCodexRifeRe
         .ok_or_else(|| AppError::General("base_parts/body.png が見つかりません".into()))?;
     let width = body.width();
     let height = body.height();
+    let draw_order = resolve_base_draw_order(&read_base_layer_order(&base_parts_dir(&job_dir)));
     let output_root = rife_output_dir(&job_dir);
     if !output_root.is_dir() {
         return Err(AppError::General(format!(
@@ -1262,16 +1682,15 @@ fn preview_codex_rife_outputs_inner(job_path: &str) -> Result<PreviewCodexRifeRe
                 ))
             })?;
             let frame_rgba = resized_rgba(&frame, width, height);
-            let mut composite = compose_base_parts_for_part(&base_parts, part, width, height);
-            alpha_composite_onto(&mut composite, &frame_rgba, width, height);
-            if let Some(hair) = base_parts.get("hair") {
-                alpha_composite_onto(
-                    &mut composite,
-                    &resized_rgba(hair, width, height),
-                    width,
-                    height,
-                );
-            }
+            let is_eye_part = part.starts_with("eyes-");
+            let composite = compose_base_parts_ordered(
+                &base_parts,
+                width,
+                height,
+                &draw_order,
+                is_eye_part.then_some(&frame_rgba),
+                (!is_eye_part).then_some(&frame_rgba),
+            );
             previews.push(CodexRifeFramePreviewItem {
                 part: part.to_string(),
                 frame_index: index as u32 + 1,
@@ -1282,10 +1701,13 @@ fn preview_codex_rife_outputs_inner(job_path: &str) -> Result<PreviewCodexRifeRe
     }
 
     Ok(PreviewCodexRifeResult {
-        base_preview: image_data_url(&DynamicImage::ImageRgba8(compose_base_parts_neutral(
+        base_preview: image_data_url(&DynamicImage::ImageRgba8(compose_base_parts_ordered(
             &base_parts,
             width,
             height,
+            &draw_order,
+            None,
+            None,
         )))?,
         previews,
     })
@@ -1318,68 +1740,54 @@ fn sorted_png_files(dir: &Path) -> Result<Vec<PathBuf>, AppError> {
     Ok(files)
 }
 
-fn compose_base_parts_neutral(
+/// base_parts をグループ描画順（layer-order.json由来、背面→前面）で合成する。
+/// eye/mouth スロットは overlay 指定時にそれで置き換え（差分パーツ・RIFEフレーム用）。
+/// overlay が None のスロットは eye_open / mouth_closed を使う。
+fn compose_base_parts_ordered(
     base_parts: &HashMap<String, DynamicImage>,
     width: u32,
     height: u32,
-) -> RgbaImage {
-    let mut result = compose_base_parts_shell(base_parts, width, height);
-    for key in ["eye_open", "mouth_closed", "hair"] {
-        if let Some(image) = base_parts.get(key) {
-            alpha_composite_onto(
-                &mut result,
-                &resized_rgba(image, width, height),
-                width,
-                height,
-            );
-        }
-    }
-    result
-}
-
-fn compose_base_parts_for_part(
-    base_parts: &HashMap<String, DynamicImage>,
-    part: &str,
-    width: u32,
-    height: u32,
-) -> RgbaImage {
-    let mut result = compose_base_parts_shell(base_parts, width, height);
-    if part.starts_with("mouth-") {
-        if let Some(eye) = base_parts.get("eye_open") {
-            alpha_composite_onto(
-                &mut result,
-                &resized_rgba(eye, width, height),
-                width,
-                height,
-            );
-        }
-    } else if part.starts_with("eyes-") {
-        if let Some(mouth) = base_parts.get("mouth_closed") {
-            alpha_composite_onto(
-                &mut result,
-                &resized_rgba(mouth, width, height),
-                width,
-                height,
-            );
-        }
-    }
-    result
-}
-
-fn compose_base_parts_shell(
-    base_parts: &HashMap<String, DynamicImage>,
-    width: u32,
-    height: u32,
+    order: &[String],
+    eye_overlay: Option<&RgbaImage>,
+    mouth_overlay: Option<&RgbaImage>,
 ) -> RgbaImage {
     let mut result = RgbaImage::new(width, height);
-    for key in ["hair_back", "body", "neck"] {
-        if let Some(image) = base_parts.get(key) {
-            alpha_composite_onto(
-                &mut result,
-                &resized_rgba(image, width, height),
-                width,
-                height,
-            );
+    let mut draw = |result: &mut RgbaImage, image: &DynamicImage| {
+        alpha_composite_onto(result, &resized_rgba(image, width, height), width, height);
+    };
+    for key in order {
+        match key.as_str() {
+            "eye" => {
+                if let Some(overlay) = eye_overlay {
+                    alpha_composite_onto(&mut result, overlay, width, height);
+                } else if let Some(image) = base_parts.get("eye_open") {
+                    draw(&mut result, image);
+                }
+            }
+            "mouth" => {
+                if let Some(overlay) = mouth_overlay {
+                    alpha_composite_onto(&mut result, overlay, width, height);
+                } else if let Some(image) = base_parts.get("mouth_closed") {
+                    draw(&mut result, image);
+                }
+            }
+            "sways" => {
+                let mut sway_keys: Vec<&String> = base_parts
+                    .keys()
+                    .filter(|key| key.starts_with("sway_"))
+                    .collect();
+                sway_keys.sort();
+                for sway_key in sway_keys {
+                    if let Some(image) = base_parts.get(sway_key) {
+                        draw(&mut result, image);
+                    }
+                }
+            }
+            _ => {
+                if let Some(image) = base_parts.get(key.as_str()) {
+                    draw(&mut result, image);
+                }
+            }
         }
     }
     result
@@ -1757,7 +2165,7 @@ fn materialize_spritalk_static_assets(
     }
     fs::write(
         output_root.join("README.txt"),
-        "PachiPakuGen SpriTalk output\nSelect this folder in SpriTalk layer import.\nRequired: body.png\nOptional: hair.png, hair_back.png\nAnimation folders: eye, mouth_a, mouth_i, mouth_u, mouth_e, mouth_o\n",
+        "PachiPakuGen SpriTalk output\nSelect this folder in SpriTalk layer import.\nRequired: body.png\nOptional: hair.png, hair_back.png, arm_l.png, arm_r.png, chest.png, sway_*.png\nAnimation folders: eye, mouth_a, mouth_i, mouth_u, mouth_e, mouth_o\n",
     )?;
     Ok(copied)
 }
@@ -1782,7 +2190,18 @@ fn copy_spritalk_root_assets(
     copied: &mut Vec<String>,
 ) -> Result<(), AppError> {
     fs::create_dir_all(output_root)?;
-    for file_name in ["body.png", "hair.png", "hair_back.png"] {
+    for file_name in [
+        "body.png",
+        "hair.png",
+        "hair_back.png",
+        "arm_l.png",
+        "arm_r.png",
+        "chest.png",
+        "eyewhite.png",
+        "irides.png",
+        "highlight.png",
+        "layer-order.json",
+    ] {
         let source_path = source_dir.join(file_name);
         if source_path.is_file() {
             let dest_path = output_root.join(file_name);
@@ -1792,6 +2211,23 @@ fn copy_spritalk_root_assets(
             let stale_path = output_root.join(file_name);
             if stale_path.exists() {
                 fs::remove_file(stale_path)?;
+            }
+        }
+    }
+    // 汎用揺れパーツ sway_*.png（base_parts に手動配置されたものも伝搬する）
+    if let Ok(entries) = fs::read_dir(source_dir) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if path.is_file()
+                && name.to_ascii_lowercase().starts_with("sway_")
+                && name.to_ascii_lowercase().ends_with(".png")
+            {
+                let dest_path = output_root.join(name);
+                fs::copy(&path, &dest_path)?;
+                copied.push(dest_path.to_string_lossy().into_owned());
             }
         }
     }
@@ -1869,14 +2305,20 @@ fn inspect_generated_parts(
             ))
         })?;
         if image.width() != source_image.width() || image.height() != source_image.height() {
-            size_mismatches.push(format!(
-                "{}.png: {}x{} (expected {}x{})",
-                part,
-                image.width(),
-                image.height(),
-                source_image.width(),
-                source_image.height()
-            ));
+            // 同アスペクト比なら抽出時に自動リサイズするため受け入れる。
+            // アスペクト比が異なる場合のみブロック（リサイズすると歪むため）
+            let source_aspect = source_image.width() as f64 / source_image.height() as f64;
+            let part_aspect = image.width() as f64 / image.height() as f64;
+            if (source_aspect - part_aspect).abs() > 0.01 {
+                size_mismatches.push(format!(
+                    "{}.png: {}x{} (expected {}x{} または同アスペクト比)",
+                    part,
+                    image.width(),
+                    image.height(),
+                    source_image.width(),
+                    source_image.height()
+                ));
+            }
         }
         present_parts.push(part.clone());
     }
@@ -3241,6 +3683,53 @@ fn composite_inside_mask(
 mod tests {
     use super::*;
     use image::{GrayImage, Luma, Rgba};
+
+    #[test]
+    fn resolve_base_draw_order_inserts_missing_groups() {
+        // layer-order.json は neck / sways を含まない → 既定の相対位置へ補完される
+        let custom: Vec<String> = ["hair_back", "arm_l", "arm_r", "body", "chest", "eye", "mouth", "hair"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let order = resolve_base_draw_order(&custom);
+        // sways は既定順の直前要素 arm_r の直後へ補完される
+        // （sways が custom に無い = swayパーツ未使用なので実描画には影響しない）
+        assert_eq!(
+            order,
+            vec![
+                "hair_back", "arm_l", "arm_r", "sways", "body", "neck", "chest", "eye", "mouth",
+                "hair"
+            ]
+        );
+        // 空 = 既定順そのまま
+        assert_eq!(
+            resolve_base_draw_order(&[]),
+            vec![
+                "hair_back", "body", "neck", "chest", "arm_l", "arm_r", "sways", "eye", "mouth",
+                "hair"
+            ]
+        );
+    }
+
+    #[test]
+    fn compose_base_parts_ordered_respects_arm_behind_body() {
+        // 腕(赤)が body(青) の背面指定なら、重なり部は body の色になる
+        let mut parts: HashMap<String, DynamicImage> = HashMap::new();
+        parts.insert(
+            "body".into(),
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, Rgba([0, 0, 255, 255]))),
+        );
+        parts.insert(
+            "arm_l".into(),
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, Rgba([255, 0, 0, 255]))),
+        );
+        let behind: Vec<String> = ["arm_l", "body"].iter().map(|s| s.to_string()).collect();
+        let composite = compose_base_parts_ordered(&parts, 2, 2, &behind, None, None);
+        assert_eq!(composite.get_pixel(0, 0), &Rgba([0, 0, 255, 255]));
+        let front: Vec<String> = ["body", "arm_l"].iter().map(|s| s.to_string()).collect();
+        let composite = compose_base_parts_ordered(&parts, 2, 2, &front, None, None);
+        assert_eq!(composite.get_pixel(0, 0), &Rgba([255, 0, 0, 255]));
+    }
 
     fn request(targets: &[&str]) -> GenerateExpressionSetRequest {
         GenerateExpressionSetRequest {

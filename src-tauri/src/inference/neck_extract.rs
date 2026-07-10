@@ -161,6 +161,139 @@ pub fn extract_masks_with_sam3(
     Ok(masks)
 }
 
+/// Extract a mask from a click point using SAM3's point-prompt API
+/// (切出ツールのクリック選択モード。テキストプロンプト経路とは独立した処理)
+pub fn extract_mask_with_sam3_point(
+    image: &DynamicImage,
+    points: &[(f64, f64)],
+    sam3_checkpoint: Option<&Path>,
+) -> Result<Vec<u8>, AppError> {
+    let sam3_ckpt = sam3_checkpoint.ok_or_else(|| {
+        AppError::General("sam3.pt が見つかりません。models/ に配置してください".into())
+    })?;
+    if points.is_empty() {
+        return Err(AppError::General("クリック点が指定されていません".into()));
+    }
+
+    let temp_dir = std::env::temp_dir().join("pachipakugen_sam3_points");
+    std::fs::create_dir_all(&temp_dir)
+        .map_err(|e| AppError::General(format!("一時ディレクトリの作成に失敗: {}", e)))?;
+
+    let temp_image = temp_dir.join("input.png");
+    let rgba = image.to_rgba8();
+    let w = image.width();
+    let h = image.height();
+    let mut rgb_img = image::RgbImage::new(w, h);
+    for y in 0..h {
+        for x in 0..w {
+            let p = rgba.get_pixel(x, y);
+            let a = p[3] as f32 / 255.0;
+            rgb_img.put_pixel(
+                x,
+                y,
+                image::Rgb([
+                    (p[0] as f32 * a + 255.0 * (1.0 - a)) as u8,
+                    (p[1] as f32 * a + 255.0 * (1.0 - a)) as u8,
+                    (p[2] as f32 * a + 255.0 * (1.0 - a)) as u8,
+                ]),
+            );
+        }
+    }
+    DynamicImage::ImageRgb8(rgb_img)
+        .save(&temp_image)
+        .map_err(|e| AppError::General(format!("一時画像の保存に失敗: {}", e)))?;
+
+    let output_dir = temp_dir.join("output");
+    std::fs::create_dir_all(&output_dir)
+        .map_err(|e| AppError::General(format!("出力ディレクトリの作成に失敗: {}", e)))?;
+
+    let script_path = resolve_script_path()?;
+    let python = find_python()?;
+    let points_arg = points
+        .iter()
+        .map(|(x, y)| format!("{x},{y}"))
+        .collect::<Vec<_>>()
+        .join(";");
+
+    eprintln!("[PachiPakuGen] SAM3 point selection: points='{}'", points_arg);
+
+    let mut child = Command::new(&python)
+        .env("PYTHONIOENCODING", "utf-8")
+        .arg(&script_path)
+        .arg("--image")
+        .arg(&temp_image)
+        .arg("--checkpoint")
+        .arg(sam3_ckpt)
+        .arg("--output-dir")
+        .arg(&output_dir)
+        .arg("--points")
+        .arg(&points_arg)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| AppError::General(format!("Pythonの実行に失敗: {}", e)))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::General("SAM3 stdout を取得できません".into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| AppError::General("SAM3 stderr を取得できません".into()))?;
+
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut reader = BufReader::new(stdout);
+        let _ = reader.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut collected = String::new();
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            match line {
+                Ok(line) => {
+                    eprintln!("[PachiPakuGen] SAM3(point): {}", line);
+                    collected.push_str(&line);
+                    collected.push('\n');
+                }
+                Err(e) => {
+                    collected.push_str(&format!("SAM3 stderr read failed: {}\n", e));
+                    break;
+                }
+            }
+        }
+        collected
+    });
+
+    let status = child
+        .wait()
+        .map_err(|e| AppError::General(format!("Pythonの実行に失敗: {}", e)))?;
+    let stdout_bytes = stdout_handle
+        .join()
+        .map_err(|_| AppError::General("SAM3 stdout reader が異常終了しました".into()))?;
+    let stderr = stderr_handle
+        .join()
+        .map_err(|_| AppError::General("SAM3 stderr reader が異常終了しました".into()))?;
+    if !status.success() {
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        return Err(AppError::General(format!(
+            "SAM3クリック選択がエラーで終了:\n{}\n{}",
+            stderr, stdout
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    if !stdout.trim().contains("OK") {
+        return Err(AppError::General(format!("SAM3出力が不正: {}", stdout)));
+    }
+
+    let mask_path = output_dir.join("points_mask.png");
+    let mask = read_grayscale_mask(&mask_path, w, h)?;
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    Ok(mask)
+}
+
 pub fn extract_mouth_raw_mask(
     image: &DynamicImage,
     sam3_checkpoint: Option<&Path>,

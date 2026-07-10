@@ -257,6 +257,55 @@ def segment_by_text(processor, image, text_prompt):
     return combined_mask
 
 
+def segment_by_points(processor, image, points, labels, box_frac=0.28):
+    """Run segmentation from click points using SAM3's box (geometric) prompt.
+
+    SAM3's Sam3Processor exposes add_geometric_prompt(box, label, state) where the
+    box is [center_x, center_y, width, height] normalized to [0,1]. There is no
+    point-prompt API, so each click point is converted to a box centered on it.
+
+    Args:
+        processor: Sam3Processor
+        image: PIL Image (RGB)
+        points: list of (x, y) pixel coordinates
+        labels: list of 1 (positive) matching points
+        box_frac: box size as a fraction of image width/height (default 0.28)
+
+    Returns:
+        combined_mask: (H, W) numpy array, 0-255
+    """
+    import numpy as np
+    import cv2
+    import torch
+
+    w, h = image.size
+    state = processor.set_image(image)
+    processor.reset_all_prompts(state)
+
+    for (px, py), label in zip(points, labels):
+        cx = float(px) / w
+        cy = float(py) / h
+        box = [cx, cy, float(box_frac), float(box_frac)]
+        # add_geometric_prompt accumulates boxes and reruns inference each call
+        state = processor.add_geometric_prompt(box=box, label=bool(label), state=state)
+
+    combined_mask = np.zeros((h, w), dtype=np.uint8)
+    for key in ("masks", "pred_masks"):
+        if key in state and state[key] is not None:
+            masks = state[key]
+            if isinstance(masks, torch.Tensor):
+                masks = masks.cpu().numpy()
+            for mask in masks:
+                if mask.ndim == 3:
+                    mask = mask.squeeze(0)
+                mask_uint8 = (mask > 0.5).astype(np.uint8) * 255
+                if mask_uint8.shape != (h, w):
+                    mask_uint8 = cv2.resize(mask_uint8, (w, h), interpolation=cv2.INTER_NEAREST)
+                combined_mask = np.maximum(combined_mask, mask_uint8)
+            break
+    return combined_mask
+
+
 def refine_mask(mask, dilate_iter=2, blur_size=7):
     """Dilate + Gaussian blur for smooth mask edges."""
     import cv2
@@ -273,6 +322,11 @@ def main():
     parser.add_argument("--checkpoint", required=True, help="sam3.pt checkpoint path")
     parser.add_argument("--output-dir", required=True, help="Output directory")
     parser.add_argument("--prompts", default="eye,mouth", help="Comma-separated prompts")
+    parser.add_argument(
+        "--points",
+        default=None,
+        help="Click-to-select mode: 'x1,y1;x2,y2;...' positive point prompts in pixel coords",
+    )
     args = parser.parse_args()
 
     # Check dependencies first
@@ -314,14 +368,34 @@ def main():
 
         image = Image.open(image_path).convert("RGB")
 
-        for prompt in prompts:
-            print(f"segmenting: {prompt}", file=sys.stderr)
-            mask_raw = segment_by_text(processor, image, prompt)
-            mask = refine_mask(mask_raw)
-            out_path = output_dir / f"{prompt}_mask.png"
+        if args.points:
+            points = []
+            for pair in args.points.split(";"):
+                pair = pair.strip()
+                if not pair:
+                    continue
+                x_str, y_str = pair.split(",")
+                points.append((float(x_str), float(y_str)))
+            if not points:
+                print("ERROR: --points was given but no valid point parsed", file=sys.stderr)
+                sys.exit(1)
+            labels = [1] * len(points)
+            print(f"point-prompt segmenting: {points}", file=sys.stderr)
+            mask_raw = segment_by_points(processor, image, points, labels)
+            mask = refine_mask(mask_raw, dilate_iter=0, blur_size=5)
+            out_path = output_dir / "points_mask.png"
             cv2.imwrite(str(out_path), mask)
             pixels = np.count_nonzero(mask)
-            print(f"  {prompt}: {pixels} pixels -> {out_path}", file=sys.stderr)
+            print(f"  points: {pixels} pixels -> {out_path}", file=sys.stderr)
+        else:
+            for prompt in prompts:
+                print(f"segmenting: {prompt}", file=sys.stderr)
+                mask_raw = segment_by_text(processor, image, prompt)
+                mask = refine_mask(mask_raw)
+                out_path = output_dir / f"{prompt}_mask.png"
+                cv2.imwrite(str(out_path), mask)
+                pixels = np.count_nonzero(mask)
+                print(f"  {prompt}: {pixels} pixels -> {out_path}", file=sys.stderr)
 
     # Signal success to Rust caller via stdout
     print("OK")

@@ -28,3 +28,9 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["blocking", "json", "multipart", "rustls-tls"] }
 keyring-core = "1"
 windows-native-keyring-store = "1.1"
+
+# 開発ビルドでも依存クレートだけ最適化する。
+# デバッグビルドの image/png エンコードは極端に遅く、
+# プレビュー1回の再合成に数秒かかる主因だった（アプリ本体のコンパイル速度は維持）
+[profile.dev.package."*"]
+opt-level = 2

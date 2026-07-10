@@ -24,8 +24,20 @@ pub struct MotionLabPartsResult {
     pub body: String,
     pub hair: Option<String>,
     pub hair_back: Option<String>,
+    pub arm_l: Option<String>,
+    pub arm_r: Option<String>,
+    pub chest: Option<String>,
+    /// sway_<name>.png（汎用揺れパーツ）。キーはファイル名のstem（例: "sway_ribbon"）
+    pub sways: HashMap<String, String>,
+    /// 視線ドリフト用（§8.4）: 白目=クリップ領域、虹彩=ドリフト対象
+    pub eyewhite: Option<String>,
+    pub irides: Option<String>,
+    /// 目ハイライト（微小ドリフト対象）
+    pub highlight: Option<String>,
     pub eye_frames: Vec<String>,
     pub mouths: HashMap<String, Vec<String>>,
+    /// layer-order.json（Step4由来のグループ描画順、背面→前面）。無ければ空=固定z順
+    pub layer_order: Vec<String>,
     pub missing: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -121,6 +133,13 @@ fn load_motion_lab_parts_inner(dir: &str) -> Result<MotionLabPartsResult, AppErr
         read_optional_image_aliases(&root, &["hair.png", "front-hair.png", "front_hair.png"])?;
     let hair_back =
         read_optional_image_aliases(&root, &["hair_back.png", "back-hair.png", "back_hair.png"])?;
+    let arm_l = read_optional_image_aliases(&root, &["arm_l.png", "arm-l.png", "arm_left.png"])?;
+    let arm_r = read_optional_image_aliases(&root, &["arm_r.png", "arm-r.png", "arm_right.png"])?;
+    let chest = read_optional_image_aliases(&root, &["chest.png"])?;
+    let sways = read_sway_images(&root)?;
+    let eyewhite = read_optional_image_aliases(&root, &["eyewhite.png", "eye_white.png"])?;
+    let irides = read_optional_image_aliases(&root, &["irides.png", "iris.png"])?;
+    let highlight = read_optional_image_aliases(&root, &["highlight.png", "eye_highlight.png"])?;
     let eye_frames = read_frame_source(&root, "eye")?;
 
     let mut mouths = HashMap::new();
@@ -172,6 +191,8 @@ fn load_motion_lab_parts_inner(dir: &str) -> Result<MotionLabPartsResult, AppErr
     }
     mouths.insert("closed".into(), closed_frames);
 
+    let layer_order = read_layer_draw_order(&root, &mut warnings);
+
     Ok(MotionLabPartsResult {
         source_dir: root.to_string_lossy().into_owned(),
         width,
@@ -179,11 +200,83 @@ fn load_motion_lab_parts_inner(dir: &str) -> Result<MotionLabPartsResult, AppErr
         body,
         hair,
         hair_back,
+        arm_l,
+        arm_r,
+        chest,
+        sways,
+        eyewhite,
+        irides,
+        highlight,
         eye_frames,
         mouths,
+        layer_order,
         missing,
         warnings,
     })
+}
+
+/// layer-order.json（{"drawOrder": ["hair_back", ...]}）を読む。無ければ空
+fn read_layer_draw_order(root: &Path, warnings: &mut Vec<String>) -> Vec<String> {
+    let path = root.join("layer-order.json");
+    if !path.is_file() {
+        return Vec::new();
+    }
+    let parsed = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| {
+            value.get("drawOrder").and_then(|order| {
+                order.as_array().map(|entries| {
+                    entries
+                        .iter()
+                        .filter_map(|entry| entry.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+            })
+        });
+    match parsed {
+        Some(order) if !order.is_empty() => order,
+        _ => {
+            warnings.push("layer-order.json を読めなかったため固定レイヤー順を使います".into());
+            Vec::new()
+        }
+    }
+}
+
+/// sway_*.png（汎用揺れパーツ）をフォルダ直下から収集する
+fn read_sway_images(root: &Path) -> Result<HashMap<String, String>, AppError> {
+    let mut sways = HashMap::new();
+    if !root.is_dir() {
+        return Ok(sways);
+    }
+    let mut paths = fs::read_dir(root)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.eq_ignore_ascii_case("png"))
+                    .unwrap_or(false)
+                && path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(|stem| stem.to_ascii_lowercase().starts_with("sway_"))
+                    .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        sways.insert(
+            stem.to_string(),
+            image_utils::image_to_base64_png(&open_image(&path)?),
+        );
+    }
+    Ok(sways)
 }
 
 fn save_motion_lab_manifest_inner(
@@ -404,6 +497,62 @@ mod tests {
             .mouths
             .get("a")
             .is_some_and(|frames| frames.len() == 1));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_motion_lab_parts_reads_arm_chest_and_sway_parts() {
+        let root = std::env::temp_dir().join(format!(
+            "pachipakugen_motion_lab_arm_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(root.join("mouth_a")).unwrap();
+        RgbaImage::from_pixel(4, 4, Rgba([10, 20, 30, 255]))
+            .save(root.join("body.png"))
+            .unwrap();
+        RgbaImage::from_pixel(4, 4, Rgba([0, 0, 0, 0]))
+            .save(root.join("mouth_a").join("001.png"))
+            .unwrap();
+        RgbaImage::from_pixel(4, 4, Rgba([1, 1, 1, 255]))
+            .save(root.join("arm_l.png"))
+            .unwrap();
+        RgbaImage::from_pixel(4, 4, Rgba([2, 2, 2, 255]))
+            .save(root.join("arm_r.png"))
+            .unwrap();
+        RgbaImage::from_pixel(4, 4, Rgba([3, 3, 3, 255]))
+            .save(root.join("chest.png"))
+            .unwrap();
+        RgbaImage::from_pixel(4, 4, Rgba([4, 4, 4, 255]))
+            .save(root.join("sway_ribbon.png"))
+            .unwrap();
+        RgbaImage::from_pixel(4, 4, Rgba([5, 5, 5, 255]))
+            .save(root.join("sway_necktie.png"))
+            .unwrap();
+        RgbaImage::from_pixel(4, 4, Rgba([250, 250, 250, 255]))
+            .save(root.join("eyewhite.png"))
+            .unwrap();
+        RgbaImage::from_pixel(4, 4, Rgba([90, 60, 20, 255]))
+            .save(root.join("irides.png"))
+            .unwrap();
+        RgbaImage::from_pixel(4, 4, Rgba([255, 255, 255, 128]))
+            .save(root.join("highlight.png"))
+            .unwrap();
+
+        let result = load_motion_lab_parts_inner(&root.to_string_lossy()).unwrap();
+
+        assert!(result.arm_l.is_some());
+        assert!(result.arm_r.is_some());
+        assert!(result.chest.is_some());
+        assert_eq!(result.sways.len(), 2);
+        assert!(result.sways.contains_key("sway_ribbon"));
+        assert!(result.sways.contains_key("sway_necktie"));
+        assert!(result.eyewhite.is_some());
+        assert!(result.irides.is_some());
+        assert!(result.highlight.is_some());
 
         let _ = fs::remove_dir_all(root);
     }
