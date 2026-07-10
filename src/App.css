@@ -5382,3 +5382,65 @@ body {
   font-size: 0.75rem;
   padding: 6px 8px;
 }
+
+/* ===== Motion Tune (STEP7 モーション調整パネル) ===== */
+.motion-tune {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 380px;
+  gap: 12px;
+  width: 100%;
+  min-height: 0;
+  height: 100%;
+}
+
+.motion-tune-preview {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-height: 0;
+  padding: 14px;
+}
+
+.motion-tune-controls {
+  min-height: 0;
+}
+
+.motion-tune-stage {
+  position: relative;
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  min-height: 320px;
+  overflow: hidden;
+  border: 1px solid var(--border-color);
+  background: var(--surface-bg);
+}
+
+.motion-tune-stage canvas {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.motion-tune-text {
+  flex: 1;
+  display: flex;
+  gap: 8px;
+}
+
+.motion-tune-text input {
+  flex: 1;
+  min-width: 120px;
+}
+
+.motion-tune-export-btn {
+  width: 100%;
+  padding: 12px;
+  font-weight: 700;
+}
+
+.motion-tune-export code {
+  word-break: break-all;
+  font-size: 11px;
+}
