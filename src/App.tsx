@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import "./App.css";
@@ -102,6 +103,14 @@ function App() {
   const [seeThroughStartedAt, setSeeThroughStartedAt] = useState<number | null>(null);
   const [seeThroughElapsedSeconds, setSeeThroughElapsedSeconds] = useState(0);
   const [seeThroughProfile, setSeeThroughProfile] = useState<SeeThroughProfile>("low-vram");
+  /** ユーザーが手動でプロファイルを選んだら、環境確認による推奨自動選択を止める */
+  const seeThroughProfileTouched = useRef(false);
+  const applyRecommendedSeeThroughProfile = (runtime: SeeThroughRuntimeStatus) => {
+    if (seeThroughProfileTouched.current) return;
+    if (runtime.recommendedProfile === "low-vram" || runtime.recommendedProfile === "standard") {
+      setSeeThroughProfile(runtime.recommendedProfile);
+    }
+  };
   const [seeThroughSplitParts, setSeeThroughSplitParts] = useState(true);
   const [seeThroughOptions, setSeeThroughOptions] = useState<SeeThroughOptions>(DEFAULT_SEE_THROUGH_OPTIONS);
   const [workspacePartOffsetX, setWorkspacePartOffsetX] = useState(0);
@@ -111,10 +120,105 @@ function App() {
   const [workspaceAdjustTarget, setWorkspaceAdjustTarget] = useState("all");
   /** Step5プレビュー上のドラッグでパーツを動かすモード */
   const [workspacePartDragMode, setWorkspacePartDragMode] = useState(false);
+  /** Step5で位置補正を適用済みのパーツ（サムネイルのバッジ表示用） */
+  const [workspaceAdjustedParts, setWorkspaceAdjustedParts] = useState<Record<string, boolean>>({});
+  /** 完了フィードバック用トースト（3秒で自動消滅） */
+  const [toast, setToast] = useState("");
+  const toastTimer = useRef<number | null>(null);
+  const showToast = (message: string) => {
+    setToast(message);
+    if (toastTimer.current !== null) window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(""), 3000);
+  };
+  /** 追記式の作業ログ（最新50件） */
+  const [workspaceLogs, setWorkspaceLogs] = useState<Array<{ time: string; level: "info" | "error"; text: string }>>([]);
+  const pushWorkspaceLog = (level: "info" | "error", text: string) => {
+    if (!text) return;
+    setWorkspaceLogs(prev => {
+      if (prev.length > 0 && prev[prev.length - 1].text === text) return prev;
+      return [...prev.slice(-49), { time: new Date().toLocaleTimeString("ja-JP", { hour12: false }), level, text }];
+    });
+  };
+  useEffect(() => { pushWorkspaceLog("info", status); /* eslint-disable-line react-hooks/exhaustive-deps */ }, [status]);
+  useEffect(() => { pushWorkspaceLog("error", error); /* eslint-disable-line react-hooks/exhaustive-deps */ }, [error]);
 
   useEffect(() => {
     window.localStorage.setItem("pachipakugen-theme", themeMode);
   }, [themeMode]);
+
+  // STEP2: Codex成果物の自動確認（依頼作成後〜揃うまで5秒間隔でポーリング）
+  useEffect(() => {
+    if (mode !== "workspace" || workspaceStep !== 2) return;
+    if (!expressionWorkspace || !workspaceGeneratedStatus || workspaceGeneratedStatus.ready) return;
+    const workPath = expressionWorkspace.workPath;
+    const timer = window.setInterval(async () => {
+      try {
+        const generated = await invoke<WorkspaceGeneratedPartsStatus>("inspect_workspace_generated_parts", { workPath });
+        setWorkspaceGeneratedStatus(generated);
+        if (generated.ready) {
+          showToast("Codex成果物が揃いました");
+          setStatus("Codex成果物が揃いました。STEP3へ進めます");
+        }
+      } catch {
+        // 依頼作成前のフォルダ状態では失敗してよい
+      }
+    }, 5000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, workspaceStep, expressionWorkspace, workspaceGeneratedStatus]);
+
+  // STEP5: 「パーツ移動」ON中は矢印キーで±1px（Shiftで±10px）微調整できる
+  useEffect(() => {
+    if (mode !== "workspace" || workspaceStep !== 5 || !workspacePartDragMode) return;
+    const onKey = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
+      const delta = event.shiftKey ? 10 : 1;
+      if (event.key === "ArrowLeft") setWorkspacePartOffsetX(v => v - delta);
+      else if (event.key === "ArrowRight") setWorkspacePartOffsetX(v => v + delta);
+      else if (event.key === "ArrowUp") setWorkspacePartOffsetY(v => v - delta);
+      else if (event.key === "ArrowDown") setWorkspacePartOffsetY(v => v + delta);
+      else return;
+      event.preventDefault();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [mode, workspaceStep, workspacePartDragMode]);
+
+  // STEP1: 画像ファイルのドラッグ&ドロップ対応（1枚目=立ち絵、2枚目=参照画像）
+  useEffect(() => {
+    if (mode !== "workspace" || workspaceStep !== 1) return;
+    let unlisten: (() => void) | null = null;
+    let disposed = false;
+    void getCurrentWebview().onDragDropEvent(event => {
+      if (event.payload.type !== "drop") return;
+      const paths = event.payload.paths.filter(path => /\.(png|jpe?g|webp)$/i.test(path));
+      if (paths.length === 0) return;
+      setWorkspaceFiles(prev => {
+        const next = { ...prev };
+        const [first, second] = paths;
+        if (!next.source) {
+          next.source = first;
+          if (second) next.reference = second;
+        } else if (!next.reference) {
+          next.reference = first;
+        } else {
+          next.source = first;
+        }
+        void loadWorkspaceImagePreviews(next);
+        return next;
+      });
+      setStatus("ドロップした画像を設定しました");
+    }).then(fn => {
+      if (disposed) fn();
+      else unlisten = fn;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, workspaceStep]);
 
   // === Input (shared) ===
   const [loadResult, setLoadResult] = useState<SlotLoadResult | null>(null);
@@ -1339,6 +1443,20 @@ function App() {
     });
   }
 
+  function clearWorkspaceImage(key: "source" | "reference") {
+    setWorkspaceFiles(prev => {
+      const next = { ...prev };
+      delete next[key];
+      void loadWorkspaceImagePreviews(next);
+      return next;
+    });
+  }
+
+  function workspaceFileName(path: string | undefined): string {
+    if (!path) return "";
+    return path.split(/[\\/]/).pop() ?? path;
+  }
+
   async function prepareWorkspaceCodexRequest() {
     if (!expressionWorkspace || !workspaceFiles.source) {
       setError("先に作業フォルダと立ち絵を選択してください");
@@ -1359,8 +1477,8 @@ function App() {
       });
       setWorkspaceGeneratedStatus(status);
       await setWorkspaceStepAndPersist(2);
-      setStatus("Codex依頼ファイルを作成しました");
-      await revealItemInDir(status.requestPath).catch(() => {});
+      setStatus("Codex依頼ファイルを作成しました。依頼フォルダの内容をCodexへ渡してください");
+      showToast("依頼ファイルを作成しました");
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -1375,8 +1493,11 @@ function App() {
     try {
       const status = await invoke<WorkspaceGeneratedPartsStatus>("inspect_workspace_generated_parts", { workPath: expressionWorkspace.workPath });
       setWorkspaceGeneratedStatus(status);
-      if (status.ready) await setWorkspaceStepAndPersist(3);
-      setStatus(status.ready ? "Codex成果物が揃いました" : "Codex成果物に不足があります");
+      if (status.ready) {
+        await setWorkspaceStepAndPersist(3);
+        showToast("Codex成果物が揃いました");
+      }
+      setStatus(status.ready ? "Codex成果物が揃いました" : `Codex成果物に不足があります（残り${status.missingParts.length}ファイル）`);
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -1392,6 +1513,7 @@ function App() {
     try {
       const runtime = await invoke<SeeThroughRuntimeStatus>("get_see_through_runtime_status");
       setSeeThroughRuntime(runtime);
+      applyRecommendedSeeThroughProfile(runtime);
       setStatus(runtime.message);
       setSeeThroughProgress({ stage: "status", percent: 100, message: runtime.message });
     } catch (cause) {
@@ -1408,6 +1530,7 @@ function App() {
     try {
       const runtime = await invoke<SeeThroughRuntimeStatus>("prepare_see_through_runtime");
       setSeeThroughRuntime(runtime);
+      applyRecommendedSeeThroughProfile(runtime);
       setStatus(runtime.message);
     } catch (cause) {
       setError(String(cause));
@@ -1466,6 +1589,7 @@ function App() {
       await openUnifiedBaseEditorWithPreview(allPreview);
       setSeeThroughProgress({ stage: "complete", percent: 100, message: "See-Through一括分解が完了しました" });
       setStatus(`See-Through一括分解が完了しました: ${extracted.extractedParts.length}パーツ`);
+      showToast("一括分解が完了しました");
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -1496,9 +1620,20 @@ function App() {
       });
       setWorkspaceRifeResult(null);
       setWorkspaceRifePreview(null);
+      // 調整済みバッジ: 個別適用は対象パーツ、一括適用は全対象パーツを記録
+      setWorkspaceAdjustedParts(prev => {
+        const next = { ...prev };
+        if (workspaceAdjustTarget === "all") {
+          for (const part of WORKSPACE_ADJUST_PART_KEYS) next[part] = true;
+        } else {
+          next[workspaceAdjustTarget] = true;
+        }
+        return next;
+      });
       await refreshWorkspaceCompositePreview().catch(() => null);
       await setWorkspaceStepAndPersist(5);
       setStatus("差分位置を調整しました");
+      showToast("位置調整を適用しました");
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -1526,6 +1661,7 @@ function App() {
       // RIFE完了後は自動でSTEP7（モーション調整）へ進む
       await setWorkspaceStepAndPersist(7);
       setStatus(`SpriTalk用フォルダへ出力しました: ${result.outputPath}。モーション調整に進みます`);
+      showToast("RIFE補完が完了しました");
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -1922,6 +2058,26 @@ function App() {
       if (workspaceStep >= 7 || !canAdvanceWorkspaceStep()) return;
       void setWorkspaceStepAndPersist((workspaceStep + 1) as WorkspaceStep);
     };
+    // 「次へ」が押せない理由の提示（無効ボタンの理由が分からない問題への対応）
+    const nextStepBlockReason = (): string | null => {
+      if (workspaceStep >= 7 || canAdvanceWorkspaceStep()) return null;
+      if (workspaceBusy) return "処理が完了するまでお待ちください";
+      switch (workspaceStep) {
+        case 1: return "立ち絵を選択すると次へ進めます";
+        case 2: {
+          const missing = workspaceGeneratedStatus?.missingParts.length ?? 0;
+          return missing > 0
+            ? `Codex成果物が揃うと進めます（残り${missing}ファイル）`
+            : "「依頼ファイルを作成」してCodexの成果物を配置してください";
+        }
+        case 3: return "「一括分解を開始」が完了すると次へ進めます";
+        case 4: return "「素体調整を開く」で調整を保存すると次へ進めます";
+        case 5: return "差分の抽出結果と合成プレビューが揃うと次へ進めます";
+        case 6: return "「RIFE補完を開始」が完了すると自動でモーション調整へ進みます";
+        default: return null;
+      }
+    };
+    const nextStepLabel = workspaceStep < 7 ? steps[workspaceStep]?.[1] ?? "" : "";
     if (!workspace) return null;
 
     return (
@@ -1932,9 +2088,11 @@ function App() {
               key={step}
               className={`workspace-flow-step${workspaceStep === step ? " active" : ""}${workspaceStep > step ? " done" : ""}`}
               disabled={!canOpenWorkspaceStep(step)}
+              aria-current={workspaceStep === step ? "step" : undefined}
+              title={!canOpenWorkspaceStep(step) && !workspaceBusy ? "前の工程を完了すると開けます" : workspaceStep > step ? "クリックでこの工程へ戻れます" : undefined}
               onClick={() => void setWorkspaceStepAndPersist(step)}
             >
-              <b>{step}</b>
+              <b>{workspaceBusy && workspaceStep === step ? <span className="step-spinner" aria-label="処理中" /> : workspaceStep > step ? "✓" : step}</b>
               <span><strong>{label}</strong><small>{note}</small></span>
             </button>
           ))}
@@ -1950,61 +2108,105 @@ function App() {
                 <div className="workspace-panel-heading compact">
                   <span>STEP 1</span>
                   <h3>立ち絵と参照画像を選択</h3>
-                  <p>立ち絵は必須です。参照画像は目や口の中の色、質感をCodex生成で合わせたい場合だけ使います。</p>
+                  <p>立ち絵は必須です。参照画像は任意で、使うと目や口の中の色・質感が元絵に近づきます。画像はこの画面へドラッグ&ドロップでも設定できます。</p>
                 </div>
                 <div className="workspace-image-picker-grid">
-                  <button className={`workspace-image-picker${workspaceFiles.source ? " ready" : ""}`} onClick={() => void pickWorkspaceImage("source")}>
-                    <span>立ち絵</span>
-                    {workspaceImagePreviews.source ? <img src={workspaceImagePreviews.source} alt="立ち絵プレビュー" /> : <strong>選択</strong>}
-                    <small>{workspaceFiles.source ? "選択済み" : "必須: 表情セットの元画像"}</small>
-                  </button>
-                  <button className={`workspace-image-picker${workspaceFiles.reference ? " ready" : ""}`} onClick={() => void pickWorkspaceImage("reference")}>
-                    <span>参照画像</span>
-                    {workspaceImagePreviews.reference ? <img src={workspaceImagePreviews.reference} alt="参照画像プレビュー" /> : <strong>選択</strong>}
-                    <small>{workspaceFiles.reference ? "選択済み" : "任意: 目や口内の色参照"}</small>
-                  </button>
+                  <div className="workspace-image-picker-cell">
+                    <button className={`workspace-image-picker${workspaceFiles.source ? " ready" : ""}`} onClick={() => void pickWorkspaceImage("source")}>
+                      <span>立ち絵</span>
+                      {workspaceImagePreviews.source ? <img src={workspaceImagePreviews.source} alt="立ち絵プレビュー" /> : <strong>選択</strong>}
+                      <small title={workspaceFiles.source}>{workspaceFiles.source ? workspaceFileName(workspaceFiles.source) : "必須: 表情セットの元画像"}</small>
+                    </button>
+                    {workspaceFiles.source && (
+                      <button className="workspace-image-clear" title="立ち絵の選択を解除" onClick={() => clearWorkspaceImage("source")}>✕ クリア</button>
+                    )}
+                  </div>
+                  <div className="workspace-image-picker-cell">
+                    <button className={`workspace-image-picker${workspaceFiles.reference ? " ready" : ""}`} onClick={() => void pickWorkspaceImage("reference")}>
+                      <span>参照画像</span>
+                      {workspaceImagePreviews.reference ? <img src={workspaceImagePreviews.reference} alt="参照画像プレビュー" /> : <strong>選択</strong>}
+                      <small title={workspaceFiles.reference}>{workspaceFiles.reference ? workspaceFileName(workspaceFiles.reference) : "任意: 使うと目・口内の色が元絵に近づきます"}</small>
+                    </button>
+                    {workspaceFiles.reference && (
+                      <button className="workspace-image-clear" title="参照画像の選択を解除" onClick={() => clearWorkspaceImage("reference")}>✕ クリア</button>
+                    )}
+                  </div>
                 </div>
               </div>
             )}
 
-            {workspaceStep === 2 && (
+            {workspaceStep === 2 && (() => {
+              // ①依頼作成 → ②Codexで生成（このアプリの外の作業）→ ③配置確認 の現在地
+              const codexPhase = workspaceGeneratedStatus?.ready ? 3 : workspaceGeneratedStatus ? 2 : 1;
+              return (
               <>
                 <div className="workspace-panel-heading">
                   <span>STEP 2</span>
                   <h3>Codex依頼を作成</h3>
-                  <p>依頼ファイルを作成し、Codexが生成した7枚を <code>02_generated_parts</code> に配置してから確認します。</p>
+                  <p>この工程の生成はアプリの外（Codex）で行います。依頼ファイルを作成 → Codexに生成させる → 成果物を <code>02_generated_parts</code> に配置、の順で進みます。</p>
                 </div>
                 <div className="workspace-codex-steps">
-                  <section className="workspace-codex-card">
+                  <section className={`workspace-codex-card${codexPhase === 1 ? " current" : ""}`}>
                     <div>
                       <span>1</span>
-                      <strong>依頼ファイル作成</strong>
+                      <strong>依頼ファイル作成 {codexPhase === 1 && <em className="workspace-phase-badge">いまここ</em>}{codexPhase > 1 && <em className="workspace-phase-done">✓ 済み</em>}</strong>
                       <p>Codexへ渡す説明書と元画像を <code>01_codex_request</code> に作成します。</p>
                     </div>
                     <div className="workspace-action-row">
                       <button className="btn btn-secondary" onClick={() => revealItemInDir(workspace.codexRequestPath).catch(() => {})}>依頼フォルダを開く</button>
+                      <button
+                        className="btn btn-secondary"
+                        disabled={!workspaceGeneratedStatus?.requestPath}
+                        title="依頼ファイルのパスをコピー（Codexへの指示に貼り付け）"
+                        onClick={() => {
+                          if (!workspaceGeneratedStatus?.requestPath) return;
+                          void navigator.clipboard.writeText(workspaceGeneratedStatus.requestPath).then(() => showToast("依頼ファイルのパスをコピーしました"));
+                        }}
+                      >パスをコピー</button>
                       <button className="btn btn-primary" disabled={workspaceBusy || !workspaceFiles.source} onClick={() => void prepareWorkspaceCodexRequest()}>依頼ファイルを作成</button>
                     </div>
                   </section>
-                  <section className="workspace-codex-card">
+                  <section className={`workspace-codex-card${codexPhase === 2 ? " current" : ""}`}>
                     <div>
                       <span>2</span>
-                      <strong>成果物を確認</strong>
-                      <p>Codexが作成した素材を <code>02_generated_parts</code> に配置して、必要ファイルが揃ったか確認します。</p>
+                      <strong>Codexで生成（アプリ外の作業） {codexPhase === 2 && <em className="workspace-phase-badge">いまここ</em>}{codexPhase > 2 && <em className="workspace-phase-done">✓ 済み</em>}</strong>
+                      <p>依頼フォルダの内容をCodexに渡して表情パーツを生成させ、出来上がった画像を <code>02_generated_parts</code> に置いてください。配置は5秒ごとに自動確認します。</p>
+                    </div>
+                    <div className="workspace-action-row">
+                      <button className="btn btn-secondary" onClick={() => revealItemInDir(workspace.generatedPartsPath).catch(() => {})}>配置フォルダを開く</button>
+                    </div>
+                  </section>
+                  <section className={`workspace-codex-card${codexPhase === 3 ? " current" : ""}`}>
+                    <div>
+                      <span>3</span>
+                      <strong>配置確認 {codexPhase === 3 && <em className="workspace-phase-done">✓ 揃いました</em>}</strong>
                       <div className="workspace-status-card compact">
-                        <strong>{workspaceGeneratedStatus?.ready ? "成果物は揃っています" : "成果物待ちです"}</strong>
+                        <strong>{workspaceGeneratedStatus?.ready ? "成果物は揃っています" : codexPhase === 2 ? "配置を自動確認しています..." : "依頼ファイル作成後に確認できます"}</strong>
                         <span>必要: {workspaceGeneratedStatus?.expectedParts.length ?? 7} / 配置済み: {workspaceGeneratedStatus?.presentParts.length ?? 0}</span>
-                        {!!workspaceGeneratedStatus?.missingParts.length && <small>不足: {workspaceGeneratedStatus.missingParts.join(", ")}</small>}
-                        {!!workspaceGeneratedStatus?.sizeMismatches.length && <small>サイズ不一致: {workspaceGeneratedStatus.sizeMismatches.join(", ")}</small>}
+                        {workspaceGeneratedStatus && (
+                          <div className="workspace-parts-checklist">
+                            {workspaceGeneratedStatus.expectedParts.map(part => {
+                              const present = workspaceGeneratedStatus.presentParts.includes(part);
+                              const mismatch = workspaceGeneratedStatus.sizeMismatches.includes(part);
+                              return (
+                                <span key={part} className={mismatch ? "mismatch" : present ? "present" : "missing"} title={mismatch ? "サイズが立ち絵と一致していません" : undefined}>
+                                  {mismatch ? "⚠" : present ? "✓" : "✗"} {part}
+                                </span>
+                              );
+                            })}
+                          </div>
+                        )}
+                        {!!workspaceGeneratedStatus?.sizeMismatches.length && <small>⚠ サイズ不一致: 立ち絵と同じ縦横サイズで再生成してください</small>}
                       </div>
                     </div>
                     <div className="workspace-action-row">
-                      <button className="btn btn-primary" disabled={workspaceBusy} onClick={() => void inspectWorkspaceGeneratedParts()}>成果物を確認</button>
+                      <button className="btn btn-primary" disabled={workspaceBusy} onClick={() => void inspectWorkspaceGeneratedParts()}>いますぐ確認</button>
                     </div>
                   </section>
                 </div>
               </>
-            )}
+              );
+            })()}
 
             {workspaceStep === 3 && (
               <>
@@ -2029,16 +2231,29 @@ function App() {
                   <div className="workspace-option-card">
                     <span>実行プロファイル</span>
                     <div className="workspace-segmented">
-                      <button className={seeThroughProfile === "low-vram" ? "active" : ""} disabled={workspaceBusy} onClick={() => setSeeThroughProfile("low-vram")}>省VRAM</button>
-                      <button className={seeThroughProfile === "standard" ? "active" : ""} disabled={workspaceBusy} onClick={() => setSeeThroughProfile("standard")}>高VRAM</button>
+                      <button className={seeThroughProfile === "low-vram" ? "active" : ""} disabled={workspaceBusy} onClick={() => { seeThroughProfileTouched.current = true; setSeeThroughProfile("low-vram"); }}>
+                        省VRAM{seeThroughRuntime?.recommendedProfile === "low-vram" && <em className="workspace-recommend-badge">推奨</em>}
+                      </button>
+                      <button className={seeThroughProfile === "standard" ? "active" : ""} disabled={workspaceBusy} onClick={() => { seeThroughProfileTouched.current = true; setSeeThroughProfile("standard"); }}>
+                        高VRAM{seeThroughRuntime?.recommendedProfile === "standard" && <em className="workspace-recommend-badge">推奨</em>}
+                      </button>
                     </div>
+                    {seeThroughRuntime?.gpuName && (
+                      <small className="workspace-gpu-info">
+                        GPU: {seeThroughRuntime.gpuName}
+                        {seeThroughRuntime.gpuMemoryMb ? ` (${Math.round(seeThroughRuntime.gpuMemoryMb / 1024)}GB)` : ""}
+                      </small>
+                    )}
                   </div>
                   <label className="workspace-toggle-option workspace-option-card">
                     <input type="checkbox" checked={seeThroughSplitParts} disabled={workspaceBusy} onChange={(event) => setSeeThroughSplitParts(event.target.checked)} />
                     <span>左右パーツ分解</span>
                     <small>目や耳などを左右レイヤーに分けます。</small>
                   </label>
-                  <div className="workspace-option-card workspace-option-card-wide">
+                  <details className="workspace-option-card workspace-option-card-wide workspace-advanced-options">
+                    <summary>
+                      <span>詳細設定（通常は変更不要）</span>
+                    </summary>
                     <div className="workspace-option-header">
                       <span>See-Throughパラメータ</span>
                       <button className="btn btn-secondary" disabled={workspaceBusy} onClick={() => setSeeThroughOptions(DEFAULT_SEE_THROUGH_OPTIONS)}>標準値に戻す</button>
@@ -2052,15 +2267,18 @@ function App() {
                       <label><span>Group offload</span><select value={seeThroughOptions.groupOffload} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, groupOffload: event.target.value as SeeThroughOptionMode })}><option value="default">標準</option><option value="on">有効</option><option value="off">無効</option></select></label>
                       <label><span>CPU offload</span><select value={seeThroughOptions.cpuOffload} disabled={workspaceBusy || seeThroughProfile === "standard"} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, cpuOffload: event.target.value as SeeThroughOptionMode })}><option value="default">標準</option><option value="on">有効</option><option value="off">無効</option></select></label>
                     </div>
-                  </div>
+                  </details>
                 </div>
                 <div className="workspace-start-seethrough">
                   <div><strong>分解処理を開始</strong><p>立ち絵、閉じ目、閉じ口、あいうえお口の素材をまとめて分解します。</p></div>
                   <button className="btn btn-primary" disabled={workspaceBusy || !seeThroughRuntime?.ready || !workspaceGeneratedStatus?.ready} onClick={() => void runWorkspaceSeeThroughBatch()}>{seeThroughRunning ? "分解処理中..." : "一括分解を開始"}</button>
                   {seeThroughRunning && (
                     <div className="workspace-running-inline">
-                      <span>{displaySeeThroughMessage(seeThroughProgress)}</span>
-                      <small>経過: {formatElapsed(seeThroughElapsedSeconds)}</small>
+                      <span>
+                        <b>{seeThroughProgress.stage === "prepare" ? "準備中" : seeThroughProgress.stage === "load" ? "読込中" : "分解中"}</b>
+                        {" "}{displaySeeThroughMessage(seeThroughProgress)}
+                      </span>
+                      <small>進捗 {Math.round(Math.min(100, Math.max(0, seeThroughProgress.percent)))}% ・ 経過 {formatElapsed(seeThroughElapsedSeconds)}</small>
                       <div className="workspace-progress-bar" aria-label="See-Through進捗"><div style={{ width: `${Math.max(3, Math.min(100, seeThroughProgress.percent))}%` }} /></div>
                     </div>
                   )}
@@ -2071,24 +2289,73 @@ function App() {
             {workspaceStep === 4 && (
               <>
                 <div className="workspace-panel-heading"><span>STEP 4</span><h3>素体を調整</h3><p>分解済みレイヤーの前後関係を確認し、SpriTalkに渡す素体パーツを作成します。</p></div>
-                <div className="workspace-action-row"><button className="btn btn-primary" disabled={workspaceBusy} onClick={() => void openWorkspaceBaseAdjustment()}>素体調整を開く</button></div>
+                {workspaceCompositePreview?.basePreview ? (
+                  <div className="workspace-status-card">
+                    <strong>✓ 素体は保存済みです</strong>
+                    <span>右のプレビューが現在の素体です。直したい箇所があれば再調整できます。問題なければ「次へ」で差分位置調整に進んでください。</span>
+                  </div>
+                ) : (
+                  <div className="workspace-status-card">
+                    <strong>素体調整でできること</strong>
+                    <ul className="workspace-feature-list">
+                      <li>レイヤーの表示/非表示と前後関係（描画順）の入れ替え</li>
+                      <li>腕・獣耳の分離出力（Motion Labの腕揺れ・耳ピコピコ用）</li>
+                      <li>胸の切り出し（揺れ物理用の chest.png 分離）</li>
+                      <li>ブラシによるレイヤーの継ぎ足し・削り（SAM3補助つき）</li>
+                    </ul>
+                    <span>「保存して戻る」と自動でSTEP5（差分位置調整）へ進みます。</span>
+                  </div>
+                )}
+                <div className="workspace-action-row">
+                  <button className="btn btn-primary" disabled={workspaceBusy} onClick={() => void openWorkspaceBaseAdjustment()}>
+                    {workspaceBusy ? "読み込み中..." : workspaceCompositePreview?.basePreview ? "再調整する" : "素体調整を開く"}
+                  </button>
+                </div>
               </>
             )}
 
             {workspaceStep === 5 && (
               <>
-                <div className="workspace-panel-heading"><span>STEP 5</span><h3>差分位置を調整</h3><p>パーツを選んで個別にX/Y/Scale補正できます。「パーツ移動」ON中はプレビューを直接ドラッグして動かせます（離すと適用）。</p></div>
+                <div className="workspace-panel-heading"><span>STEP 5</span><h3>差分位置を調整</h3><p>右のサムネイルでパーツを選ぶと、プレビューを直接ドラッグして動かせます（離すと適用）。細かい調整は矢印ボタンか矢印キー（Shiftで±10）が便利です。</p></div>
                 <div className="workspace-action-row">
                   <div className="workspace-adjust-grid">
                     <label><span>対象</span>
-                      <select value={workspaceAdjustTarget} onChange={e => setWorkspaceAdjustTarget(e.target.value)}>
+                      <select
+                        value={workspaceAdjustTarget}
+                        onChange={e => {
+                          setWorkspaceAdjustTarget(e.target.value);
+                          // パーツ個別を選んだら即ドラッグで動かせるように自動ON（一括ではOFF）
+                          setWorkspacePartDragMode(e.target.value !== "all");
+                        }}
+                      >
                         <option value="all">全パーツ一括</option>
-                        {WORKSPACE_ADJUST_PART_KEYS.map(part => <option key={part} value={part}>{part}</option>)}
+                        {WORKSPACE_ADJUST_PART_KEYS.map(part => <option key={part} value={part}>{part}{workspaceAdjustedParts[part] ? " ✓" : ""}</option>)}
                       </select>
                     </label>
-                    <label><span>X offset</span><input type="number" value={workspacePartOffsetX} onChange={e => setWorkspacePartOffsetX(Number(e.target.value))} /></label>
-                    <label><span>Y offset</span><input type="number" value={workspacePartOffsetY} onChange={e => setWorkspacePartOffsetY(Number(e.target.value))} /></label>
-                    <label><span>Scale %</span><input type="number" min={50} max={150} value={workspacePartScale} onChange={e => setWorkspacePartScale(Number(e.target.value))} /></label>
+                    <label><span>X offset</span>
+                      <span className="workspace-nudge-row">
+                        <button type="button" title="-10" onClick={() => setWorkspacePartOffsetX(v => v - 10)}>≪</button>
+                        <button type="button" title="-1" onClick={() => setWorkspacePartOffsetX(v => v - 1)}>‹</button>
+                        <input type="number" value={workspacePartOffsetX} onChange={e => setWorkspacePartOffsetX(Number(e.target.value))} />
+                        <button type="button" title="+1" onClick={() => setWorkspacePartOffsetX(v => v + 1)}>›</button>
+                        <button type="button" title="+10" onClick={() => setWorkspacePartOffsetX(v => v + 10)}>≫</button>
+                      </span>
+                    </label>
+                    <label><span>Y offset</span>
+                      <span className="workspace-nudge-row">
+                        <button type="button" title="-10" onClick={() => setWorkspacePartOffsetY(v => v - 10)}>≪</button>
+                        <button type="button" title="-1" onClick={() => setWorkspacePartOffsetY(v => v - 1)}>‹</button>
+                        <input type="number" value={workspacePartOffsetY} onChange={e => setWorkspacePartOffsetY(Number(e.target.value))} />
+                        <button type="button" title="+1" onClick={() => setWorkspacePartOffsetY(v => v + 1)}>›</button>
+                        <button type="button" title="+10" onClick={() => setWorkspacePartOffsetY(v => v + 10)}>≫</button>
+                      </span>
+                    </label>
+                    <label><span>Scale {workspacePartScale}%</span>
+                      <span className="workspace-scale-row">
+                        <input type="range" min={50} max={150} value={workspacePartScale} onChange={e => setWorkspacePartScale(Number(e.target.value))} />
+                        <input type="number" min={50} max={150} value={workspacePartScale} onChange={e => setWorkspacePartScale(Number(e.target.value))} />
+                      </span>
+                    </label>
                   </div>
                   <button
                     className={`btn ${workspacePartDragMode ? "btn-primary" : "btn-secondary"}`}
@@ -2098,26 +2365,46 @@ function App() {
                   >
                     パーツ移動 {workspacePartDragMode ? "ON" : "OFF"}
                   </button>
+                  <button
+                    className="btn btn-secondary"
+                    disabled={workspaceBusy}
+                    title="X/Y/Scaleの入力値を 0 / 0 / 100% に戻します（適用は別途）"
+                    onClick={() => { setWorkspacePartOffsetX(0); setWorkspacePartOffsetY(0); setWorkspacePartScale(100); }}
+                  >0に戻す</button>
                   <button className="btn btn-secondary" disabled={workspaceBusy || !workspaceExtractResult} onClick={() => void updateWorkspaceCompositePreview()}>合成プレビューを更新</button>
                   <button className="btn btn-primary" disabled={workspaceBusy || !workspaceExtractResult} onClick={() => void applyWorkspacePartAdjustment()}>位置調整を適用</button>
                 </div>
                 <div className="motion-lab-note">
                   補正値はパーツごとに元画像基準の絶対値で保存されます（adjustment.json v2）。
-                  eyes-open は元画像由来のため補正対象外です。下のサムネイルをクリックすると対象パーツが切り替わります。
+                  eyes-open は元画像由来のため補正対象外です。「パーツ移動」ON中は矢印キーでも±1px（Shiftで±10px）動かせます。
                 </div>
               </>
             )}
 
             {workspaceStep === 6 && (
               <>
-                <div className="workspace-panel-heading"><span>STEP 6</span><h3>RIFE補完してSpriTalk用に出力</h3><p>RIFEフレーム、素体、抽出差分を <code>04_spritalk_parts</code> にまとめます。</p></div>
+                <div className="workspace-panel-heading"><span>STEP 6</span><h3>RIFE補完してSpriTalk用に出力</h3><p>RIFEフレーム、素体、抽出差分を <code>04_spritalk_parts</code> にまとめます。完了すると自動でモーション調整（STEP7）へ進みます。</p></div>
                 <div className="workspace-rife-panel">
                   <div className="workspace-frame-slider">
                     <label><span>補間枚数</span><strong>{frameCount}枚</strong></label>
                     <input type="range" min={RIFE_FRAME_MIN} max={RIFE_FRAME_MAX} value={frameCount} disabled={workspaceBusy} onChange={e => setFrameCount(Number(e.target.value))} />
-                    <small>SpriTalkでは {RIFE_FRAME_RECOMMENDED} 枚が扱いやすい目安です。</small>
+                    <small>多いほど口パク・まばたきが滑らかになりますが、ファイル数と生成時間が増えます。SpriTalkでは {RIFE_FRAME_RECOMMENDED} 枚が扱いやすい目安です。</small>
                   </div>
                   <button className="btn btn-primary" disabled={workspaceBusy || !workspaceExtractResult || !workspaceCompositePreview?.basePreview} onClick={() => void generateWorkspaceRifeOutputs()}>{workspaceBusy ? "RIFE補完中..." : "RIFE補完を開始"}</button>
+                  {workspaceBusy && progress.total > 0 && (
+                    <div className="workspace-running-inline">
+                      <span><b>RIFE補完中</b> {progress.pair_name} {progress.current}/{progress.total}</span>
+                      <div className="workspace-progress-bar" aria-label="RIFE進捗"><div style={{ width: `${Math.max(3, Math.min(100, (progress.current / Math.max(1, progress.total)) * 100))}%` }} /></div>
+                    </div>
+                  )}
+                  {!workspaceBusy && workspaceRifeResult && (
+                    <div className="workspace-status-card">
+                      <strong>✓ RIFE補完は完了しています</strong>
+                      <span>出力先: <code>{workspaceRifeResult.outputPath}</code></span>
+                      <span>{workspaceRifeResult.directories.length}ディレクトリ / 各{workspaceRifeResult.frameCount}フレーム</span>
+                      <span>「次へ: モーション調整」で揺れ・口パクの仕上げに進めます。枚数を変えて再生成することもできます。</span>
+                    </div>
+                  )}
                 </div>
               </>
             )}
@@ -2148,12 +2435,17 @@ function App() {
                     <button type="button" key={workspacePreviewItemKey(item)} className={workspaceSelectedPreviewPart === workspacePreviewItemKey(item) ? "active" : ""} onClick={() => {
                       const key = workspacePreviewItemKey(item);
                       setWorkspaceSelectedPreviewPart(key);
-                      // Step5ではサムネイル選択＝調整対象の切替（直観的な個別調整）
+                      // Step5ではサムネイル選択＝調整対象の切替＋即ドラッグ可能に
                       if (workspaceStep === 5 && WORKSPACE_ADJUST_PART_KEYS.includes(key)) {
                         setWorkspaceAdjustTarget(key);
+                        setWorkspacePartDragMode(true);
                       }
                     }}>
-                      <span>{workspacePreviewItemLabel(item)}</span><img src={item.preview} alt={`${workspacePreviewItemLabel(item)} preview`} />
+                      <span>
+                        {workspacePreviewItemLabel(item)}
+                        {workspaceStep === 5 && workspaceAdjustedParts[workspacePreviewItemKey(item)] && <em className="workspace-adjusted-badge">調整済</em>}
+                      </span>
+                      <img src={item.preview} alt={`${workspacePreviewItemLabel(item)} preview`} />
                     </button>
                   ))}
                 </div>
@@ -2174,22 +2466,44 @@ function App() {
         )}
 
         <div className="workspace-bottom-nav">
-          <button className="btn btn-secondary" onClick={goPreviousWorkspaceStep}>戻る</button>
-          {workspaceStep >= 7 ? (
-            <button className="btn btn-primary" disabled={workspaceBusy} onClick={() => revealItemInDir(workspaceRifeResult?.outputPath || workspace.spritalkPartsPath).catch(() => {})}>出力フォルダを開く</button>
-          ) : (
-            <button className="btn btn-primary" disabled={!canAdvanceWorkspaceStep()} onClick={goNextWorkspaceStep}>次へ</button>
-          )}
+          <button className="btn btn-secondary" onClick={goPreviousWorkspaceStep}>
+            {workspaceStep === 1 ? "制作ホームへ戻る" : `戻る: ${steps[workspaceStep - 2]?.[1] ?? ""}`}
+          </button>
+          <div className="workspace-next-area">
+            {nextStepBlockReason() && <small className="workspace-next-hint">{nextStepBlockReason()}</small>}
+            {workspaceStep >= 7 ? (
+              <button className="btn btn-primary" disabled={workspaceBusy} onClick={() => revealItemInDir(workspaceRifeResult?.outputPath || workspace.spritalkPartsPath).catch(() => {})}>出力フォルダを開く</button>
+            ) : (
+              <button
+                className="btn btn-primary"
+                disabled={!canAdvanceWorkspaceStep()}
+                title={nextStepBlockReason() ?? undefined}
+                onClick={goNextWorkspaceStep}
+              >次へ: {nextStepLabel}</button>
+            )}
+          </div>
         </div>
         <div className="workspace-log-console" aria-live="polite">
-          <div className="workspace-log-title">LOG</div>
-          <div className="workspace-log-lines">
-            <div><span>step</span>{workspaceStep}/7 {steps[workspaceStep - 1]?.[1]}</div>
-            {workspaceBusy && <div><span>run</span>処理中...</div>}
-            {seeThroughProgress && <div><span>see-through</span>{seeThroughProgress.message}</div>}
-            {progress.total > 0 && <div><span>rife</span>{progress.pair_name} {progress.current}/{progress.total}</div>}
-            <div><span>{error ? "error" : "status"}</span>{error || status}</div>
-          </div>
+          <details className="workspace-log-history">
+            <summary>
+              <span className="workspace-log-title">LOG</span>
+              <span className="workspace-log-latest">
+                <span>step {workspaceStep}/7 {steps[workspaceStep - 1]?.[1]}</span>
+                {workspaceBusy && <span className="running">処理中...</span>}
+                {seeThroughProgress && workspaceBusy && <span>{displaySeeThroughMessage(seeThroughProgress)}</span>}
+                {progress.total > 0 && workspaceBusy && <span>RIFE {progress.pair_name} {progress.current}/{progress.total}</span>}
+                <span className={error ? "log-error" : ""}>{error || status}</span>
+              </span>
+            </summary>
+            <div className="workspace-log-lines">
+              {workspaceLogs.length === 0 && <div><span>-</span>まだログはありません</div>}
+              {[...workspaceLogs].reverse().map((entry, index) => (
+                <div key={`${entry.time}-${index}`} className={entry.level === "error" ? "log-error" : ""}>
+                  <span>{entry.time}</span>{entry.text}
+                </div>
+              ))}
+            </div>
+          </details>
         </div>
       </div>
     );
@@ -2449,10 +2763,18 @@ function App() {
           <div className="interp-action-panel base-flow-action body-action">
             <div>
               <div className="action-panel-title">{mode === "correction" ? "See-Through補正" : "素体レイヤー調整"}</div>
-              <div className="action-panel-hint">レイヤー順、ON/OFF、切り出し、透明度を確認して保存します。</div>
+              <div className="action-panel-hint">
+                {mode !== "correction" && expressionWorkspace
+                  ? "レイヤー順、ON/OFF、切り出しを確認して保存します。「保存して戻る」とSTEP5（差分位置調整）へ進みます。"
+                  : "レイヤー順、ON/OFF、切り出し、透明度を確認して保存します。"}
+              </div>
             </div>
             <div className="step-nav-actions base-output-actions">
-              <button className="btn btn-secondary" onClick={returnToModeSelect}>戻る</button>
+              <button
+                className="btn btn-secondary"
+                title={expressionWorkspace ? "保存せずにSTEP4へ戻ります" : undefined}
+                onClick={mode !== "correction" && expressionWorkspace ? returnFromBaseFlow : returnToModeSelect}
+              >{mode !== "correction" && expressionWorkspace ? "STEP4へ戻る（保存しない）" : "戻る"}</button>
               {mode === "correction" ? (
                 <button className="btn btn-primary" onClick={handleExportCorrection} disabled={loading || !bodyPreview}>{loading ? "保存中..." : "PNG保存"}</button>
               ) : (
@@ -2513,6 +2835,15 @@ function App() {
           {!error && status}
         </div>
       )}
+
+      {mode === "workspace" && error && (
+        <div className="workspace-error-banner" role="alert">
+          <strong>エラー</strong>
+          <span>{error}</span>
+          <button type="button" aria-label="エラーを閉じる" onClick={() => setError("")}>✕</button>
+        </div>
+      )}
+      {toast && <div className="workspace-toast" role="status">{toast}</div>}
     </div>
   );
 }
