@@ -48,6 +48,7 @@ import {
   RIFE_FRAME_RECOMMENDED,
   isNoisySeeThroughWarning,
   displaySeeThroughMessage,
+  sanitizeSeeThroughLogMessage,
   formatElapsed,
   CHEST_CUT_SENTINEL,
   workspacePreviewItemKey,
@@ -102,6 +103,8 @@ function App() {
   const [seeThroughProgress, setSeeThroughProgress] = useState<SeeThroughProgress | null>(null);
   const [seeThroughStartedAt, setSeeThroughStartedAt] = useState<number | null>(null);
   const [seeThroughElapsedSeconds, setSeeThroughElapsedSeconds] = useState(0);
+  /** STEP3実行中の工程表示（工程 n/N: ラベル）。null=一括分解以外の処理中 */
+  const [seeThroughPhase, setSeeThroughPhase] = useState<{ index: number; total: number; label: string } | null>(null);
   const [seeThroughProfile, setSeeThroughProfile] = useState<SeeThroughProfile>("low-vram");
   /** ユーザーが手動でプロファイルを選んだら、環境確認による推奨自動選択を止める */
   const seeThroughProfileTouched = useRef(false);
@@ -313,7 +316,8 @@ function App() {
     const unlistenSeeThrough = listen<SeeThroughProgress>("see-through-progress", (event) => {
       setSeeThroughProgress(event.payload);
       if (!isNoisySeeThroughWarning(event.payload.message)) {
-        setStatus(event.payload.message);
+        // tqdm等の生ログ断片はステータス/ログ履歴に流さず短文へ整形
+        setStatus(sanitizeSeeThroughLogMessage(event.payload.message));
       }
     });
     return () => {
@@ -1325,8 +1329,13 @@ function App() {
       setWorkspaceGeneratedStatus(loaded.generatedParts);
       setWorkspaceExtractResult(loaded.extractedParts);
       setWorkspaceRifeResult(loaded.rifeOutput);
+      // プレビュー再構築は保存済みbase_partsからのみ行う（推論は走らない）。
+      // base_parts未保存の作業ではここで失敗し、STEP4からのやり直しに誘導する
+      let compositeReady = false;
       if (loaded.extractedParts) {
-        await refreshWorkspaceCompositePreview(workspace);
+        compositeReady = await refreshWorkspaceCompositePreview(workspace)
+          .then(() => true)
+          .catch(() => false);
       }
       if (loaded.rifeOutput) {
         await refreshWorkspaceRifePreview(workspace).catch(() => null);
@@ -1337,8 +1346,13 @@ function App() {
         restoredStep = Math.max(restoredStep, 6) as WorkspaceStep;
       } else {
         if (restoredStep > 6) restoredStep = 6;
-        if (loaded.extractedParts) restoredStep = Math.max(restoredStep, 5) as WorkspaceStep;
-        else if (loaded.generatedParts.ready) restoredStep = Math.max(restoredStep, 3) as WorkspaceStep;
+        if (loaded.extractedParts) {
+          restoredStep = compositeReady
+            ? (Math.max(restoredStep, 5) as WorkspaceStep)
+            : (Math.min(Math.max(restoredStep, 4), 4) as WorkspaceStep);
+        } else if (loaded.generatedParts.ready) {
+          restoredStep = Math.max(restoredStep, 3) as WorkspaceStep;
+        }
       }
     } catch {
       // Not all workspaces are valid Codex jobs until Step 2 has been prepared.
@@ -1553,6 +1567,7 @@ function App() {
     setSeeThroughStartedAt(Date.now());
     setSeeThroughElapsedSeconds(0);
     setSeeThroughProgress({ stage: "inference", percent: 0, message: "See-Through一括分解中" });
+    setSeeThroughPhase({ index: 1, total: 3, label: "立ち絵を分解しています" });
     try {
       const base = await invoke<SeeThroughRunResult>("run_see_through", {
         sourcePath: workspaceFiles.source,
@@ -1573,6 +1588,7 @@ function App() {
       setLayerMapping(defaultMapping);
       setMappingPreview(base.mappingPreview);
       setSeeThroughProgress({ stage: "inference", percent: 50, message: "Codex成果物をSee-Throughで分解しています" });
+      setSeeThroughPhase({ index: 2, total: 3, label: "表情素材（Codex成果物）を分解しています" });
       const extracted = await invoke<ExtractCodexGeneratedPartsResult>("extract_codex_generated_parts", {
         jobPath: expressionWorkspace.workPath,
         profile: seeThroughProfile,
@@ -1584,6 +1600,7 @@ function App() {
       setWorkspaceRifeResult(null);
       setWorkspaceRifePreview(null);
       await setWorkspaceStepAndPersist(4);
+      setSeeThroughPhase({ index: 3, total: 3, label: "プレビューを準備しています" });
       const allPreview = await invoke<MappingPreviewResult>("get_all_layers_preview");
       setMappingPreview(allPreview);
       await openUnifiedBaseEditorWithPreview(allPreview);
@@ -1595,6 +1612,7 @@ function App() {
     } finally {
       setWorkspaceBusy(false);
       setSeeThroughStartedAt(null);
+      setSeeThroughPhase(null);
     }
   }
 
@@ -2259,14 +2277,15 @@ function App() {
                       <button className="btn btn-secondary" disabled={workspaceBusy} onClick={() => setSeeThroughOptions(DEFAULT_SEE_THROUGH_OPTIONS)}>標準値に戻す</button>
                     </div>
                     <div className="workspace-option-grid">
-                      <label><span>Seed</span><input type="number" value={seeThroughOptions.seed} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, seed: Number(event.target.value) })} /></label>
-                      <label><span>LayerDiff解像度</span><input type="number" min={256} max={4096} step={64} value={seeThroughOptions.resolution} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, resolution: Number(event.target.value) })} /></label>
-                      <label><span>Depth解像度</span><input type="number" min={-1} max={4096} step={64} value={seeThroughOptions.resolutionDepth} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, resolutionDepth: Number(event.target.value) })} /></label>
-                      <label><span>LayerDiff step</span><input type="number" min={1} max={150} value={seeThroughOptions.inferenceSteps} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, inferenceSteps: Number(event.target.value) })} /></label>
-                      <label><span>Depth step</span><input type="number" min={-1} max={150} value={seeThroughOptions.inferenceStepsDepth} disabled={workspaceBusy || seeThroughProfile === "low-vram"} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, inferenceStepsDepth: Number(event.target.value) })} /></label>
-                      <label><span>Group offload</span><select value={seeThroughOptions.groupOffload} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, groupOffload: event.target.value as SeeThroughOptionMode })}><option value="default">標準</option><option value="on">有効</option><option value="off">無効</option></select></label>
-                      <label><span>CPU offload</span><select value={seeThroughOptions.cpuOffload} disabled={workspaceBusy || seeThroughProfile === "standard"} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, cpuOffload: event.target.value as SeeThroughOptionMode })}><option value="default">標準</option><option value="on">有効</option><option value="off">無効</option></select></label>
+                      <label title="生成の乱数シード。同じ値なら同じ分解結果になります。分解結果が気に入らない時に値を変えて再実行してください"><span>Seed <i className="workspace-info-mark">?</i></span><input type="number" value={seeThroughOptions.seed} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, seed: Number(event.target.value) })} /></label>
+                      <label title="レイヤー分解の処理解像度。大きいほど輪郭が精細になりますがVRAM消費と処理時間が増えます"><span>LayerDiff解像度 <i className="workspace-info-mark">?</i></span><input type="number" min={256} max={4096} step={64} value={seeThroughOptions.resolution} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, resolution: Number(event.target.value) })} /></label>
+                      <label title="深度（前後関係）推定の処理解像度。-1で自動。レイヤー前後の判定が怪しい時に上げます"><span>Depth解像度 <i className="workspace-info-mark">?</i></span><input type="number" min={-1} max={4096} step={64} value={seeThroughOptions.resolutionDepth} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, resolutionDepth: Number(event.target.value) })} /></label>
+                      <label title="レイヤー分解の推論ステップ数。多いほど品質が上がりますが遅くなります（既定30）"><span>LayerDiff step <i className="workspace-info-mark">?</i></span><input type="number" min={1} max={150} value={seeThroughOptions.inferenceSteps} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, inferenceSteps: Number(event.target.value) })} /></label>
+                      <label title="深度推定のステップ数。-1で自動。省VRAMプロファイルでは固定のため変更できません"><span>Depth step <i className="workspace-info-mark">?</i></span><input type="number" min={-1} max={150} value={seeThroughOptions.inferenceStepsDepth} disabled={workspaceBusy || seeThroughProfile === "low-vram"} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, inferenceStepsDepth: Number(event.target.value) })} /></label>
+                      <label title="モデルをブロック単位でCPUメモリへ退避してVRAMを節約します。少し遅くなります。VRAM不足エラーが出る時に有効化"><span>Group offload <i className="workspace-info-mark">?</i></span><select value={seeThroughOptions.groupOffload} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, groupOffload: event.target.value as SeeThroughOptionMode })}><option value="default">標準</option><option value="on">有効</option><option value="off">無効</option></select></label>
+                      <label title="モデル全体をCPUへ退避する最も強い省VRAM設定。大きく遅くなります。高VRAMプロファイルでは使いません"><span>CPU offload <i className="workspace-info-mark">?</i></span><select value={seeThroughOptions.cpuOffload} disabled={workspaceBusy || seeThroughProfile === "standard"} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, cpuOffload: event.target.value as SeeThroughOptionMode })}><option value="default">標準</option><option value="on">有効</option><option value="off">無効</option></select></label>
                     </div>
+                    <small className="workspace-option-note">各項目にマウスを重ねると説明が表示されます。</small>
                   </details>
                 </div>
                 <div className="workspace-start-seethrough">
@@ -2274,11 +2293,12 @@ function App() {
                   <button className="btn btn-primary" disabled={workspaceBusy || !seeThroughRuntime?.ready || !workspaceGeneratedStatus?.ready} onClick={() => void runWorkspaceSeeThroughBatch()}>{seeThroughRunning ? "分解処理中..." : "一括分解を開始"}</button>
                   {seeThroughRunning && (
                     <div className="workspace-running-inline">
-                      <span>
-                        <b>{seeThroughProgress.stage === "prepare" ? "準備中" : seeThroughProgress.stage === "load" ? "読込中" : "分解中"}</b>
-                        {" "}{displaySeeThroughMessage(seeThroughProgress)}
-                      </span>
-                      <small>進捗 {Math.round(Math.min(100, Math.max(0, seeThroughProgress.percent)))}% ・ 経過 {formatElapsed(seeThroughElapsedSeconds)}</small>
+                      {seeThroughPhase ? (
+                        <span><b>工程 {seeThroughPhase.index}/{seeThroughPhase.total}</b> {seeThroughPhase.label}</span>
+                      ) : (
+                        <span><b>{seeThroughProgress.stage === "prepare" ? "準備中" : seeThroughProgress.stage === "load" ? "読込中" : "処理中"}</b> {sanitizeSeeThroughLogMessage(displaySeeThroughMessage(seeThroughProgress))}</span>
+                      )}
+                      <small>経過 {formatElapsed(seeThroughElapsedSeconds)}</small>
                       <div className="workspace-progress-bar" aria-label="See-Through進捗"><div style={{ width: `${Math.max(3, Math.min(100, seeThroughProgress.percent))}%` }} /></div>
                     </div>
                   )}
@@ -2490,7 +2510,7 @@ function App() {
               <span className="workspace-log-latest">
                 <span>step {workspaceStep}/7 {steps[workspaceStep - 1]?.[1]}</span>
                 {workspaceBusy && <span className="running">処理中...</span>}
-                {seeThroughProgress && workspaceBusy && <span>{displaySeeThroughMessage(seeThroughProgress)}</span>}
+                {seeThroughProgress && workspaceBusy && <span>{sanitizeSeeThroughLogMessage(displaySeeThroughMessage(seeThroughProgress))}</span>}
                 {progress.total > 0 && workspaceBusy && <span>RIFE {progress.pair_name} {progress.current}/{progress.total}</span>}
                 <span className={error ? "log-error" : ""}>{error || status}</span>
               </span>

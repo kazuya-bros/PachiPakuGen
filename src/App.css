@@ -295,7 +295,7 @@ body {
 
 .workspace-flow-stepper {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   gap: 8px;
   width: min(1180px, 100%);
   margin: 0 auto;
@@ -3563,21 +3563,24 @@ body {
   align-items: center;
   gap: 24px;
   padding: 24px 26px;
-  border: 1px solid color-mix(in srgb, var(--primary) 52%, var(--border));
+  border: 1px solid color-mix(in srgb, var(--primary) 32%, var(--border));
   border-radius: var(--radius);
-  background:
-    linear-gradient(110deg, rgba(233, 69, 96, 0.13), transparent 52%),
-    var(--surface-raised);
+  background: var(--surface-raised);
   color: var(--text);
   text-align: left;
   cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
 }
 
-.primary-workflow-card:hover {
+/* 選択（ホバー/フォーカス）した側だけグラデーションで浮き上がる */
+.primary-workflow-card:hover,
+.primary-workflow-card:focus-visible {
   border-color: var(--primary);
   background:
-    linear-gradient(110deg, rgba(233, 69, 96, 0.2), transparent 56%),
+    linear-gradient(110deg, rgba(233, 69, 96, 0.18), transparent 56%),
     var(--surface-raised);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
 }
 
 .workspace-start-panel {
@@ -3587,9 +3590,10 @@ body {
   margin-bottom: 18px;
 }
 
+/* 2カードは同格のため secondary も同一スタイル（グラデーションはホバー側のみ） */
 .primary-workflow-card.secondary {
   background: var(--surface-raised);
-  border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
+  border-color: color-mix(in srgb, var(--primary) 32%, var(--border));
 }
 
 .primary-workflow-card.legacy-entry {
@@ -5748,4 +5752,26 @@ body {
   font-size: 9px;
   font-style: normal;
   font-weight: 700;
+}
+
+.workspace-info-mark {
+  display: inline-grid;
+  place-items: center;
+  width: 14px;
+  height: 14px;
+  margin-left: 2px;
+  border: 1px solid var(--text-muted);
+  border-radius: 50%;
+  color: var(--text-muted);
+  font-size: 9px;
+  font-style: normal;
+  cursor: help;
+  vertical-align: 1px;
+}
+
+.workspace-option-note {
+  display: block;
+  margin-top: 8px;
+  color: var(--text-muted);
+  font-size: 11px;
 }

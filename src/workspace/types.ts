@@ -118,6 +118,18 @@ export function displaySeeThroughMessage(progress: SeeThroughProgress | null): s
   return "See-Through処理を継続しています";
 }
 
+/** tqdm進捗バー等の生ログノイズを除去し、表示向けの短い一文へ整形する */
+export function sanitizeSeeThroughLogMessage(message: string): string {
+  if (/Loading pipeline components/i.test(message)) return "モデルを読み込んでいます";
+  const cleaned = message
+    // "100%|██████| 5/5 [00:02<00:00, 1.59it/s]" のようなtqdm断片を除去
+    .replace(/\d+%\|[^|]*\|\s*\d+\/\d+\s*(\[[^\]]*\])?/g, " ")
+    .replace(/\[\d+:\d+<[^\]]*\]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return cleaned || "処理を継続しています";
+}
+
 export function formatElapsed(seconds: number): string {
   const minutes = Math.floor(seconds / 60);
   const rest = seconds % 60;

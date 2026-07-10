@@ -1365,18 +1365,9 @@ fn cut_image_with_mask(image: &DynamicImage, mask: &GrayImage) -> DynamicImage {
 fn preview_codex_composite_inner(
     app: AppHandle,
     job_path: &str,
-    profile: &str,
+    _profile: &str,
 ) -> Result<PreviewCodexCompositeResult, AppError> {
     let job_dir = PathBuf::from(job_path);
-    let source_path = job_source_path(&job_dir);
-    let source = image::open(&source_path).map_err(|error| {
-        AppError::General(format!(
-            "source.png を読み込めません: {} ({error})",
-            source_path.display()
-        ))
-    })?;
-    let source_rgba = source.to_rgba8();
-    let (width, height) = source_rgba.dimensions();
     let early_extracted_dir = extracted_parts_dir(&job_dir);
     if !early_extracted_dir.is_dir() {
         return Err(AppError::General(
@@ -1392,92 +1383,12 @@ fn preview_codex_composite_inner(
         save_layer_draw_order(&app, &base_parts_dir)?;
         return preview_from_base_parts(&base_parts, &early_extracted_dir, &base_parts_dir);
     }
-    see_through::run_inference(&app, &source_path.to_string_lossy(), profile, true, None)?;
-    let state = app.state::<AppState>();
-    let base_layers = state
-        .slot_layers
-        .lock()
-        .unwrap()
-        .get("current")
-        .cloned()
-        .ok_or_else(|| AppError::General("See-Through base layers were not loaded".into()))?;
-    let base_layer_order = state.slot_layer_order.lock().unwrap().clone();
-    let extracted_dir = extracted_parts_dir(&job_dir);
-    if !extracted_dir.is_dir() {
-        return Err(AppError::General(
-            "extracted_parts が見つかりません。先に生成素材をSee-Throughで分解してください".into(),
-        ));
-    }
-
-    let mut parts = Vec::new();
-    if extracted_dir.join("eyes-closed.png").is_file() {
-        parts.push("eyes-closed".to_string());
-    }
-    if extracted_dir.join("mouth-closed.png").is_file() {
-        parts.push("mouth-closed".to_string());
-    }
-    for part in MOUTH_VOWEL_TARGETS {
-        if extracted_dir.join(format!("{part}.png")).is_file() {
-            parts.push((*part).to_string());
-        }
-    }
-
-    let mut previews = Vec::new();
-    for part in parts {
-        let part_path = extracted_dir.join(format!("{part}.png"));
-        let part_image = image::open(&part_path).map_err(|error| {
-            AppError::General(format!(
-                "extracted part を読み込めません: {} ({error})",
-                part_path.display()
-            ))
-        })?;
-        let part_rgba = if part_image.width() != width || part_image.height() != height {
-            part_image
-                .resize_exact(width, height, image::imageops::FilterType::Lanczos3)
-                .to_rgba8()
-        } else {
-            part_image.to_rgba8()
-        };
-        let mut composite = expression_base_composite_for_part(
-            &base_layers,
-            &base_layer_order,
-            &part,
-            width,
-            height,
-        );
-        alpha_composite_onto(&mut composite, &part_rgba, width, height);
-        previews.push(CodexCompositePreviewItem {
-            part,
-            preview: image_data_url(&DynamicImage::ImageRgba8(composite))?,
-        });
-    }
-
-    Ok(PreviewCodexCompositeResult {
-        base_preview: image_data_url(&DynamicImage::ImageRgba8(expression_base_composite(
-            &base_layers,
-            &base_layer_order,
-            width,
-            height,
-            &["mouth", "eyewhite", "irides", "eyelash"],
-        )))?,
-        previews,
-    })
-}
-
-fn expression_base_composite_for_part(
-    layers: &HashMap<String, DynamicImage>,
-    layer_order: &[String],
-    part: &str,
-    width: u32,
-    height: u32,
-) -> RgbaImage {
-    if part.starts_with("mouth-") {
-        expression_base_composite(layers, layer_order, width, height, &["mouth"])
-    } else if part.starts_with("eyes-") {
-        expression_base_composite(layers, layer_order, width, height, EYE_LAYER_NAMES)
-    } else {
-        expression_base_composite(layers, layer_order, width, height, &[])
-    }
+    // 素体データが無い場合でも、ここで暗黙にSee-Through推論へフォールバックしない。
+    // 推論はSTEP3の「一括分解を開始」ボタンだけがトリガー（つづきから復帰時に
+    // プレビュー再構築経由で分解処理が勝手に走る事故の防止）
+    Err(AppError::General(
+        "素体データ（base_parts）が見つかりません。STEP4の素体調整を開いて保存すると合成プレビューを表示できます".into(),
+    ))
 }
 
 fn load_job_base_parts(job_dir: &Path) -> Result<Option<HashMap<String, DynamicImage>>, AppError> {
@@ -1801,67 +1712,6 @@ fn resized_rgba(image: &DynamicImage, width: u32, height: u32) -> RgbaImage {
     } else {
         image.to_rgba8()
     }
-}
-
-fn expression_base_composite(
-    layers: &HashMap<String, DynamicImage>,
-    layer_order: &[String],
-    width: u32,
-    height: u32,
-    excluded_normalized_names: &[&str],
-) -> RgbaImage {
-    let mut result = RgbaImage::new(width, height);
-    let mut used = std::collections::HashSet::new();
-    for layer_name in layer_order {
-        if let Some(layer) = layers.get(layer_name) {
-            composite_expression_base_layer(
-                &mut result,
-                layer_name,
-                layer,
-                width,
-                height,
-                excluded_normalized_names,
-            );
-            used.insert(layer_name.as_str());
-        }
-    }
-    let mut remaining: Vec<_> = layers
-        .iter()
-        .filter(|(name, _)| !used.contains(name.as_str()))
-        .collect();
-    remaining.sort_by(|(left, _), (right, _)| left.cmp(right));
-    for (layer_name, layer) in remaining {
-        composite_expression_base_layer(
-            &mut result,
-            layer_name,
-            layer,
-            width,
-            height,
-            excluded_normalized_names,
-        );
-    }
-    result
-}
-
-fn composite_expression_base_layer(
-    result: &mut RgbaImage,
-    layer_name: &str,
-    layer: &DynamicImage,
-    width: u32,
-    height: u32,
-    excluded_normalized_names: &[&str],
-) {
-    if excluded_normalized_names.contains(&normalize_layer_name(layer_name)) {
-        return;
-    }
-    let rgba = if layer.width() != width || layer.height() != height {
-        layer
-            .resize_exact(width, height, image::imageops::FilterType::Lanczos3)
-            .to_rgba8()
-    } else {
-        layer.to_rgba8()
-    };
-    alpha_composite_onto(result, &rgba, width, height);
 }
 
 fn image_data_url(image: &DynamicImage) -> Result<String, AppError> {
