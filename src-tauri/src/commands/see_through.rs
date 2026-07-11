@@ -545,8 +545,14 @@ fn run_inference_with_recovery(
             )?;
             result.split_parts_fallback = true;
             return Ok(result);
-        } else if allow_oom_retry && is_cuda_oom_failure(&error) {
-            let quantization_kernel_issue = is_quantization_kernel_failure(&error);
+        } else if allow_oom_retry
+            && (is_cuda_oom_failure(&error)
+                || (is_native_crash(&error) && selected_profile == "low-vram"))
+        {
+            // low-vram（量子化）でのネイティブクラッシュは、新GPUでbitsandbytes 4bit
+            // カーネルが動かないケースが多い。CUDA OOMと同様に非量子化のstandardへ切替
+            let quantization_kernel_issue = is_quantization_kernel_failure(&error)
+                || (is_native_crash(&error) && selected_profile == "low-vram");
             match oom_retry_plan(&selected_profile, options.as_ref(), quantization_kernel_issue) {
                 Some((retry_profile, retry_options, note)) => {
                     emit_progress(
@@ -568,8 +574,9 @@ fn run_inference_with_recovery(
                 }
                 None => return Err(augment_oom_error(error, quantization_kernel_issue)),
             }
-        } else if is_cuda_oom_failure(&error) {
-            let quantization_kernel_issue = is_quantization_kernel_failure(&error);
+        } else if is_cuda_oom_failure(&error) || is_native_crash(&error) {
+            let quantization_kernel_issue = is_quantization_kernel_failure(&error)
+                || (is_native_crash(&error) && selected_profile == "low-vram");
             return Err(augment_oom_error(error, quantization_kernel_issue));
         } else {
             return Err(error);
@@ -612,6 +619,15 @@ fn run_inference_with_recovery(
 fn is_lr_split_failure(error: &AppError) -> bool {
     let text = error.to_string();
     text.contains("lr_split") || text.contains("further_extr")
+}
+
+/// Windowsのネイティブクラッシュ（アクセス違反 0xC0000005 等）か。
+/// Pythonの例外文字列が出ないハードクラッシュで、exit code -1073741819 で判別する。
+/// low-vram（量子化）プロファイルでこれが起きる場合、新しいGPU（Blackwell等）で
+/// bitsandbytesの4bitカーネルが動かず落ちているケースが多い
+fn is_native_crash(error: &AppError) -> bool {
+    let text = error.to_string();
+    text.contains("-1073741819") || text.contains("ネイティブアクセス違反")
 }
 
 /// CUDA/cuBLASのメモリ確保失敗（cublasCreate等）由来の失敗か。
@@ -1069,6 +1085,11 @@ fn resolve_gpu(app: &AppHandle) -> Option<GpuInfo> {
     gpus.into_iter().max_by_key(|gpu| gpu.memory_mb)
 }
 
+/// autoプロファイルで standard を推奨するVRAMしきい値（MB）。
+/// 16GB以上あれば非量子化(standard)が収まり、bitsandbytesの4bitカーネル非互換
+/// （新GPUでのクラッシュ）を根本的に避けられる
+const STANDARD_PROFILE_VRAM_THRESHOLD_MB: u32 = 16_000;
+
 fn select_profile(requested: &str, gpu: Option<&GpuInfo>) -> String {
     match requested {
         "standard" => return "standard".into(),
@@ -1076,8 +1097,13 @@ fn select_profile(requested: &str, gpu: Option<&GpuInfo>) -> String {
         "low-vram" => return "low-vram".into(),
         _ => {}
     }
-    let _ = gpu;
-    "low-vram".into()
+    // auto: VRAMに余裕があれば量子化(bitsandbytes)を使わない standard を選ぶ。
+    // 新しいGPU（Blackwell等）ではbitsandbytesの4bitカーネルが未対応でクラッシュするため、
+    // VRAMが足りるならstandardの方が安全かつ高速
+    match gpu {
+        Some(g) if g.memory_mb >= STANDARD_PROFILE_VRAM_THRESHOLD_MB => "standard".into(),
+        _ => "low-vram".into(),
+    }
 }
 
 fn git_commit(repo: &Path) -> Option<String> {
@@ -1183,8 +1209,11 @@ mod tests {
     }
 
     #[test]
-    fn auto_profile_uses_low_vram_for_large_vram() {
-        assert_eq!(select_profile("auto", Some(&gpu(24_000))), "low-vram");
+    fn auto_profile_uses_standard_for_large_vram() {
+        // 16GB以上は非量子化(standard)を選び、bitsandbytes 4bitカーネルの
+        // 新GPU非互換クラッシュを根本的に避ける
+        assert_eq!(select_profile("auto", Some(&gpu(24_000))), "standard");
+        assert_eq!(select_profile("auto", Some(&gpu(16_000))), "standard");
     }
 
     #[test]
@@ -1196,6 +1225,14 @@ mod tests {
     fn auto_profile_uses_low_vram_without_supported_gpu() {
         assert_eq!(select_profile("auto", None), "low-vram");
         assert_eq!(select_profile("auto", Some(&gpu(8_000))), "low-vram");
+    }
+
+    #[test]
+    fn native_crash_is_detected() {
+        let err = AppError::General("Windowsのネイティブアクセス違反が発生しました。\n終了コード: -1073741819".into());
+        assert!(is_native_crash(&err));
+        let ok = AppError::General("running layerdiff...".into());
+        assert!(!is_native_crash(&ok));
     }
 
     #[test]

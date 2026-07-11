@@ -1637,6 +1637,11 @@ function App() {
       if (base.oomRetryNote) {
         showToast(`GPUエラーのため設定を変更して続行しています（${base.oomRetryNote}）`);
         pushWorkspaceLog("info", `警告: GPUエラーのため自動リトライしました（${base.oomRetryNote}）`);
+        // 高VRAM（非量子化）へ切り替わった場合はUIのプロファイル表示も揃える
+        if (base.oomRetryNote.includes("高VRAM") || base.oomRetryNote.includes("standard")) {
+          seeThroughProfileTouched.current = true;
+          setSeeThroughProfile("standard");
+        }
       }
       await invoke<string>("cache_codex_source_see_through", {
         jobPath: expressionWorkspace.workPath,
