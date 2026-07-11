@@ -5894,3 +5894,47 @@ body {
 .layer-bulk-body .layer-arm-split-toggle {
   padding: 0 4px 0 0;
 }
+
+/* 戻る/次への間の進捗表示 */
+.workspace-nav-progress {
+  display: grid;
+  flex: 1;
+  gap: 5px;
+  align-content: center;
+  max-width: 520px;
+  margin: 0 24px;
+  min-width: 0;
+}
+
+.workspace-nav-progress span {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 12.5px;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-nav-progress span b {
+  color: var(--text-primary);
+}
+
+.workspace-nav-progress span small {
+  color: var(--text-muted);
+}
+
+/* 不定形バー: サブ処理ごとにpercentが巻き戻って見える問題を回避 */
+.workspace-progress-bar.indeterminate div {
+  width: 32%;
+  animation: workspace-bar-slide 1.4s ease-in-out infinite;
+}
+
+@keyframes workspace-bar-slide {
+  0% { margin-left: 0; }
+  50% { margin-left: 68%; }
+  100% { margin-left: 0; }
+}
+
+.workspace-error-banner span {
+  white-space: pre-line;
+}

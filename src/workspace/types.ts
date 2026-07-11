@@ -118,16 +118,29 @@ export function displaySeeThroughMessage(progress: SeeThroughProgress | null): s
   return "See-Through処理を継続しています";
 }
 
-/** tqdm進捗バー等の生ログノイズを除去し、表示向けの短い一文へ整形する */
+/**
+ * tqdm進捗バー・ANSIエスケープ等の生ログノイズを除去し、表示向けの短い一文へ整形する。
+ * 表示する価値のない断片（カーソル制御・Pythonの途中行など）は "" を返す＝表示しない。
+ */
 export function sanitizeSeeThroughLogMessage(message: string): string {
-  if (/Loading pipeline components/i.test(message)) return "モデルを読み込んでいます";
-  const cleaned = message
+  // ANSIエスケープ（ESC[A 等のカーソル制御）と、ESCが欠落した "[A" 断片を除去
+  let cleaned = message
+    .replace(/\[[0-9;]*[A-Za-z]/g, " ")
+    .replace(/(^|\s)\[[A-Z](?=\s|$)/g, " ");
+  if (/Loading pipeline components|Loading weights|Loading checkpoint/i.test(cleaned)) {
+    return "モデルを読み込んでいます";
+  }
+  if (/running marigold/i.test(cleaned)) return "深度を推定しています";
+  cleaned = cleaned
     // "100%|██████| 5/5 [00:02<00:00, 1.59it/s]" のようなtqdm断片を除去
     .replace(/\d+%\|[^|]*\|\s*\d+\/\d+\s*(\[[^\]]*\])?/g, " ")
     .replace(/\[\d+:\d+<[^\]]*\]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
-  return cleaned || "処理を継続しています";
+  // 意味のない断片（Pythonソースの途中行・罫線など）は表示しない
+  if (cleaned.length < 4) return "";
+  if (/^(return |File |Traceback|self\.|args\.|\^|~)/.test(cleaned)) return "";
+  return cleaned;
 }
 
 export function formatElapsed(seconds: number): string {

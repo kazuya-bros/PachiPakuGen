@@ -319,8 +319,9 @@ function App() {
     const unlistenSeeThrough = listen<SeeThroughProgress>("see-through-progress", (event) => {
       setSeeThroughProgress(event.payload);
       if (!isNoisySeeThroughWarning(event.payload.message)) {
-        // tqdm等の生ログ断片はステータス/ログ履歴に流さず短文へ整形
-        setStatus(sanitizeSeeThroughLogMessage(event.payload.message));
+        // tqdm等の生ログ断片はステータス/ログ履歴に流さず短文へ整形。無意味な断片は捨てる
+        const cleaned = sanitizeSeeThroughLogMessage(event.payload.message);
+        if (cleaned) setStatus(cleaned);
       }
     });
     return () => {
@@ -1617,7 +1618,14 @@ function App() {
       setStatus(`See-Through一括分解が完了しました: ${extracted.extractedParts.length}パーツ`);
       showToast("一括分解が完了しました");
     } catch (cause) {
-      setError(String(cause));
+      const message = String(cause);
+      // 左右分割（耳・目などのL/R分離）のインデックスエラーはVRAM不足ではなく
+      // 素材依存の検出失敗。回避方法を明示する
+      if (seeThroughSplitParts && /(tag_lr_split|part_lr_split|lr_split|IndexError)/.test(message)) {
+        setError(`左右パーツ分解の処理（耳などの左右分割）で失敗しました。このキャラクターでは「左右パーツ分解」をOFFにして再実行すると回避できます（VRAM不足ではありません）。\n\n詳細: ${message}`);
+      } else {
+        setError(message);
+      }
     } finally {
       setWorkspaceBusy(false);
       setSeeThroughStartedAt(null);
@@ -2334,25 +2342,14 @@ function App() {
                       <label title="深度（前後関係）推定の処理解像度。-1で自動。レイヤー前後の判定が怪しい時に上げます"><span>Depth解像度 <i className="workspace-info-mark">?</i></span><input type="number" min={-1} max={4096} step={64} value={seeThroughOptions.resolutionDepth} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, resolutionDepth: Number(event.target.value) })} /></label>
                       <label title="レイヤー分解の推論ステップ数。多いほど品質が上がりますが遅くなります（既定30）"><span>LayerDiff step <i className="workspace-info-mark">?</i></span><input type="number" min={1} max={150} value={seeThroughOptions.inferenceSteps} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, inferenceSteps: Number(event.target.value) })} /></label>
                       <label title="深度推定のステップ数。-1で自動。省VRAMプロファイルでは固定のため変更できません"><span>Depth step <i className="workspace-info-mark">?</i></span><input type="number" min={-1} max={150} value={seeThroughOptions.inferenceStepsDepth} disabled={workspaceBusy || seeThroughProfile === "low-vram"} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, inferenceStepsDepth: Number(event.target.value) })} /></label>
-                      <label title="モデルをブロック単位でCPUメモリへ退避してVRAMを節約します。少し遅くなります。VRAM不足エラーが出る時に有効化"><span>Group offload <i className="workspace-info-mark">?</i></span><select value={seeThroughOptions.groupOffload} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, groupOffload: event.target.value as SeeThroughOptionMode })}><option value="default">標準</option><option value="on">有効</option><option value="off">無効</option></select></label>
-                      <label title="モデル全体をCPUへ退避する最も強い省VRAM設定。大きく遅くなります。高VRAMプロファイルでは使いません"><span>CPU offload <i className="workspace-info-mark">?</i></span><select value={seeThroughOptions.cpuOffload} disabled={workspaceBusy || seeThroughProfile === "standard"} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, cpuOffload: event.target.value as SeeThroughOptionMode })}><option value="default">標準</option><option value="on">有効</option><option value="off">無効</option></select></label>
+                      <label title="モデルをブロック単位でCPUメモリへ退避してVRAMを節約します（少し低速）。「自動」はプロファイルの既定動作に任せます。VRAM不足エラーが出る時に有効化"><span>Group offload <i className="workspace-info-mark">?</i></span><select value={seeThroughOptions.groupOffload} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, groupOffload: event.target.value as SeeThroughOptionMode })}><option value="default">自動（推奨）</option><option value="on">有効</option><option value="off">無効</option></select></label>
+                      <label title="モデル全体をCPUへ退避する最も強い省VRAM設定（大きく低速）。「自動」はプロファイルの既定動作に任せます。高VRAMプロファイルでは使いません"><span>CPU offload <i className="workspace-info-mark">?</i></span><select value={seeThroughOptions.cpuOffload} disabled={workspaceBusy || seeThroughProfile === "standard"} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, cpuOffload: event.target.value as SeeThroughOptionMode })}><option value="default">自動（推奨）</option><option value="on">有効</option><option value="off">無効</option></select></label>
                     </div>
                   </details>
                 </div>
                 <div className="workspace-start-seethrough">
                   <div><strong>分解処理を開始</strong><p>立ち絵、閉じ目、閉じ口、あいうえお口の素材をまとめて分解します。</p></div>
                   <button className="btn btn-primary" disabled={workspaceBusy || !seeThroughRuntime?.ready || !workspaceGeneratedStatus?.ready} onClick={() => void runWorkspaceSeeThroughBatch()}>{seeThroughRunning ? "分解処理中..." : "一括分解を開始"}</button>
-                  {seeThroughRunning && (
-                    <div className="workspace-running-inline">
-                      {seeThroughPhase ? (
-                        <span><b>工程 {seeThroughPhase.index}/{seeThroughPhase.total}</b> {seeThroughPhase.label}</span>
-                      ) : (
-                        <span><b>{seeThroughProgress.stage === "prepare" ? "準備中" : seeThroughProgress.stage === "load" ? "読込中" : "処理中"}</b> {sanitizeSeeThroughLogMessage(displaySeeThroughMessage(seeThroughProgress))}</span>
-                      )}
-                      <small>経過 {formatElapsed(seeThroughElapsedSeconds)}</small>
-                      <div className="workspace-progress-bar" aria-label="See-Through進捗"><div style={{ width: `${Math.max(3, Math.min(100, seeThroughProgress.percent))}%` }} /></div>
-                    </div>
-                  )}
                 </div>
               </>
             )}
@@ -2462,12 +2459,6 @@ function App() {
                     <small>多いほど口パク・まばたきが滑らかになりますが、ファイル数と生成時間が増えます。SpriTalkでは {RIFE_FRAME_RECOMMENDED} 枚が扱いやすい目安です。</small>
                   </div>
                   <button className="btn btn-primary" disabled={workspaceBusy || !workspaceExtractResult || !workspaceCompositePreview?.basePreview} onClick={() => void generateWorkspaceRifeOutputs()}>{workspaceBusy ? "RIFE補完中..." : "RIFE補完を開始"}</button>
-                  {workspaceBusy && progress.total > 0 && (
-                    <div className="workspace-running-inline">
-                      <span><b>RIFE補完中</b> {progress.pair_name} {progress.current}/{progress.total}</span>
-                      <div className="workspace-progress-bar" aria-label="RIFE進捗"><div style={{ width: `${Math.max(3, Math.min(100, (progress.current / Math.max(1, progress.total)) * 100))}%` }} /></div>
-                    </div>
-                  )}
                   {!workspaceBusy && workspaceRifeResult && (
                     <div className="workspace-status-card">
                       <strong>✓ RIFE補完は完了しています</strong>
@@ -2540,6 +2531,26 @@ function App() {
           <button className="btn btn-secondary" onClick={goPreviousWorkspaceStep}>
             {workspaceStep === 1 ? "制作ホームへ戻る" : `戻る: ${steps[workspaceStep - 2]?.[1] ?? ""}`}
           </button>
+          {/* 戻る/次への間の空きスペースに実行中の進捗を表示（パネル側のスクロールを増やさない） */}
+          <div className="workspace-nav-progress" aria-live="polite">
+            {seeThroughRunning && (
+              <>
+                <span>
+                  {seeThroughPhase
+                    ? <><b>工程 {seeThroughPhase.index}/{seeThroughPhase.total}</b> {seeThroughPhase.label}</>
+                    : <>{sanitizeSeeThroughLogMessage(displaySeeThroughMessage(seeThroughProgress)) || "処理を継続しています"}</>}
+                  <small>・経過 {formatElapsed(seeThroughElapsedSeconds)}</small>
+                </span>
+                <div className="workspace-progress-bar indeterminate" aria-label="See-Through進捗"><div /></div>
+              </>
+            )}
+            {!seeThroughRunning && workspaceBusy && progress.total > 0 && (
+              <>
+                <span><b>RIFE補完中</b> {progress.pair_name} {progress.current}/{progress.total}</span>
+                <div className="workspace-progress-bar" aria-label="RIFE進捗"><div style={{ width: `${Math.max(3, Math.min(100, (progress.current / Math.max(1, progress.total)) * 100))}%` }} /></div>
+              </>
+            )}
+          </div>
           <div className="workspace-next-area">
             {nextStepBlockReason() && <small className="workspace-next-hint">{nextStepBlockReason()}</small>}
             {workspaceStep >= 7 ? (
@@ -2561,7 +2572,7 @@ function App() {
               <span className="workspace-log-latest">
                 <span>step {workspaceStep}/7 {steps[workspaceStep - 1]?.[1]}</span>
                 {workspaceBusy && <span className="running">処理中...</span>}
-                {seeThroughProgress && workspaceBusy && <span>{sanitizeSeeThroughLogMessage(displaySeeThroughMessage(seeThroughProgress))}</span>}
+                {seeThroughProgress && workspaceBusy && <span>{sanitizeSeeThroughLogMessage(displaySeeThroughMessage(seeThroughProgress)) || "処理を継続しています"}</span>}
                 {progress.total > 0 && workspaceBusy && <span>RIFE {progress.pair_name} {progress.current}/{progress.total}</span>}
                 <span className={error ? "log-error" : ""}>{error || status}</span>
               </span>
