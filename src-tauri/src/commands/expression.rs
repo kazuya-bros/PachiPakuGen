@@ -1007,13 +1007,18 @@ fn extract_codex_generated_parts_inner(
             snapshot
         }
         _ => {
-            see_through::run_inference(
+            let source_result = see_through::run_inference(
                 &app,
                 &source_path.to_string_lossy(),
                 profile,
                 split_parts,
                 options.clone(),
             )?;
+            if source_result.split_parts_fallback {
+                warnings.push(
+                    "元画像: 左右パーツ分解に失敗したため、左右分解なしで処理しました".into(),
+                );
+            }
             snapshot_current_decomposition(&app).ok_or_else(|| {
                 AppError::General("元画像のSee-Through分解結果を取得できません".into())
             })?
@@ -1081,6 +1086,11 @@ fn extract_codex_generated_parts_inner(
             split_parts,
             options.clone(),
         )?;
+        if see_through_result.split_parts_fallback {
+            warnings.push(format!(
+                "{part}: 左右パーツ分解に失敗したため、左右分解なしで処理しました"
+            ));
+        }
         let state = app.state::<AppState>();
         let layers = state
             .slot_layers

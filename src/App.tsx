@@ -1585,6 +1585,15 @@ function App() {
         splitParts: seeThroughSplitParts,
         options: seeThroughOptions,
       });
+      // 左右分解が素材依存で失敗した場合、バックエンドが左右分解なしで自動リトライ済み。
+      // 以降の工程（表情素材の分解）も左右分解なしに揃え、ユーザーへ報告する
+      let effectiveSplitParts = seeThroughSplitParts;
+      if (base.splitPartsFallback) {
+        effectiveSplitParts = false;
+        setSeeThroughSplitParts(false);
+        showToast("左右パーツ分解に失敗したため、分解なしで続行しています");
+        setStatus("左右パーツ分解がこの素材では失敗したため、左右分解なしで処理を続行しました（目・耳は左右一体のレイヤーになります）");
+      }
       await invoke<string>("cache_codex_source_see_through", {
         jobPath: expressionWorkspace.workPath,
         psdPath: base.psdPath,
@@ -1602,9 +1611,17 @@ function App() {
       const extracted = await invoke<ExtractCodexGeneratedPartsResult>("extract_codex_generated_parts", {
         jobPath: expressionWorkspace.workPath,
         profile: seeThroughProfile,
-        splitParts: seeThroughSplitParts,
+        splitParts: effectiveSplitParts,
         options: seeThroughOptions,
       });
+      // 左右分解フォールバック等の警告は作業ログへ残す（トーストでは流れてしまうため）
+      for (const warning of extracted.warnings) {
+        pushWorkspaceLog("info", `警告: ${warning}`);
+      }
+      if (extracted.warnings.some(warning => warning.includes("左右分解なしで処理しました"))) {
+        setSeeThroughSplitParts(false);
+        showToast("左右パーツ分解に失敗したため、分解なしで続行しました");
+      }
       setWorkspaceExtractResult(extracted);
       setWorkspaceCompositePreview(null);
       setWorkspaceRifeResult(null);

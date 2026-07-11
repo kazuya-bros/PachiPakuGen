@@ -69,6 +69,8 @@ export interface SeeThroughRunResult {
   selectedProfile: string;
   slotLoad: SlotLoadResult;
   mappingPreview: MappingPreviewResult;
+  /** 左右パーツ分解に失敗し、左右分解なしで自動リトライされた場合にtrue */
+  splitPartsFallback: boolean;
 }
 export interface WorkspaceProject {
   version: number;

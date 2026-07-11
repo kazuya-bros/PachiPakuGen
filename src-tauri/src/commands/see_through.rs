@@ -50,6 +50,8 @@ pub struct SeeThroughRunResult {
     pub selected_profile: String,
     pub slot_load: SlotLoadResult,
     pub mapping_preview: MappingPreviewResult,
+    /// 左右パーツ分解に失敗し、左右分解なしで自動リトライした場合にtrue（UIで報告する）
+    pub split_parts_fallback: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -509,6 +511,18 @@ pub(crate) fn run_inference(
                 90,
                 "See-Through exited with an error after writing PSD; continuing with the saved PSD.",
             );
+        } else if split_parts && is_lr_split_failure(&error) {
+            // 左右分割（耳などのL/R分離）は素材依存で失敗することがある。
+            // VRAM等の環境問題ではないため、左右分解なしで自動リトライして作業を止めない
+            emit_progress(
+                app,
+                "inference",
+                5,
+                "左右パーツ分解に失敗したため、左右分解なしで再実行しています",
+            );
+            let mut result = run_inference(app, source_path, requested_profile, false, options)?;
+            result.split_parts_fallback = true;
+            return Ok(result);
         } else {
             return Err(error);
         }
@@ -540,7 +554,15 @@ pub(crate) fn run_inference(
         selected_profile,
         slot_load,
         mapping_preview,
+        split_parts_fallback: false,
     })
+}
+
+/// 左右分割（--tblr_split）由来の失敗か。inference_utils.pyのlr_split系トレース
+/// バックが「直前のログ」としてエラーメッセージに含まれることを利用する
+fn is_lr_split_failure(error: &AppError) -> bool {
+    let text = error.to_string();
+    text.contains("lr_split") || text.contains("further_extr")
 }
 
 fn append_inference_options(
