@@ -1669,6 +1669,14 @@ function App() {
       if (extracted.warnings.some(warning => warning.includes("GPUエラーのため自動リトライしました"))) {
         showToast("GPUエラーのため設定を変更して続行しました");
       }
+      // 期待する全表情（目開閉＋口6種）のうち、抽出できず欠落したものを明示する
+      const EXPECTED_EXPRESSION_PARTS = ["eyes-open", "eyes-closed", "mouth-closed", "mouth-a", "mouth-i", "mouth-u", "mouth-e", "mouth-o"];
+      const missingExpressions = EXPECTED_EXPRESSION_PARTS.filter(part => !extracted.extractedParts.includes(part));
+      if (missingExpressions.length > 0) {
+        const label = missingExpressions.join("・");
+        pushWorkspaceLog("error", `表情が不足: ${label} を抽出できませんでした`);
+        setError(`一部の表情（${label}）を元画像から抽出できませんでした。これらはまばたきや口パクに使われます。\n\n対処: STEP2の「配置フォルダを開く」で該当画像を確認し、目や口がはっきり分かる素材に差し替えて（またはCodexで作り直して）STEP3を再実行してください。左右パーツ分解をOFFにすると改善する場合もあります。`);
+      }
       setWorkspaceExtractResult(extracted);
       setWorkspaceCompositePreview(null);
       setWorkspaceRifeResult(null);

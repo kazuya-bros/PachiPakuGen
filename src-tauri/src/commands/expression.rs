@@ -1148,33 +1148,33 @@ fn extract_codex_generated_parts_inner(
             .ok_or_else(|| AppError::General("See-Through分解レイヤーを取得できません".into()))?;
         let width = *state.canvas_width.lock().unwrap();
         let height = *state.canvas_height.lock().unwrap();
-        let extracted_from_layers = if part.starts_with("eyes-") {
-            extract_named_expression_layers(&layers, EYE_LAYER_NAMES, width, height)
+        if width == 0 || height == 0 {
+            return Err(AppError::General(
+                "See-Through分解結果のキャンバスサイズが不正です".into(),
+            ));
+        }
+        // 生成素材を作業解像度へ正規化（マスク切り出し・差分フォールバックの前提）
+        let generated_image = if generated_image.width() != width || generated_image.height() != height {
+            generated_image.resize_exact(width, height, image::imageops::FilterType::Lanczos3)
         } else {
-            extract_named_expression_layers(&layers, &["mouth"], width, height)
+            generated_image
         };
-        let extracted = if let Some(extracted) = extracted_from_layers {
-            Some(extracted)
-        } else {
-            if part.starts_with("mouth-") {
-                warnings.push(format!(
-                    "{}: See-Through mouth layer was not found ({})",
-                    part, see_through_result.psd_path
-                ));
-                continue;
-            }
-            if width == 0 || height == 0 {
-                return Err(AppError::General(
-                    "See-Through分解結果のキャンバスサイズが不正です".into(),
-                ));
-            }
-
-            let mut mask = if part.starts_with("eyes-") {
+        let is_eye_part = part.starts_with("eyes-");
+        // 1) See-Throughの名前付きレイヤー（eyewhite/irides等 or mouth）から抽出
+        let extracted = extract_named_expression_layers(
+            &layers,
+            if is_eye_part { EYE_LAYER_NAMES } else { &["mouth"] },
+            width,
+            height,
+        )
+        // 2) 名前付きが無ければ、See-Throughのマスクで生成素材から切り出し
+        .or_else(|| {
+            let mut mask = if is_eye_part {
                 expression_mask(&layers, EYE_LAYER_NAMES, width, height, 12, 3)
             } else {
                 mouth_expression_mask(&layers, width, height)
             };
-            if part.starts_with("mouth-") {
+            if !is_eye_part {
                 mask = refine_mouth_mask_with_difference(
                     &mask,
                     &source_image,
@@ -1183,24 +1183,22 @@ fn extract_codex_generated_parts_inner(
                     height,
                 );
             }
-            let min_area = if part.starts_with("eyes-") { 80 } else { 40 };
+            let min_area = if is_eye_part { 80 } else { 40 };
             if !mask_has_minimum_edit_area(&mask, min_area) {
-                warnings.push(format!(
-                    "{}: 対象レイヤーを十分に抽出できませんでした ({})",
-                    part, see_through_result.psd_path
-                ));
-                continue;
+                return None;
             }
-
-            let part_image =
-                if generated_image.width() != width || generated_image.height() != height {
-                    generated_image.resize_exact(width, height, image::imageops::FilterType::Lanczos3)
-                } else {
-                    generated_image
-                };
-            Some(cut_image_with_mask(&part_image, &mask))
+            Some(cut_image_with_mask(&generated_image, &mask))
+        })
+        // 3) それでも失敗したら、元画像との差分領域から直接切り出す（See-Through非依存の保険）
+        .or_else(|| {
+            difference_fallback_extract(&source_image, &generated_image, width, height, is_eye_part)
+        });
+        let Some(extracted) = extracted else {
+            warnings.push(format!(
+                "{part}: 目/口の領域を抽出できず、この表情はスキップしました（元画像が分解しづらい可能性があります）"
+            ));
+            continue;
         };
-        let Some(extracted) = extracted else { continue };
 
         // 出力は source 解像度に正規化（生成素材が同アスペクト別解像度でも後段が揃う）
         let extracted = if extracted.width() != source_snapshot.width
@@ -3174,6 +3172,60 @@ fn mouth_mask_from_face_anchors(
         (width / 15).clamp(30, 96),
         (height / 24).clamp(22, 56),
     )
+}
+
+/// See-Throughが目/口レイヤーを抽出できなかった時の保険。
+/// 生成素材と元画像（立ち絵）の差分領域＝変化した目/口をそのまま切り出す。
+/// See-Throughの分解結果に依存しないため、分解しづらい素材でも表情を落とさない。
+fn difference_fallback_extract(
+    source_image: &DynamicImage,
+    generated_image: &DynamicImage,
+    width: u32,
+    height: u32,
+    is_eye: bool,
+) -> Option<DynamicImage> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let source_rgba = resized_rgba(source_image, width, height);
+    let generated_rgba = resized_rgba(generated_image, width, height);
+    // 顔ゾーンで差分を検出（目=上寄り / 口=下寄り）。全体的なAIノイズの誤検出を抑える
+    let (y_min, y_max) = if is_eye {
+        (0u32, (height as f32 * 0.62) as u32)
+    } else {
+        ((height as f32 * 0.32) as u32, height)
+    };
+    let mut diff = vec![0u8; (width * height) as usize];
+    let mut count = 0usize;
+    for y in y_min..y_max.min(height) {
+        for x in 0..width {
+            let a = source_rgba.get_pixel(x, y).0;
+            let b = generated_rgba.get_pixel(x, y).0;
+            let rgb_delta = (a[0] as i16 - b[0] as i16).abs()
+                + (a[1] as i16 - b[1] as i16).abs()
+                + (a[2] as i16 - b[2] as i16).abs();
+            let alpha_delta = (a[3] as i16 - b[3] as i16).abs();
+            if rgb_delta >= 48 || alpha_delta >= 32 {
+                diff[(y * width + x) as usize] = 255;
+                count += 1;
+            }
+        }
+    }
+    if count < 30 {
+        return None; // 差分がほぼ無い＝抽出不能
+    }
+    let (min_x, min_y, max_x, max_y) = mask_bounds(&diff, width, height)?;
+    let bbox_w = max_x.saturating_sub(min_x) + 1;
+    let bbox_h = max_y.saturating_sub(min_y) + 1;
+    // 大きすぎる差分＝全体的な色シフト/ノイズで信頼できない
+    if bbox_w > width * 3 / 4 || bbox_h > height * 3 / 5 {
+        return None;
+    }
+    // 差分マスクを少し膨張＋ぼかしして輪郭をなじませる
+    let adjusted = neck_extract::adjust_mask(&diff, width, height, 3, 3);
+    let mask = GrayImage::from_raw(width, height, adjusted)?;
+    let gen_dyn = DynamicImage::ImageRgba8(generated_rgba);
+    Some(cut_image_with_mask(&gen_dyn, &mask))
 }
 
 fn refine_mouth_mask_with_difference(
