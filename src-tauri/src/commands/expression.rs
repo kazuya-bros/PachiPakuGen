@@ -1019,6 +1019,11 @@ fn extract_codex_generated_parts_inner(
                     "元画像: 左右パーツ分解に失敗したため、左右分解なしで処理しました".into(),
                 );
             }
+            if let Some(note) = &source_result.oom_retry_note {
+                warnings.push(format!(
+                    "元画像: GPU VRAM不足のため自動リトライしました（{note}）"
+                ));
+            }
             snapshot_current_decomposition(&app).ok_or_else(|| {
                 AppError::General("元画像のSee-Through分解結果を取得できません".into())
             })?
@@ -1089,6 +1094,11 @@ fn extract_codex_generated_parts_inner(
         if see_through_result.split_parts_fallback {
             warnings.push(format!(
                 "{part}: 左右パーツ分解に失敗したため、左右分解なしで処理しました"
+            ));
+        }
+        if let Some(note) = &see_through_result.oom_retry_note {
+            warnings.push(format!(
+                "{part}: GPU VRAM不足のため自動リトライしました（{note}）"
             ));
         }
         let state = app.state::<AppState>();

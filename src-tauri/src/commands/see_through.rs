@@ -52,6 +52,8 @@ pub struct SeeThroughRunResult {
     pub mapping_preview: MappingPreviewResult,
     /// 左右パーツ分解に失敗し、左右分解なしで自動リトライした場合にtrue（UIで報告する）
     pub split_parts_fallback: bool,
+    /// GPU VRAM不足（CUDA OOM）で自動リトライした場合、その内容の説明文（UIで報告する）
+    pub oom_retry_note: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -435,6 +437,19 @@ pub(crate) fn run_inference(
     split_parts: bool,
     options: Option<SeeThroughOptions>,
 ) -> Result<SeeThroughRunResult, AppError> {
+    run_inference_with_recovery(app, source_path, requested_profile, split_parts, options, true)
+}
+
+/// allow_oom_retry: VRAM不足での自動リトライを1回だけ許可するかどうか。
+/// リトライ呼び出し自身はfalseを渡し、再帰の無限ループを防ぐ
+fn run_inference_with_recovery(
+    app: &AppHandle,
+    source_path: &str,
+    requested_profile: &str,
+    split_parts: bool,
+    options: Option<SeeThroughOptions>,
+    allow_oom_retry: bool,
+) -> Result<SeeThroughRunResult, AppError> {
     let source = Path::new(source_path);
     if !source.is_file() {
         return Err(AppError::General(format!(
@@ -520,9 +535,40 @@ pub(crate) fn run_inference(
                 5,
                 "左右パーツ分解に失敗したため、左右分解なしで再実行しています",
             );
-            let mut result = run_inference(app, source_path, requested_profile, false, options)?;
+            let mut result = run_inference_with_recovery(
+                app,
+                source_path,
+                requested_profile,
+                false,
+                options,
+                allow_oom_retry,
+            )?;
             result.split_parts_fallback = true;
             return Ok(result);
+        } else if allow_oom_retry && is_cuda_oom_failure(&error) {
+            match oom_retry_plan(&selected_profile, options.as_ref()) {
+                Some((retry_profile, retry_options, note)) => {
+                    emit_progress(
+                        app,
+                        "inference",
+                        5,
+                        &format!("GPU VRAM不足のため、{note}して再実行しています"),
+                    );
+                    let mut result = run_inference_with_recovery(
+                        app,
+                        source_path,
+                        &retry_profile,
+                        split_parts,
+                        retry_options,
+                        false,
+                    )?;
+                    result.oom_retry_note = Some(note);
+                    return Ok(result);
+                }
+                None => return Err(augment_oom_error(error)),
+            }
+        } else if is_cuda_oom_failure(&error) {
+            return Err(augment_oom_error(error));
         } else {
             return Err(error);
         }
@@ -555,6 +601,7 @@ pub(crate) fn run_inference(
         slot_load,
         mapping_preview,
         split_parts_fallback: false,
+        oom_retry_note: None,
     })
 }
 
@@ -563,6 +610,55 @@ pub(crate) fn run_inference(
 fn is_lr_split_failure(error: &AppError) -> bool {
     let text = error.to_string();
     text.contains("lr_split") || text.contains("further_extr")
+}
+
+/// GPU VRAM不足（CUDA/cuBLASのメモリ確保失敗）由来の失敗か
+fn is_cuda_oom_failure(error: &AppError) -> bool {
+    let text = error.to_string();
+    text.contains("CUBLAS_STATUS_ALLOC_FAILED")
+        || text.contains("CUDA out of memory")
+        || text.contains("OutOfMemoryError")
+        || (text.contains("CUDA error") && text.contains("memory"))
+}
+
+/// OOM発生時に安全に一度だけ試せる、より軽い実行設定を返す
+/// (再試行プロファイル, 再試行オプション, 変更内容の説明文)。
+/// これ以上緩和できる設定が無ければ None（自動リトライしない）
+fn oom_retry_plan(
+    selected_profile: &str,
+    options: Option<&SeeThroughOptions>,
+) -> Option<(String, Option<SeeThroughOptions>, String)> {
+    if selected_profile != "low-vram" {
+        // 高VRAMプロファイルでのOOM: より軽い省VRAM（量子化）プロファイルへ切り替え
+        return Some((
+            "low-vram".to_string(),
+            options.cloned(),
+            "省VRAMプロファイルへ切り替え".to_string(),
+        ));
+    }
+    // 既に省VRAMプロファイル: CPU/グループオフロードを強制有効化して再試行（一度のみ）
+    let mut next = options.cloned().unwrap_or_default();
+    let already_maxed =
+        next.cpu_offload.as_deref() == Some("on") && next.group_offload.as_deref() == Some("on");
+    if already_maxed {
+        return None;
+    }
+    next.cpu_offload = Some("on".to_string());
+    next.group_offload = Some("on".to_string());
+    Some((
+        "low-vram".to_string(),
+        Some(next),
+        "CPU/グループオフロードを有効化".to_string(),
+    ))
+}
+
+/// 自動リトライ済み、またはこれ以上緩和できる設定が無いOOMエラーに、対処のヒントを添える
+fn augment_oom_error(error: AppError) -> AppError {
+    AppError::General(format!(
+        "{error}\n\nGPUのVRAM不足（CUDA/cuBLASのメモリ確保失敗）が原因の可能性があります。\
+他にGPUを使用しているアプリ（ブラウザ・ゲーム・他のAI処理等）を終了する、\
+STEP3の「使用GPU」でVRAMに余裕のあるGPUへ切り替える、のいずれかを試してから再実行してください。"
+    ))
 }
 
 fn append_inference_options(

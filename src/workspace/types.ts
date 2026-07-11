@@ -71,6 +71,8 @@ export interface SeeThroughRunResult {
   mappingPreview: MappingPreviewResult;
   /** 左右パーツ分解に失敗し、左右分解なしで自動リトライされた場合にtrue */
   splitPartsFallback: boolean;
+  /** GPU VRAM不足で自動リトライされた場合、その内容の説明文 */
+  oomRetryNote: string | null;
 }
 export interface WorkspaceProject {
   version: number;

@@ -1594,6 +1594,10 @@ function App() {
         showToast("左右パーツ分解に失敗したため、分解なしで続行しています");
         setStatus("左右パーツ分解がこの素材では失敗したため、左右分解なしで処理を続行しました（目・耳は左右一体のレイヤーになります）");
       }
+      if (base.oomRetryNote) {
+        showToast(`GPU VRAM不足のため設定を変更して続行しています（${base.oomRetryNote}）`);
+        pushWorkspaceLog("info", `警告: GPU VRAM不足のため自動リトライしました（${base.oomRetryNote}）。処理は通常より低速になります`);
+      }
       await invoke<string>("cache_codex_source_see_through", {
         jobPath: expressionWorkspace.workPath,
         psdPath: base.psdPath,
@@ -1621,6 +1625,9 @@ function App() {
       if (extracted.warnings.some(warning => warning.includes("左右分解なしで処理しました"))) {
         setSeeThroughSplitParts(false);
         showToast("左右パーツ分解に失敗したため、分解なしで続行しました");
+      }
+      if (extracted.warnings.some(warning => warning.includes("GPU VRAM不足"))) {
+        showToast("GPU VRAM不足のため設定を変更して続行しました");
       }
       setWorkspaceExtractResult(extracted);
       setWorkspaceCompositePreview(null);
