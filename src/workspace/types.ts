@@ -198,10 +198,9 @@ export function workspacePreviewItemLabel(item: WorkspacePreviewItem): string {
 }
 
 // Step5でパーツ個別調整できる対象。
-// eyes-open はsource由来で通常はズレないため「全パーツ一括」の対象外だが、
-// See-Throughの目レイヤー検出が甘い素材向けに個別選択でのみ調整できる
+// eyes-open は素体の目そのもの（平常時の目＝他フレームと共通）なので調整対象外。
+// 実際に位置がズレうるのはCodex生成→分解した閉じ目・口の差分だけ
 export const WORKSPACE_ADJUST_PART_KEYS = [
-  "eyes-open",
   "eyes-closed",
   "mouth-closed",
   "mouth-a",

@@ -211,7 +211,7 @@ function App() {
     workspaceAdjustDebounceTimer.current = window.setTimeout(() => {
       workspaceAdjustDebounceTimer.current = null;
       void applyWorkspacePartAdjustment();
-    }, 500);
+    }, 250);
     return () => {
       if (workspaceAdjustDebounceTimer.current !== null) {
         window.clearTimeout(workspaceAdjustDebounceTimer.current);
@@ -2516,8 +2516,8 @@ function App() {
                   <button className="btn btn-primary" disabled={workspaceBusy || !workspaceExtractResult} title="待たずにすぐ適用します（通常は自動で適用されるため押さなくてもOK）" onClick={() => void applyWorkspacePartAdjustment()}>今すぐ適用</button>
                 </div>
                 <div className="motion-lab-note">
-                  変更（ドラッグ・矢印・数値入力）は約0.5秒後に自動で保存されます。補正値はパーツごとに元画像基準の絶対値で保存され（adjustment.json v2）、対象を切り替えるとそのパーツの現在値が表示されます。
-                  eyes-open は元画像由来のため「全パーツ一括」の対象外ですが、目の検出がズレた素材向けに個別選択で調整できます（STEP3をやり直しても調整は引き継がれます）。「パーツ移動」ON中は矢印キーでも±1px（Shiftで±10px）動かせます。
+                  自動整列が効くので通常は微調整のみでOKです。変更（ドラッグ・矢印・数値入力）は自動で保存されます。補正値はパーツごとに元画像基準の絶対値で保存され（adjustment.json v2）、対象を切り替えるとそのパーツの現在値が表示されます。
+                  base は目・口を乗せない素体（のっぺらぼう）で、eyes-open は素体の目そのもの（他フレームと共通の平常時の目）なので調整対象外です。ズレうるのは閉じ目・口の差分だけです。「パーツ移動」ON中は矢印キーでも±1px（Shiftで±10px）動かせます。
                 </div>
               </>
             )}

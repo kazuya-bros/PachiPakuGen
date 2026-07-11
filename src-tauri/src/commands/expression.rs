@@ -675,12 +675,10 @@ fn adjust_codex_extracted_parts_inner(
     }
     let originals_dir = extracted_dir.join("original_extracted_parts");
     fs::create_dir_all(&originals_dir)?;
-    // eyes-open は source 由来で最初から位置が合っている想定のため「全パーツ一括」の
-    // 対象外だが、See-Throughの目レイヤー検出が甘い素材ではズレるため、個別指定でのみ
-    // 調整を許可する（一括のCodex向け補正が巻き添えで適用されることはない）
+    // eyes-open は素体の目そのもの（平常時の目）なので調整対象外。閉じ目・口だけが差分
     let target_parts: Vec<&str> = match request.part.as_deref() {
         Some(part) => {
-            if part != "eyes-open" && !GENERATED_PART_TARGETS.contains(&part) {
+            if !GENERATED_PART_TARGETS.contains(&part) {
                 return Err(AppError::General(format!(
                     "調整対象外のパーツです: {part}"
                 )));
@@ -921,12 +919,13 @@ fn save_eyes_open_extracted_part(
         base_eye.clone()
     };
     fs::create_dir_all(extracted_dir)?;
-    // 抽出済み eyes-open.png は source 由来（抽出工程で生成）を正とし、
-    // 無い場合のみグローバル状態のeye_openで補完する
-    let extracted_eyes_open = extracted_dir.join("eyes-open.png");
-    if !extracted_eyes_open.is_file() {
-        eyes_open.save(&extracted_eyes_open)?;
-    }
+    // eyes-open は「素体の目（eye_open）そのもの」を正とする。他フレーム（口パク等）が
+    // 表示する平常時の目と完全一致させ、閉じ目だけが差分になるようにする。
+    // 抽出時のsource切り出し版は目の輪郭が微妙に異なるため、ここで必ず上書きする
+    eyes_open.save(extracted_dir.join("eyes-open.png"))?;
+    let originals_dir = extracted_dir.join("original_extracted_parts");
+    fs::create_dir_all(&originals_dir)?;
+    eyes_open.save(originals_dir.join("eyes-open.png"))?;
     let base_dir = base_parts_dir(job_dir);
     fs::create_dir_all(&base_dir)?;
     eyes_open.save(base_dir.join("eye_open.png"))?;
@@ -1347,25 +1346,14 @@ fn regenerate_eyes_open_from_source(
     } else {
         source_image.clone()
     };
+    // 抽出時点の暫定 eyes-open（base素体が未保存の段階の早期プレビュー用）。
+    // STEP4の素体保存（save_eyes_open_extracted_part）で base の eye_open に上書きされ、
+    // 最終的には平常時の目と完全一致する
     let eyes_open = cut_image_with_mask(&source_resized, &mask);
     eyes_open.save(extracted_dir.join("eyes-open.png"))?;
-    // 位置補正前の原本も source 由来へ更新（過去の壊れたコピーを残さない）
     let originals_dir = extracted_dir.join("original_extracted_parts");
     fs::create_dir_all(&originals_dir)?;
     eyes_open.save(originals_dir.join("eyes-open.png"))?;
-    // STEP5でeyes-openの個別補正が保存済みなら、再生成したピクセルにも同じ補正を
-    // 再適用する（STEP3をやり直すたびにユーザーの位置調整が黙って消えるのを防ぐ）
-    if let Some(adjustment) = read_typed_part_adjustments(extracted_dir).get("eyes-open") {
-        if adjustment.offset_x != 0 || adjustment.offset_y != 0 || adjustment.scale_percent != 100 {
-            let adjusted = transform_extracted_part(
-                &eyes_open,
-                adjustment.offset_x,
-                adjustment.offset_y,
-                adjustment.scale_percent,
-            );
-            adjusted.save(extracted_dir.join("eyes-open.png"))?;
-        }
-    }
     Ok(())
 }
 
@@ -1608,6 +1596,7 @@ fn preview_from_base_parts(
             &draw_order,
             is_eye_part.then_some(&part_rgba),
             (!is_eye_part).then_some(&part_rgba),
+            true,
         );
         previews.push(CodexCompositePreviewItem {
             part,
@@ -1616,8 +1605,9 @@ fn preview_from_base_parts(
     }
 
     Ok(PreviewCodexCompositeResult {
+        // base = 素体そのもの（目・口の差分を乗せない のっぺらぼう）
         base_preview: image_data_url(&DynamicImage::ImageRgba8(compose_base_parts_ordered(
-            base_parts, width, height, &draw_order, None, None,
+            base_parts, width, height, &draw_order, None, None, false,
         )))?,
         previews,
     })
@@ -1673,6 +1663,7 @@ fn preview_codex_rife_outputs_inner(job_path: &str) -> Result<PreviewCodexRifeRe
                 &draw_order,
                 is_eye_part.then_some(&frame_rgba),
                 (!is_eye_part).then_some(&frame_rgba),
+                true,
             );
             previews.push(CodexRifeFramePreviewItem {
                 part: part.to_string(),
@@ -1684,6 +1675,7 @@ fn preview_codex_rife_outputs_inner(job_path: &str) -> Result<PreviewCodexRifeRe
     }
 
     Ok(PreviewCodexRifeResult {
+        // base = 素体そのもの（目・口の差分を乗せない のっぺらぼう）
         base_preview: image_data_url(&DynamicImage::ImageRgba8(compose_base_parts_ordered(
             &base_parts,
             width,
@@ -1691,6 +1683,7 @@ fn preview_codex_rife_outputs_inner(job_path: &str) -> Result<PreviewCodexRifeRe
             &draw_order,
             None,
             None,
+            false,
         )))?,
         previews,
     })
@@ -1725,7 +1718,8 @@ fn sorted_png_files(dir: &Path) -> Result<Vec<PathBuf>, AppError> {
 
 /// base_parts をグループ描画順（layer-order.json由来、背面→前面）で合成する。
 /// eye/mouth スロットは overlay 指定時にそれで置き換え（差分パーツ・RIFEフレーム用）。
-/// overlay が None のスロットは eye_open / mouth_closed を使う。
+/// overlay が None のスロットは include_face_defaults=true なら eye_open / mouth_closed を、
+/// false なら何も描かない（＝素体そのもの＝のっぺらぼう。baseプレビュー用）。
 fn compose_base_parts_ordered(
     base_parts: &HashMap<String, DynamicImage>,
     width: u32,
@@ -1733,6 +1727,7 @@ fn compose_base_parts_ordered(
     order: &[String],
     eye_overlay: Option<&RgbaImage>,
     mouth_overlay: Option<&RgbaImage>,
+    include_face_defaults: bool,
 ) -> RgbaImage {
     let mut result = RgbaImage::new(width, height);
     let mut draw = |result: &mut RgbaImage, image: &DynamicImage| {
@@ -1743,15 +1738,19 @@ fn compose_base_parts_ordered(
             "eye" => {
                 if let Some(overlay) = eye_overlay {
                     alpha_composite_onto(&mut result, overlay, width, height);
-                } else if let Some(image) = base_parts.get("eye_open") {
-                    draw(&mut result, image);
+                } else if include_face_defaults {
+                    if let Some(image) = base_parts.get("eye_open") {
+                        draw(&mut result, image);
+                    }
                 }
             }
             "mouth" => {
                 if let Some(overlay) = mouth_overlay {
                     alpha_composite_onto(&mut result, overlay, width, height);
-                } else if let Some(image) = base_parts.get("mouth_closed") {
-                    draw(&mut result, image);
+                } else if include_face_defaults {
+                    if let Some(image) = base_parts.get("mouth_closed") {
+                        draw(&mut result, image);
+                    }
                 }
             }
             "sways" => {
@@ -2166,6 +2165,16 @@ fn ensure_eyes_open_part(
     if eyes_open.is_file() {
         return Ok(());
     }
+    // eyes-open は素体の目（base_parts/eye_open.png）を正とする。素体が保存済みなら
+    // それをコピー＝平常時の目と完全一致させる（source切り出しへは素体が無い時だけ落ちる）
+    let base_eye = base_parts_dir(job_dir).join("eye_open.png");
+    if base_eye.is_file() {
+        fs::copy(&base_eye, &eyes_open)?;
+        let originals_dir = extracted_dir.join("original_extracted_parts");
+        fs::create_dir_all(&originals_dir)?;
+        fs::copy(&base_eye, originals_dir.join("eyes-open.png"))?;
+        return Ok(());
+    }
     let source_path = job_source_path(job_dir);
     if !source_path.is_file() {
         return Err(AppError::General(format!(
@@ -2201,22 +2210,9 @@ fn ensure_eyes_open_part(
     };
     let raw_eyes_open = cut_image_with_mask(&source_image, &mask);
     raw_eyes_open.save(&eyes_open)?;
-    // 補正の基準になる原本も残す（無いとSTEP5適用時に補正済み画像を原本と誤認し二重適用になる）
     let originals_dir = extracted_dir.join("original_extracted_parts");
     fs::create_dir_all(&originals_dir)?;
     raw_eyes_open.save(originals_dir.join("eyes-open.png"))?;
-    // 保存済みのeyes-open個別補正があれば再適用（regenerate_eyes_open_from_sourceと同じ扱い）
-    if let Some(adjustment) = read_typed_part_adjustments(extracted_dir).get("eyes-open") {
-        if adjustment.offset_x != 0 || adjustment.offset_y != 0 || adjustment.scale_percent != 100 {
-            transform_extracted_part(
-                &raw_eyes_open,
-                adjustment.offset_x,
-                adjustment.offset_y,
-                adjustment.scale_percent,
-            )
-            .save(&eyes_open)?;
-        }
-    }
     Ok(())
 }
 
@@ -3663,10 +3659,10 @@ mod tests {
             DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, Rgba([255, 0, 0, 255]))),
         );
         let behind: Vec<String> = ["arm_l", "body"].iter().map(|s| s.to_string()).collect();
-        let composite = compose_base_parts_ordered(&parts, 2, 2, &behind, None, None);
+        let composite = compose_base_parts_ordered(&parts, 2, 2, &behind, None, None, true);
         assert_eq!(composite.get_pixel(0, 0), &Rgba([0, 0, 255, 255]));
         let front: Vec<String> = ["body", "arm_l"].iter().map(|s| s.to_string()).collect();
-        let composite = compose_base_parts_ordered(&parts, 2, 2, &front, None, None);
+        let composite = compose_base_parts_ordered(&parts, 2, 2, &front, None, None, true);
         assert_eq!(composite.get_pixel(0, 0), &Rgba([255, 0, 0, 255]));
     }
 
