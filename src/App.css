@@ -494,18 +494,49 @@ body {
 .workspace-image-picker img,
 .workspace-image-picker strong {
   width: 100%;
-  height: min(45vh, 520px);
-  min-height: 280px;
+  /* ウィンドウ高1024pxでも縦スクロールが出ない高さ（ヘッダ+ステッパー+見出し+ナビ+ログ分を控除） */
+  height: clamp(220px, calc(100vh - 590px), 520px);
   display: grid;
   place-items: center;
-  background: rgba(4, 10, 28, 0.64);
+  background:
+    linear-gradient(45deg, rgba(128, 128, 128, 0.12) 25%, transparent 25%),
+    linear-gradient(-45deg, rgba(128, 128, 128, 0.12) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, rgba(128, 128, 128, 0.12) 75%),
+    linear-gradient(-45deg, transparent 75%, rgba(128, 128, 128, 0.12) 75%);
+  background-color: rgba(4, 10, 28, 0.5);
+  background-position: 0 0, 0 10px, 10px -10px, -10px 0;
+  background-size: 20px 20px;
   color: var(--text-secondary);
   font-size: 16px;
   object-fit: contain;
 }
 
+.workspace-picker-empty {
+  display: grid;
+  gap: 10px;
+  place-content: center;
+  padding: 20px;
+  text-align: center;
+}
+
+.workspace-picker-empty b {
+  color: var(--text-primary);
+  font-size: 16px;
+}
+
+.workspace-picker-empty em {
+  color: var(--text-muted);
+  font-size: 12.5px;
+  font-style: normal;
+  line-height: 1.8;
+}
+
 .app.theme-light .workspace-image-picker img,
-.app.theme-light .workspace-image-picker strong,
+.app.theme-light .workspace-image-picker strong {
+  background-color: #f4f5f8;
+  color: var(--text-secondary);
+}
+
 .app.theme-light .workspace-input-preview-card img,
 .app.theme-light .workspace-input-preview-card div,
 .app.theme-light .workspace-adjust-grid input {
@@ -655,25 +686,28 @@ body {
   margin-top: 16px;
 }
 
+/* Codex依頼の3工程は全体ステッパーと同じく「左→右」で進む横並び */
 .workspace-codex-steps {
   display: grid;
-  gap: 12px;
-  max-width: 920px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  align-items: stretch;
 }
 
 .workspace-codex-card {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 18px;
-  padding: 14px 16px;
+  grid-template-rows: minmax(0, 1fr) auto;
+  align-items: stretch;
+  gap: 14px;
+  padding: 16px 18px;
   border: 1px solid var(--border-color);
   background: var(--surface-bg);
 }
 
 .workspace-codex-card > div:first-child {
   display: grid;
-  gap: 7px;
+  align-content: start;
+  gap: 8px;
 }
 
 .workspace-codex-card span {
@@ -709,8 +743,8 @@ body {
 }
 
 .workspace-codex-card .workspace-action-row {
-  flex-wrap: nowrap;
-  justify-content: flex-end;
+  flex-wrap: wrap;
+  justify-content: flex-start;
   margin-top: 0;
 }
 
@@ -3557,12 +3591,13 @@ body {
 
 .primary-workflow-card {
   width: 100%;
-  min-height: 176px;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(340px, 0.8fr) auto;
-  align-items: center;
-  gap: 24px;
-  padding: 24px 26px;
+  min-height: 220px;
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 26px 30px;
   border: 1px solid color-mix(in srgb, var(--primary) 32%, var(--border));
   border-radius: var(--radius);
   background: var(--surface-raised);
@@ -3590,11 +3625,7 @@ body {
   margin-bottom: 18px;
 }
 
-/* 2カードは同格のため secondary も同一スタイル（グラデーションはホバー側のみ） */
-.primary-workflow-card.secondary {
-  background: var(--surface-raised);
-  border-color: color-mix(in srgb, var(--primary) 32%, var(--border));
-}
+/* 2カードは同格（見た目の差なし）。ホバー側だけグラデーションが出る */
 
 .primary-workflow-card.legacy-entry {
   margin-top: 8px;
@@ -3645,14 +3676,21 @@ body {
 }
 
 .primary-workflow-copy strong {
-  font-size: 1.25rem;
+  font-size: 1.45rem;
 }
 
 .primary-workflow-copy p {
-  max-width: 560px;
+  max-width: none;
   color: var(--text-dim);
-  font-size: 0.76rem;
-  line-height: 1.65;
+  font-size: 0.88rem;
+  line-height: 1.85;
+}
+
+.primary-workflow-copy code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--surface-sunken);
+  font-size: 0.82em;
 }
 
 .primary-workflow-steps {
@@ -3688,16 +3726,17 @@ body {
 }
 
 .primary-workflow-cta {
-  min-width: 136px;
-  height: 38px;
+  align-self: flex-end;
+  min-width: 200px;
+  height: 42px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  padding: 0 16px;
+  padding: 0 22px;
   border-radius: var(--radius-sm);
   background: var(--primary);
   color: #fff;
-  font-size: 0.78rem;
+  font-size: 0.82rem;
   font-weight: 900;
   white-space: nowrap;
 }
@@ -5588,14 +5627,19 @@ body {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  min-height: 0;
 }
 
 .workspace-image-picker-cell .workspace-image-picker {
   width: 100%;
 }
 
+/* クリアはカード右上に重ねる（下に置くとスペースを浪費するため） */
 .workspace-image-clear {
-  align-self: flex-end;
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  z-index: 2;
   padding: 4px 10px;
   border: 1px solid var(--border-color);
   border-radius: 4px;
@@ -5636,26 +5680,49 @@ body {
 }
 
 .workspace-parts-checklist {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 6px;
+  display: grid;
+  gap: 4px;
+  margin-top: 4px;
 }
 
 .workspace-parts-checklist span {
-  padding: 3px 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
   border: 1px solid var(--border-color);
   border-radius: 4px;
   background: var(--surface-bg);
-  font-size: 11px;
+  font-size: 12px;
+}
+
+.workspace-parts-checklist span b {
+  flex: 0 0 16px;
+  text-align: center;
+  font-weight: 700;
+}
+
+.workspace-parts-checklist span i {
+  margin-left: auto;
+  font-size: 10.5px;
+  font-style: normal;
+  white-space: nowrap;
 }
 
 .workspace-parts-checklist span.present {
-  border-color: #3d7a4a;
+  border-color: rgba(98, 197, 116, 0.5);
+  color: #62c574;
+}
+
+.workspace-parts-checklist span.present i {
   color: #62c574;
 }
 
 .workspace-parts-checklist span.missing {
+  color: var(--text-secondary);
+}
+
+.workspace-parts-checklist span.missing i {
   color: var(--text-muted);
 }
 

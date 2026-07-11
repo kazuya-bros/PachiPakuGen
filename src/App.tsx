@@ -1285,7 +1285,12 @@ function App() {
       }
       await refreshWorkspaceSeeThroughStatus();
     } catch (cause) {
-      setError(String(cause));
+      const message = String(cause);
+      if (kind === "resume" && message.includes("project.json が見つかりません")) {
+        setError("選択したフォルダはPachiPakuGenの作業フォルダではありません（project.json がありません）。「はじめから」で作成した作業フォルダを選んでください");
+      } else {
+        setError(message);
+      }
     } finally {
       setWorkspaceBusy(false);
     }
@@ -2123,17 +2128,24 @@ function App() {
           <section className="workspace-flow-panel">
             {workspaceStep === 1 && (
               <div className="workspace-step-one">
-                <div className="workspace-panel-heading compact">
+                <div className="workspace-panel-heading">
                   <span>STEP 1</span>
                   <h3>立ち絵と参照画像を選択</h3>
-                  <p>立ち絵は必須です。参照画像は任意で、使うと目や口の中の色・質感が元絵に近づきます。画像はこの画面へドラッグ&ドロップでも設定できます。</p>
+                  <p>立ち絵は必須です。参照画像は任意で、使うと目や口の中の色・質感が元絵に近づきます。</p>
                 </div>
                 <div className="workspace-image-picker-grid">
                   <div className="workspace-image-picker-cell">
                     <button className={`workspace-image-picker${workspaceFiles.source ? " ready" : ""}`} onClick={() => void pickWorkspaceImage("source")}>
-                      <span>立ち絵</span>
-                      {workspaceImagePreviews.source ? <img src={workspaceImagePreviews.source} alt="立ち絵プレビュー" /> : <strong>選択</strong>}
-                      <small title={workspaceFiles.source}>{workspaceFiles.source ? workspaceFileName(workspaceFiles.source) : "必須: 表情セットの元画像"}</small>
+                      <span>立ち絵（必須）</span>
+                      {workspaceImagePreviews.source ? (
+                        <img src={workspaceImagePreviews.source} alt="立ち絵プレビュー" />
+                      ) : (
+                        <strong className="workspace-picker-empty">
+                          <b>クリックして立ち絵を選択</b>
+                          <em>表情セットの元になる1枚です。<br />この画面へのドラッグ&ドロップでも設定できます。</em>
+                        </strong>
+                      )}
+                      <small title={workspaceFiles.source}>{workspaceFiles.source ? workspaceFileName(workspaceFiles.source) : "PNG / JPG / WebP"}</small>
                     </button>
                     {workspaceFiles.source && (
                       <button className="workspace-image-clear" title="立ち絵の選択を解除" onClick={() => clearWorkspaceImage("source")}>✕ クリア</button>
@@ -2141,9 +2153,16 @@ function App() {
                   </div>
                   <div className="workspace-image-picker-cell">
                     <button className={`workspace-image-picker${workspaceFiles.reference ? " ready" : ""}`} onClick={() => void pickWorkspaceImage("reference")}>
-                      <span>参照画像</span>
-                      {workspaceImagePreviews.reference ? <img src={workspaceImagePreviews.reference} alt="参照画像プレビュー" /> : <strong>選択</strong>}
-                      <small title={workspaceFiles.reference}>{workspaceFiles.reference ? workspaceFileName(workspaceFiles.reference) : "任意: 使うと目・口内の色が元絵に近づきます"}</small>
+                      <span>参照画像（任意）</span>
+                      {workspaceImagePreviews.reference ? (
+                        <img src={workspaceImagePreviews.reference} alt="参照画像プレビュー" />
+                      ) : (
+                        <strong className="workspace-picker-empty">
+                          <b>クリックして参照画像を選択</b>
+                          <em>同じキャラクターの別ポーズや口を開けた絵があると、<br />Codex生成の目・口内の色や質感が元絵に近づきます。<br />なければ空のままで進めます。</em>
+                        </strong>
+                      )}
+                      <small title={workspaceFiles.reference}>{workspaceFiles.reference ? workspaceFileName(workspaceFiles.reference) : "設定しない場合はそのまま次へ"}</small>
                     </button>
                     {workspaceFiles.reference && (
                       <button className="workspace-image-clear" title="参照画像の選択を解除" onClick={() => clearWorkspaceImage("reference")}>✕ クリア</button>
@@ -2161,61 +2180,63 @@ function App() {
                 <div className="workspace-panel-heading">
                   <span>STEP 2</span>
                   <h3>Codex依頼を作成</h3>
-                  <p>この工程の生成はアプリの外（Codex）で行います。依頼ファイルを作成 → Codexに生成させる → 成果物を <code>02_generated_parts</code> に配置、の順で進みます。</p>
+                  <p>この工程の画像生成はアプリの外（Codex）で行います。左から順に 1 → 2 → 3 と進めてください。</p>
                 </div>
                 <div className="workspace-codex-steps">
                   <section className={`workspace-codex-card${codexPhase === 1 ? " current" : ""}`}>
                     <div>
                       <span>1</span>
-                      <strong>依頼ファイル作成 {codexPhase === 1 && <em className="workspace-phase-badge">いまここ</em>}{codexPhase > 1 && <em className="workspace-phase-done">✓ 済み</em>}</strong>
-                      <p>Codexへ渡す説明書と元画像を <code>01_codex_request</code> に作成します。</p>
+                      <strong>依頼ファイルを作成 {codexPhase === 1 && <em className="workspace-phase-badge">いまここ</em>}{codexPhase > 1 && <em className="workspace-phase-done">✓ 済み</em>}</strong>
+                      <p>
+                        Codexへの指示書（<code>codex_request.md</code>）と元画像を
+                        <code>01_codex_request</code> フォルダに書き出します。
+                        プロンプトを考える必要はありません。
+                      </p>
                     </div>
                     <div className="workspace-action-row">
-                      <button className="btn btn-secondary" onClick={() => revealItemInDir(workspace.codexRequestPath).catch(() => {})}>依頼フォルダを開く</button>
-                      <button
-                        className="btn btn-secondary"
-                        disabled={!workspaceGeneratedStatus?.requestPath}
-                        title="依頼ファイルのパスをコピー（Codexへの指示に貼り付け）"
-                        onClick={() => {
-                          if (!workspaceGeneratedStatus?.requestPath) return;
-                          void navigator.clipboard.writeText(workspaceGeneratedStatus.requestPath).then(() => showToast("依頼ファイルのパスをコピーしました"));
-                        }}
-                      >パスをコピー</button>
                       <button className="btn btn-primary" disabled={workspaceBusy || !workspaceFiles.source} onClick={() => void prepareWorkspaceCodexRequest()}>依頼ファイルを作成</button>
                     </div>
                   </section>
                   <section className={`workspace-codex-card${codexPhase === 2 ? " current" : ""}`}>
                     <div>
                       <span>2</span>
-                      <strong>Codexで生成（アプリ外の作業） {codexPhase === 2 && <em className="workspace-phase-badge">いまここ</em>}{codexPhase > 2 && <em className="workspace-phase-done">✓ 済み</em>}</strong>
-                      <p>依頼フォルダの内容をCodexに渡して表情パーツを生成させ、出来上がった画像を <code>02_generated_parts</code> に置いてください。配置は5秒ごとに自動確認します。</p>
+                      <strong>Codexで生成（アプリ外） {codexPhase === 2 && <em className="workspace-phase-badge">いまここ</em>}{codexPhase > 2 && <em className="workspace-phase-done">✓ 済み</em>}</strong>
+                      <p>
+                        <code>01_codex_request</code> を<b>フォルダごと</b>Codexへ渡すだけでOKです
+                        （何を作るかの指示はすべて <code>codex_request.md</code> に書いてあります）。
+                        生成された表情パーツのPNGを <code>02_generated_parts</code> に置いてください。
+                      </p>
                     </div>
                     <div className="workspace-action-row">
+                      <button className="btn btn-secondary" onClick={() => revealItemInDir(workspace.codexRequestPath).catch(() => {})}>依頼フォルダを開く</button>
                       <button className="btn btn-secondary" onClick={() => revealItemInDir(workspace.generatedPartsPath).catch(() => {})}>配置フォルダを開く</button>
                     </div>
                   </section>
                   <section className={`workspace-codex-card${codexPhase === 3 ? " current" : ""}`}>
                     <div>
                       <span>3</span>
-                      <strong>配置確認 {codexPhase === 3 && <em className="workspace-phase-done">✓ 揃いました</em>}</strong>
-                      <div className="workspace-status-card compact">
-                        <strong>{workspaceGeneratedStatus?.ready ? "成果物は揃っています" : codexPhase === 2 ? "配置を自動確認しています..." : "依頼ファイル作成後に確認できます"}</strong>
-                        <span>必要: {workspaceGeneratedStatus?.expectedParts.length ?? 7} / 配置済み: {workspaceGeneratedStatus?.presentParts.length ?? 0}</span>
-                        {workspaceGeneratedStatus && (
-                          <div className="workspace-parts-checklist">
-                            {workspaceGeneratedStatus.expectedParts.map(part => {
-                              const present = workspaceGeneratedStatus.presentParts.includes(part);
-                              const mismatch = workspaceGeneratedStatus.sizeMismatches.includes(part);
-                              return (
-                                <span key={part} className={mismatch ? "mismatch" : present ? "present" : "missing"} title={mismatch ? "サイズが立ち絵と一致していません" : undefined}>
-                                  {mismatch ? "⚠" : present ? "✓" : "✗"} {part}
-                                </span>
-                              );
-                            })}
-                          </div>
-                        )}
-                        {!!workspaceGeneratedStatus?.sizeMismatches.length && <small>⚠ サイズ不一致: 立ち絵と同じ縦横サイズで再生成してください</small>}
-                      </div>
+                      <strong>配置を確認 {codexPhase === 3 ? <em className="workspace-phase-done">✓ 揃いました</em> : codexPhase === 2 ? <em className="workspace-phase-badge">自動確認中</em> : null}</strong>
+                      <p>
+                        {workspaceGeneratedStatus?.ready
+                          ? "必要なファイルがすべて揃いました。「次へ」でSee-Through分解に進めます。"
+                          : codexPhase === 2
+                            ? `配置状況を5秒ごとに自動確認しています（配置済み ${workspaceGeneratedStatus?.presentParts.length ?? 0}/${workspaceGeneratedStatus?.expectedParts.length ?? 7}）。`
+                            : "依頼ファイルを作成すると、必要なファイルの一覧がここに表示されます。"}
+                      </p>
+                      {workspaceGeneratedStatus && (
+                        <div className="workspace-parts-checklist">
+                          {workspaceGeneratedStatus.expectedParts.map(part => {
+                            const present = workspaceGeneratedStatus.presentParts.includes(part);
+                            const mismatch = workspaceGeneratedStatus.sizeMismatches.includes(part);
+                            return (
+                              <span key={part} className={mismatch ? "mismatch" : present ? "present" : "missing"} title={mismatch ? "サイズが立ち絵と一致していません。立ち絵と同じ縦横サイズで再生成してください" : undefined}>
+                                <b>{mismatch ? "⚠" : present ? "✓" : "・"}</b>{part}
+                                <i>{mismatch ? "サイズ不一致" : present ? "配置済み" : "未配置"}</i>
+                              </span>
+                            );
+                          })}
+                        </div>
+                      )}
                     </div>
                     <div className="workspace-action-row">
                       <button className="btn btn-primary" disabled={workspaceBusy} onClick={() => void inspectWorkspaceGeneratedParts()}>いますぐ確認</button>
@@ -2550,7 +2571,11 @@ function App() {
             <div className="primary-workflow-copy">
               <span className="workflow-kicker">NEW WORKSPACE</span>
               <strong>はじめから</strong>
-              <p>作業フォルダを選択して、画像選択からSpriTalk用出力まで順番に進めます。</p>
+              <p>
+                新しいキャラクターの作業を開始します。空のフォルダを作業フォルダとして選ぶと、
+                画像選択 → Codex依頼 → See-Through分解 → 素体調整 → 差分位置調整 → RIFE補完 → モーション調整
+                の7ステップを順番に進めて、SpriTalk用の素材一式を出力します。
+              </p>
             </div>
             <span className="primary-workflow-cta">作業フォルダを選択</span>
           </button>
@@ -2558,9 +2583,13 @@ function App() {
             <div className="primary-workflow-copy">
               <span className="workflow-kicker">RESUME</span>
               <strong>つづきから</strong>
-              <p>既存の作業フォルダを選択して、保存済みの工程から再開します。</p>
+              <p>
+                中断した作業を再開します。「はじめから」で使った作業フォルダ
+                （<code>project.json</code> が保存されているフォルダ）を選ぶと、
+                前回の工程まで自動で復元します。それ以外のフォルダを選ぶとエラーになります。
+              </p>
             </div>
-            <span className="primary-workflow-cta">既存フォルダを開く</span>
+            <span className="primary-workflow-cta">作業フォルダを開く</span>
           </button>
         </section>
       </main>
@@ -2851,12 +2880,11 @@ function App() {
 
       {mode !== "workspace" && (
         <div className="status-bar">
-          {error && <span className="error-msg">{error}</span>}
-          {!error && status}
+          {status}
         </div>
       )}
 
-      {mode === "workspace" && error && (
+      {error && (
         <div className="workspace-error-banner" role="alert">
           <strong>エラー</strong>
           <span>{error}</span>
