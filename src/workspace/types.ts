@@ -144,6 +144,11 @@ export function sanitizeSeeThroughLogMessage(message: string): string {
   if (/Loading pipeline components|Loading weights|Loading checkpoint/i.test(cleaned)) {
     return "モデルを読み込んでいます";
   }
+  // 初回や cache が空の時はモデルをHuggingFaceからDLするため、この状態が長く続くことがある（正常）
+  if (/hf_hub_download|Downloading|\.safetensors|resolve\/main/i.test(cleaned)) {
+    return "モデルをダウンロードしています（初回は時間がかかります）";
+  }
+  if (/running layerdiff/i.test(cleaned)) return "レイヤーを分解しています";
   if (/running marigold/i.test(cleaned)) return "深度を推定しています";
   cleaned = cleaned
     // "100%|██████| 5/5 [00:02<00:00, 1.59it/s]" のようなtqdm断片を除去
