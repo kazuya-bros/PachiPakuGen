@@ -1021,7 +1021,7 @@ fn extract_codex_generated_parts_inner(
             }
             if let Some(note) = &source_result.oom_retry_note {
                 warnings.push(format!(
-                    "元画像: GPU VRAM不足のため自動リトライしました（{note}）"
+                    "元画像: GPUエラーのため自動リトライしました（{note}）"
                 ));
             }
             snapshot_current_decomposition(&app).ok_or_else(|| {
@@ -1098,7 +1098,7 @@ fn extract_codex_generated_parts_inner(
         }
         if let Some(note) = &see_through_result.oom_retry_note {
             warnings.push(format!(
-                "{part}: GPU VRAM不足のため自動リトライしました（{note}）"
+                "{part}: GPUエラーのため自動リトライしました（{note}）"
             ));
         }
         let state = app.state::<AppState>();

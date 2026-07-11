@@ -546,13 +546,14 @@ fn run_inference_with_recovery(
             result.split_parts_fallback = true;
             return Ok(result);
         } else if allow_oom_retry && is_cuda_oom_failure(&error) {
-            match oom_retry_plan(&selected_profile, options.as_ref()) {
+            let quantization_kernel_issue = is_quantization_kernel_failure(&error);
+            match oom_retry_plan(&selected_profile, options.as_ref(), quantization_kernel_issue) {
                 Some((retry_profile, retry_options, note)) => {
                     emit_progress(
                         app,
                         "inference",
                         5,
-                        &format!("GPU VRAM不足のため、{note}して再実行しています"),
+                        &format!("GPUエラーが発生したため、{note}して再実行しています"),
                     );
                     let mut result = run_inference_with_recovery(
                         app,
@@ -565,10 +566,11 @@ fn run_inference_with_recovery(
                     result.oom_retry_note = Some(note);
                     return Ok(result);
                 }
-                None => return Err(augment_oom_error(error)),
+                None => return Err(augment_oom_error(error, quantization_kernel_issue)),
             }
         } else if is_cuda_oom_failure(&error) {
-            return Err(augment_oom_error(error));
+            let quantization_kernel_issue = is_quantization_kernel_failure(&error);
+            return Err(augment_oom_error(error, quantization_kernel_issue));
         } else {
             return Err(error);
         }
@@ -612,22 +614,45 @@ fn is_lr_split_failure(error: &AppError) -> bool {
     text.contains("lr_split") || text.contains("further_extr")
 }
 
-/// GPU VRAM不足（CUDA/cuBLASのメモリ確保失敗）由来の失敗か
+/// CUDA/cuBLASのメモリ確保失敗（cublasCreate等）由来の失敗か。
+/// 注意: この失敗はVRAM不足そのものより、bitsandbytes 4bit量子化カーネルが
+/// GPUアーキテクチャ/ドライバと非互換なケースで起きることが多い（is_quantization_kernel_failure参照）
 fn is_cuda_oom_failure(error: &AppError) -> bool {
     let text = error.to_string();
     text.contains("CUBLAS_STATUS_ALLOC_FAILED")
+        || text.contains("cublasCreate")
         || text.contains("CUDA out of memory")
         || text.contains("OutOfMemoryError")
         || (text.contains("CUDA error") && text.contains("memory"))
 }
 
-/// OOM発生時に安全に一度だけ試せる、より軽い実行設定を返す
+/// bitsandbytesの4bit量子化演算（matmul_4bit等）の最中に失敗したか。
+/// 新しいGPUアーキテクチャ（例: Blackwell）ではbitsandbytesの同梱カーネルが
+/// 未対応で、テキストエンコーダのような小さな処理でも即座に失敗することがある。
+/// この場合はVRAMを空けても直らず、量子化を使わない高VRAMプロファイルへの
+/// 切り替えが最も有効な回避策になる
+fn is_quantization_kernel_failure(error: &AppError) -> bool {
+    let text = error.to_string();
+    text.contains("bitsandbytes") && (text.contains("matmul_4bit") || text.contains("cublasCreate"))
+}
+
+/// OOM/CUDAエラー発生時に安全に一度だけ試せる、より成功しやすい実行設定を返す
 /// (再試行プロファイル, 再試行オプション, 変更内容の説明文)。
 /// これ以上緩和できる設定が無ければ None（自動リトライしない）
 fn oom_retry_plan(
     selected_profile: &str,
     options: Option<&SeeThroughOptions>,
+    quantization_kernel_issue: bool,
 ) -> Option<(String, Option<SeeThroughOptions>, String)> {
+    if selected_profile == "low-vram" && quantization_kernel_issue {
+        // bitsandbytesの4bit量子化カーネルがこのGPU/ドライバでは動作しない可能性が高い。
+        // オフロードを強めても直らないため、量子化を使わない高VRAMプロファイルへ切り替える
+        return Some((
+            "standard".to_string(),
+            options.cloned(),
+            "量子化(bitsandbytes)を使わない高VRAMプロファイルへ切替".to_string(),
+        ));
+    }
     if selected_profile != "low-vram" {
         // 高VRAMプロファイルでのOOM: より軽い省VRAM（量子化）プロファイルへ切り替え
         return Some((
@@ -636,7 +661,8 @@ fn oom_retry_plan(
             "省VRAMプロファイルへ切り替え".to_string(),
         ));
     }
-    // 既に省VRAMプロファイル: CPU/グループオフロードを強制有効化して再試行（一度のみ）
+    // 既に省VRAMプロファイル・量子化カーネル起因でもない: CPU/グループオフロードを
+    // 強制有効化して再試行（一度のみ。純粋なメモリ不足のケース向け）
     let mut next = options.cloned().unwrap_or_default();
     let already_maxed =
         next.cpu_offload.as_deref() == Some("on") && next.group_offload.as_deref() == Some("on");
@@ -652,13 +678,19 @@ fn oom_retry_plan(
     ))
 }
 
-/// 自動リトライ済み、またはこれ以上緩和できる設定が無いOOMエラーに、対処のヒントを添える
-fn augment_oom_error(error: AppError) -> AppError {
-    AppError::General(format!(
-        "{error}\n\nGPUのVRAM不足（CUDA/cuBLASのメモリ確保失敗）が原因の可能性があります。\
+/// 自動リトライ済み、またはこれ以上緩和できる設定が無いOOM/CUDAエラーに、対処のヒントを添える
+fn augment_oom_error(error: AppError, quantization_kernel_issue: bool) -> AppError {
+    let hint = if quantization_kernel_issue {
+        "bitsandbytesの4bit量子化演算がこのGPU（新しいアーキテクチャの可能性）で失敗している様子です。\
+VRAM不足ではなく、量子化カーネルとGPU/ドライバの非互換が原因と考えられます。\
+STEP3の実行プロファイルを「高VRAM」に切り替えて再実行してください（今回は自動切替も失敗しています。\
+高VRAMプロファイルは量子化を使わないため、多くの場合これで解消します）。"
+    } else {
+        "GPUのVRAM不足（CUDA/cuBLASのメモリ確保失敗）が原因の可能性があります。\
 他にGPUを使用しているアプリ（ブラウザ・ゲーム・他のAI処理等）を終了する、\
 STEP3の「使用GPU」でVRAMに余裕のあるGPUへ切り替える、のいずれかを試してから再実行してください。"
-    ))
+    };
+    AppError::General(format!("{error}\n\n{hint}"))
 }
 
 fn append_inference_options(
