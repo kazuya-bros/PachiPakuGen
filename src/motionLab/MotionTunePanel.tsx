@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { openPath } from "@tauri-apps/plugin-opener";
 import type {
   MotionLabEffectKey,
   MotionLabImageSet,
@@ -623,7 +623,7 @@ export function MotionTunePanel({ partsDir, active = true, onNotify, onError }: 
             <button
               className="btn btn-secondary"
               disabled={busy || !parts}
-              onClick={() => { if (parts) void revealItemInDir(parts.sourceDir); }}
+              onClick={() => { if (parts) void openPath(parts.sourceDir); }}
             >
               出力フォルダを開く
             </button>

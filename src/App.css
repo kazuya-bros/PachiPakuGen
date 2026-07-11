@@ -708,7 +708,8 @@ body {
   gap: 8px;
 }
 
-.workspace-codex-card span {
+/* 工程番号バッジ（direct childのみ。チェックリスト等の子孫spanに当てない） */
+.workspace-codex-card > div:first-child > span {
   display: grid;
   width: 28px;
   height: 28px;
@@ -829,9 +830,9 @@ body {
 .workspace-seethrough-options {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(260px, 0.55fr);
-  gap: 12px;
+  gap: 10px;
   max-width: 920px;
-  margin: 22px auto 0;
+  margin: 10px auto 0;
 }
 
 .workspace-option-card {
@@ -942,20 +943,20 @@ body {
 
 .workspace-start-seethrough {
   display: grid;
-  gap: 18px;
+  gap: 12px;
   justify-items: center;
   max-width: 920px;
-  margin: 34px auto 0;
+  margin: 16px auto 0;
   text-align: center;
 }
 
 .workspace-start-seethrough strong {
   color: var(--text-primary);
-  font-size: 20px;
+  font-size: 17px;
 }
 
 .workspace-start-seethrough p {
-  margin: 8px 0 0;
+  margin: 4px 0 0;
   color: var(--text-secondary);
   font-size: 13px;
 }
@@ -2638,7 +2639,8 @@ body {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(300px, 390px) minmax(0, 1fr);
+  /* レイヤー管理が主役: サイドバーを広め（プレビューは狭くてよい） */
+  grid-template-columns: minmax(340px, 440px) minmax(0, 1fr);
   grid-template-rows: minmax(260px, 1fr) auto auto;
   gap: 0;
 }
@@ -5849,14 +5851,30 @@ body {
 .workspace-gpu-select select {
   flex: 1;
   min-width: 0;
+  height: 34px;
+  padding: 0 9px;
+  border: 1px solid var(--border-color);
+  border-radius: 0;
+  background: var(--panel-bg);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
 }
 
-/* 素体調整: 左パネルのグループ化 */
+.workspace-gpu-select select:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+/* 素体調整: 左パネルのグループ化（1グループ=1行のコンパクト表示。
+   レイヤーリストの縦領域を最大化するため見出しは左の固定幅カラムに置く） */
 .layer-bulk-section {
   display: grid;
-  gap: 4px;
-  padding: 6px 0;
-  border-bottom: 1px solid var(--border-color);
+  grid-template-columns: 78px minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
 }
 
 .layer-bulk-section > small {
@@ -5864,4 +5882,15 @@ body {
   font-size: 10.5px;
   font-weight: 700;
   letter-spacing: 0.04em;
+}
+
+.layer-bulk-body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+.layer-bulk-body .layer-arm-split-toggle {
+  padding: 0 4px 0 0;
 }

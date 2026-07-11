@@ -3,7 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, save } from "@tauri-apps/plugin-dialog";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { openPath } from "@tauri-apps/plugin-opener";
 import "./App.css";
 
 
@@ -1207,7 +1207,7 @@ function App() {
   }
 
   async function openOutputFolder() {
-    if (outputPath) try { await revealItemInDir(outputPath); } catch (_) {}
+    if (outputPath) try { await openPath(outputPath); } catch (_) {}
   }
 
   async function handleCreateMouthMasks() {
@@ -2201,11 +2201,11 @@ function App() {
                     <div>
                       <span>2</span>
                       <strong>Codexで生成（アプリ外） {codexPhase === 2 && <em className="workspace-phase-badge">いまここ</em>}{codexPhase > 2 && <em className="workspace-phase-done">✓ 済み</em>}</strong>
-                      <p><code>01_codex_request</code> を<b>フォルダごと</b>Codexへ渡し（指示は同梱済み）、生成されたPNGを <code>02_generated_parts</code> に置いてください。</p>
+                      <p><code>01_codex_request</code> を<b>フォルダごと</b>Codexへ渡してください（指示は同梱済み）。生成物は通常Codexが <code>02_generated_parts</code> へ自動配置します。</p>
                     </div>
                     <div className="workspace-action-row">
-                      <button className="btn btn-secondary" onClick={() => revealItemInDir(workspace.codexRequestPath).catch(() => {})}>依頼フォルダを開く</button>
-                      <button className="btn btn-secondary" onClick={() => revealItemInDir(workspace.generatedPartsPath).catch(() => {})}>配置フォルダを開く</button>
+                      <button className="btn btn-secondary" onClick={() => openPath(workspace.codexRequestPath).catch(() => {})}>依頼フォルダを開く</button>
+                      <button className="btn btn-secondary" onClick={() => openPath(workspace.generatedPartsPath).catch(() => {})}>配置フォルダを開く</button>
                     </div>
                   </section>
                   <section className={`workspace-codex-card${codexPhase === 3 ? " current" : ""}`}>
@@ -2543,7 +2543,7 @@ function App() {
           <div className="workspace-next-area">
             {nextStepBlockReason() && <small className="workspace-next-hint">{nextStepBlockReason()}</small>}
             {workspaceStep >= 7 ? (
-              <button className="btn btn-primary" disabled={workspaceBusy} onClick={() => revealItemInDir(workspaceRifeResult?.outputPath || workspace.spritalkPartsPath).catch(() => {})}>出力フォルダを開く</button>
+              <button className="btn btn-primary" disabled={workspaceBusy} onClick={() => openPath(workspaceRifeResult?.outputPath || workspace.spritalkPartsPath).catch(() => {})}>出力フォルダを開く</button>
             ) : (
               <button
                 className="btn btn-primary"
@@ -2714,14 +2714,14 @@ function App() {
               </div>
               <div className="layer-bulk-section">
                 <small>表示</small>
-                <div className="layer-bulk-row">
+                <div className="layer-bulk-body">
                   <button className="btn-layer-bulk" onClick={() => void setAllLayerVisibility(true)}>全ON</button>
                   <button className="btn-layer-bulk" onClick={() => void setAllLayerVisibility(false)}>全OFF</button>
                 </div>
               </div>
               <div className="layer-bulk-section">
                 <small>透明度</small>
-                <div className="layer-bulk-row">
+                <div className="layer-bulk-body">
                   <button className="btn-layer-bulk" onClick={() => void setAllBodyOpacities(1)}>全100%</button>
                   <button className="btn-layer-bulk" onClick={() => void setAllBodyOpacities(0.5)}>全50%</button>
                   <button className="btn-layer-bulk" onClick={() => void setAllBodyOpacities(0)}>全0%</button>
@@ -2730,38 +2730,38 @@ function App() {
               {!!expressionWorkspace && (
                 <div className="layer-bulk-section">
                   <small>並び順</small>
-                  <div className="layer-bulk-row">
+                  <div className="layer-bulk-body">
                     <button className="btn-layer-bulk" title="SpriTalk向けの標準的な前後関係（後ろ髪→体→目口→前髪）に並べ直します" onClick={() => void applyRecommendedLayerOrder()}>推奨順に並べ直す</button>
                   </div>
                 </div>
               )}
               <div className="layer-bulk-section">
-                <small>揺れ用パーツの分離</small>
+                <small>揺れ用の分離</small>
+                <div className="layer-bulk-body">
                   {armSplitLayers.length > 0 && (
                     <label className="layer-arm-split-toggle" title="腕レイヤー（handwear-l/-r）を arm_l.png / arm_r.png として分離出力します。腕揺れ用">
                       <input type="checkbox" checked={armSplitActive} onChange={(e) => toggleArmSplit(e.target.checked)} />
-                      <span>腕（arm_l / arm_r）</span>
+                      <span>腕</span>
                     </label>
                   )}
                   {earSplitLayers.length > 0 && (
                     <label className="layer-arm-split-toggle" title="獣耳レイヤー（ears-l/-r または headwear）を sway_ear*.png として分離出力します。獣耳ピコピコ用">
                       <input type="checkbox" checked={earSplitActive} onChange={(e) => toggleEarSplit(e.target.checked)} />
-                      <span>獣耳（sway_ear*）</span>
+                      <span>獣耳</span>
                     </label>
                   )}
-                  <div className="layer-bulk-row">
-                    <button
-                      className={`btn-layer-bulk${chestMaskDataUrl ? " active" : ""}`}
-                      title="See-Throughにはchestレイヤーが無いため、bodyから胸部を塗って手動で切り出します（胸揺れ用）"
-                      onClick={initChestCut}
-                    >
-                      胸を切出{chestMaskDataUrl ? "（済み）" : ""}
-                    </button>
-                    {chestMaskDataUrl && (
-                      <button className="btn-layer-bulk" onClick={() => setChestMaskDataUrl(null)}>取消</button>
-                    )}
-                  </div>
+                  <button
+                    className={`btn-layer-bulk${chestMaskDataUrl ? " active" : ""}`}
+                    title="See-Throughにはchestレイヤーが無いため、bodyから胸部を塗って手動で切り出します（胸揺れ用）"
+                    onClick={initChestCut}
+                  >
+                    胸を切出{chestMaskDataUrl ? "済" : ""}
+                  </button>
+                  {chestMaskDataUrl && (
+                    <button className="btn-layer-bulk" onClick={() => setChestMaskDataUrl(null)}>取消</button>
+                  )}
                 </div>
+              </div>
               <div className="layer-sidebar-list">
                 {layerOrder.map((name, idx) => {
                   const layer = getBodyOrderItem(name);
