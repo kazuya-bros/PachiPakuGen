@@ -675,11 +675,12 @@ fn adjust_codex_extracted_parts_inner(
     }
     let originals_dir = extracted_dir.join("original_extracted_parts");
     fs::create_dir_all(&originals_dir)?;
-    // eyes-open は source 由来で最初から位置が合っているため補正対象外
-    // （Codex成果物向けの補正を適用すると逆にズレる）
+    // eyes-open は source 由来で最初から位置が合っている想定のため「全パーツ一括」の
+    // 対象外だが、See-Throughの目レイヤー検出が甘い素材ではズレるため、個別指定でのみ
+    // 調整を許可する（一括のCodex向け補正が巻き添えで適用されることはない）
     let target_parts: Vec<&str> = match request.part.as_deref() {
         Some(part) => {
-            if !GENERATED_PART_TARGETS.contains(&part) {
+            if part != "eyes-open" && !GENERATED_PART_TARGETS.contains(&part) {
                 return Err(AppError::General(format!(
                     "調整対象外のパーツです: {part}"
                 )));
@@ -1352,6 +1353,19 @@ fn regenerate_eyes_open_from_source(
     let originals_dir = extracted_dir.join("original_extracted_parts");
     fs::create_dir_all(&originals_dir)?;
     eyes_open.save(originals_dir.join("eyes-open.png"))?;
+    // STEP5でeyes-openの個別補正が保存済みなら、再生成したピクセルにも同じ補正を
+    // 再適用する（STEP3をやり直すたびにユーザーの位置調整が黙って消えるのを防ぐ）
+    if let Some(adjustment) = read_typed_part_adjustments(extracted_dir).get("eyes-open") {
+        if adjustment.offset_x != 0 || adjustment.offset_y != 0 || adjustment.scale_percent != 100 {
+            let adjusted = transform_extracted_part(
+                &eyes_open,
+                adjustment.offset_x,
+                adjustment.offset_y,
+                adjustment.scale_percent,
+            );
+            adjusted.save(extracted_dir.join("eyes-open.png"))?;
+        }
+    }
     Ok(())
 }
 
@@ -2185,7 +2199,24 @@ fn ensure_eyes_open_part(
     } else {
         source_image
     };
-    cut_image_with_mask(&source_image, &mask).save(eyes_open)?;
+    let raw_eyes_open = cut_image_with_mask(&source_image, &mask);
+    raw_eyes_open.save(&eyes_open)?;
+    // 補正の基準になる原本も残す（無いとSTEP5適用時に補正済み画像を原本と誤認し二重適用になる）
+    let originals_dir = extracted_dir.join("original_extracted_parts");
+    fs::create_dir_all(&originals_dir)?;
+    raw_eyes_open.save(originals_dir.join("eyes-open.png"))?;
+    // 保存済みのeyes-open個別補正があれば再適用（regenerate_eyes_open_from_sourceと同じ扱い）
+    if let Some(adjustment) = read_typed_part_adjustments(extracted_dir).get("eyes-open") {
+        if adjustment.offset_x != 0 || adjustment.offset_y != 0 || adjustment.scale_percent != 100 {
+            transform_extracted_part(
+                &raw_eyes_open,
+                adjustment.offset_x,
+                adjustment.offset_y,
+                adjustment.scale_percent,
+            )
+            .save(&eyes_open)?;
+        }
+    }
     Ok(())
 }
 

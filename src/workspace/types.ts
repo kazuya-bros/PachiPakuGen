@@ -197,15 +197,18 @@ export function workspacePreviewItemLabel(item: WorkspacePreviewItem): string {
   return isRifePreviewItem(item) ? `${item.part} ${item.frameIndex}/${item.frameCount}` : item.part;
 }
 
-// Step5でパーツ個別調整できる対象（eyes-openはsource由来のため対象外）
+// Step5でパーツ個別調整できる対象。
+// eyes-open はsource由来で通常はズレないため「全パーツ一括」の対象外だが、
+// See-Throughの目レイヤー検出が甘い素材向けに個別選択でのみ調整できる
 export const WORKSPACE_ADJUST_PART_KEYS = [
+  "eyes-open",
+  "eyes-closed",
   "mouth-closed",
   "mouth-a",
   "mouth-i",
   "mouth-u",
   "mouth-e",
   "mouth-o",
-  "eyes-closed",
 ];
 
 export interface GenerateCodexRifeOutputResult {

@@ -1729,14 +1729,11 @@ function App() {
       };
       setWorkspaceRifeResult(null);
       setWorkspaceRifePreview(null);
-      // 調整済みバッジ: 個別適用は対象パーツ、一括適用は全対象パーツを記録
+      // 調整済みバッジ: バックエンドが実際に適用したパーツを記録
+      // （一括適用はeyes-open対象外のため、静的リストではなく戻り値を使う）
       setWorkspaceAdjustedParts(prev => {
         const next = { ...prev };
-        if (workspaceAdjustTarget === "all") {
-          for (const part of WORKSPACE_ADJUST_PART_KEYS) next[part] = true;
-        } else {
-          next[workspaceAdjustTarget] = true;
-        }
+        for (const part of result.adjustedParts) next[part] = true;
         return next;
       });
       await refreshWorkspaceCompositePreview().catch(() => null);
@@ -2520,7 +2517,7 @@ function App() {
                 </div>
                 <div className="motion-lab-note">
                   変更（ドラッグ・矢印・数値入力）は約0.5秒後に自動で保存されます。補正値はパーツごとに元画像基準の絶対値で保存され（adjustment.json v2）、対象を切り替えるとそのパーツの現在値が表示されます。
-                  eyes-open は元画像由来のため補正対象外です。「パーツ移動」ON中は矢印キーでも±1px（Shiftで±10px）動かせます。
+                  eyes-open は元画像由来のため「全パーツ一括」の対象外ですが、目の検出がズレた素材向けに個別選択で調整できます（STEP3をやり直しても調整は引き継がれます）。「パーツ移動」ON中は矢印キーでも±1px（Shiftで±10px）動かせます。
                 </div>
               </>
             )}
