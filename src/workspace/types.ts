@@ -101,10 +101,20 @@ export interface WorkspaceGeneratedPartsStatus {
   sizeMismatches: string[];
   ready: boolean;
 }
+export interface PartAdjustment {
+  offsetX: number;
+  offsetY: number;
+  scalePercent: number;
+}
+
+export const DEFAULT_PART_ADJUSTMENT: PartAdjustment = { offsetX: 0, offsetY: 0, scalePercent: 100 };
+
 export interface ExtractCodexGeneratedPartsResult {
   extractedPartsPath: string;
   extractedParts: string[];
   warnings: string[];
+  /** パーツごとの現在の位置補正値。STEP5でパーツ切替時に実際の値を表示するために使う */
+  partAdjustments: Record<string, PartAdjustment>;
 }
 
 export function isNoisySeeThroughWarning(message: string): boolean {
@@ -213,6 +223,8 @@ export interface AdjustCodexExtractedPartsResult {
   offsetX: number;
   offsetY: number;
   scalePercent: number;
+  /** 適用後のパーツごとの位置補正値（全パーツ分） */
+  partAdjustments: Record<string, PartAdjustment>;
 }
 export interface PrepareCodexExpressionJobResult {
   jobPath: string;

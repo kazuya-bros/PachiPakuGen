@@ -54,6 +54,7 @@ import {
   workspacePreviewItemKey,
   workspacePreviewItemLabel,
   WORKSPACE_ADJUST_PART_KEYS,
+  DEFAULT_PART_ADJUSTMENT,
   EYE_PAIRS,
   MOUTH_PAIRS_SINGLE,
   MOUTH_PAIRS_VOWELS,
@@ -128,6 +129,10 @@ function App() {
   const [workspacePartDragMode, setWorkspacePartDragMode] = useState(false);
   /** Step5で位置補正を適用済みのパーツ（サムネイルのバッジ表示用） */
   const [workspaceAdjustedParts, setWorkspaceAdjustedParts] = useState<Record<string, boolean>>({});
+  /** 直近に「読み込んだ/適用した」値のベースライン。これと一致する間は変更なしとみなし自動適用しない
+   * （対象パーツ切替時に値を復元しても誤って再適用しないため。値の一致だけでなくtargetも見る） */
+  const workspaceAdjustBaseline = useRef({ target: "all", offsetX: 0, offsetY: 0, scalePercent: 100 });
+  const workspaceAdjustDebounceTimer = useRef<number | null>(null);
   /** 完了フィードバック用トースト（3秒で自動消滅） */
   const [toast, setToast] = useState("");
   const toastTimer = useRef<number | null>(null);
@@ -190,6 +195,41 @@ function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [mode, workspaceStep, workspacePartDragMode]);
+
+  // STEP5: オフセット/スケールが読み込み済みベースラインから変化したら、ドラッグ中でなければ
+  // 少し待って自動適用する。「対象パーツ切替による値の読み込み」はベースライン比較で除外され、
+  // 誤って別パーツへ上書き適用してしまう事故を防ぐ
+  useEffect(() => {
+    if (mode !== "workspace" || workspaceStep !== 5) return;
+    const baseline = workspaceAdjustBaseline.current;
+    const unchanged = baseline.target === workspaceAdjustTarget
+      && baseline.offsetX === workspacePartOffsetX
+      && baseline.offsetY === workspacePartOffsetY
+      && baseline.scalePercent === workspacePartScale;
+    if (unchanged || workspacePreviewDragging || !workspaceExtractResult) return;
+    if (workspaceAdjustDebounceTimer.current !== null) window.clearTimeout(workspaceAdjustDebounceTimer.current);
+    workspaceAdjustDebounceTimer.current = window.setTimeout(() => {
+      workspaceAdjustDebounceTimer.current = null;
+      void applyWorkspacePartAdjustment();
+    }, 500);
+    return () => {
+      if (workspaceAdjustDebounceTimer.current !== null) {
+        window.clearTimeout(workspaceAdjustDebounceTimer.current);
+        workspaceAdjustDebounceTimer.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspacePartOffsetX, workspacePartOffsetY, workspacePartScale, workspaceAdjustTarget]);
+
+  /** STEP5: 「対象」切替時、そのパーツの実際の現在値をフィールドへ読み込む（前の対象の値が残るのを防ぐ） */
+  function loadWorkspacePartAdjustmentFields(target: string) {
+    const adjustment = target === "all" ? undefined : workspaceExtractResult?.partAdjustments[target];
+    const values = adjustment ?? DEFAULT_PART_ADJUSTMENT;
+    workspaceAdjustBaseline.current = { target, ...values };
+    setWorkspacePartOffsetX(values.offsetX);
+    setWorkspacePartOffsetY(values.offsetY);
+    setWorkspacePartScale(values.scalePercent);
+  }
 
   // STEP1: 画像ファイルのドラッグ&ドロップ対応（1枚目=立ち絵、2枚目=参照画像）
   useEffect(() => {
@@ -1661,11 +1701,13 @@ function App() {
     if (!expressionWorkspace || !workspaceExtractResult) return;
     setWorkspaceBusy(true);
     try {
+      const appliedOffsetX = offsetOverride?.x ?? workspacePartOffsetX;
+      const appliedOffsetY = offsetOverride?.y ?? workspacePartOffsetY;
       const result = await invoke<AdjustCodexExtractedPartsResult>("adjust_codex_extracted_parts", {
         request: {
           jobPath: expressionWorkspace.workPath,
-          offsetX: offsetOverride?.x ?? workspacePartOffsetX,
-          offsetY: offsetOverride?.y ?? workspacePartOffsetY,
+          offsetX: appliedOffsetX,
+          offsetY: appliedOffsetY,
           scalePercent: workspacePartScale,
           // "all" 以外はそのパーツだけ調整（パーツごとのズレに個別対応）
           part: workspaceAdjustTarget === "all" ? null : workspaceAdjustTarget,
@@ -1676,7 +1718,15 @@ function App() {
         // 個別適用時は対象1件しか返らないため、一覧は維持する
         extractedParts: workspaceAdjustTarget === "all" ? result.adjustedParts : workspaceExtractResult.extractedParts,
         warnings: workspaceExtractResult.warnings,
+        partAdjustments: result.partAdjustments,
       });
+      // 適用済みの値をベースラインとして記録（同じ値のままでは再適用が走らないように）
+      workspaceAdjustBaseline.current = {
+        target: workspaceAdjustTarget,
+        offsetX: appliedOffsetX,
+        offsetY: appliedOffsetY,
+        scalePercent: workspacePartScale,
+      };
       setWorkspaceRifeResult(null);
       setWorkspaceRifePreview(null);
       // 調整済みバッジ: 個別適用は対象パーツ、一括適用は全対象パーツを記録
@@ -2408,7 +2458,7 @@ function App() {
 
             {workspaceStep === 5 && (
               <>
-                <div className="workspace-panel-heading"><span>STEP 5</span><h3>差分位置を調整</h3><p>右のサムネイルでパーツを選ぶと、プレビューを直接ドラッグして動かせます（離すと適用）。細かい調整は矢印ボタンか矢印キー（Shiftで±10）が便利です。</p></div>
+                <div className="workspace-panel-heading"><span>STEP 5</span><h3>差分位置を調整</h3><p>右のサムネイルか「対象」でパーツを選ぶと、そのパーツの現在の補正値が表示されます。プレビューを直接ドラッグ、矢印ボタン/矢印キー（Shiftで±10）、数値入力のいずれでも動かせ、少し待つと自動で保存されます。</p></div>
                 <div className="workspace-action-row">
                   <div className="workspace-adjust-grid">
                     <label><span>対象</span>
@@ -2418,6 +2468,8 @@ function App() {
                           setWorkspaceAdjustTarget(e.target.value);
                           // パーツ個別を選んだら即ドラッグで動かせるように自動ON（一括ではOFF）
                           setWorkspacePartDragMode(e.target.value !== "all");
+                          // 前の対象の値が残らないよう、選んだパーツの実際の現在値を読み込む
+                          loadWorkspacePartAdjustmentFields(e.target.value);
                         }}
                       >
                         <option value="all">全パーツ一括</option>
@@ -2460,14 +2512,14 @@ function App() {
                   <button
                     className="btn btn-secondary"
                     disabled={workspaceBusy}
-                    title="X/Y/Scaleの入力値を 0 / 0 / 100% に戻します（適用は別途）"
+                    title="X/Y/Scaleを 0 / 0 / 100% に戻します（少し待つと自動で適用されます）"
                     onClick={() => { setWorkspacePartOffsetX(0); setWorkspacePartOffsetY(0); setWorkspacePartScale(100); }}
                   >0に戻す</button>
                   <button className="btn btn-secondary" disabled={workspaceBusy || !workspaceExtractResult} onClick={() => void updateWorkspaceCompositePreview()}>合成プレビューを更新</button>
-                  <button className="btn btn-primary" disabled={workspaceBusy || !workspaceExtractResult} onClick={() => void applyWorkspacePartAdjustment()}>位置調整を適用</button>
+                  <button className="btn btn-primary" disabled={workspaceBusy || !workspaceExtractResult} title="待たずにすぐ適用します（通常は自動で適用されるため押さなくてもOK）" onClick={() => void applyWorkspacePartAdjustment()}>今すぐ適用</button>
                 </div>
                 <div className="motion-lab-note">
-                  補正値はパーツごとに元画像基準の絶対値で保存されます（adjustment.json v2）。
+                  変更（ドラッグ・矢印・数値入力）は約0.5秒後に自動で保存されます。補正値はパーツごとに元画像基準の絶対値で保存され（adjustment.json v2）、対象を切り替えるとそのパーツの現在値が表示されます。
                   eyes-open は元画像由来のため補正対象外です。「パーツ移動」ON中は矢印キーでも±1px（Shiftで±10px）動かせます。
                 </div>
               </>
@@ -2521,10 +2573,12 @@ function App() {
                     <button type="button" key={workspacePreviewItemKey(item)} className={workspaceSelectedPreviewPart === workspacePreviewItemKey(item) ? "active" : ""} onClick={() => {
                       const key = workspacePreviewItemKey(item);
                       setWorkspaceSelectedPreviewPart(key);
-                      // Step5ではサムネイル選択＝調整対象の切替＋即ドラッグ可能に
+                      // Step5ではサムネイル選択＝調整対象の切替＋即ドラッグ可能に。
+                      // 前の対象の値が残らないよう、選んだパーツの実際の現在値を読み込む
                       if (workspaceStep === 5 && WORKSPACE_ADJUST_PART_KEYS.includes(key)) {
                         setWorkspaceAdjustTarget(key);
                         setWorkspacePartDragMode(true);
+                        loadWorkspacePartAdjustmentFields(key);
                       }
                     }}>
                       <span>

@@ -106,12 +106,22 @@ pub struct InspectCodexGeneratedPartsResult {
     pub ready: bool,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct PartAdjustment {
+    pub offset_x: i32,
+    pub offset_y: i32,
+    pub scale_percent: u32,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtractCodexGeneratedPartsResult {
     pub extracted_parts_path: String,
     pub extracted_parts: Vec<String>,
     pub warnings: Vec<String>,
+    /// パーツごとの現在の位置補正値（STEP5でパーツ切替時に実際の値を表示するため）
+    pub part_adjustments: std::collections::BTreeMap<String, PartAdjustment>,
 }
 
 #[derive(Serialize)]
@@ -189,6 +199,8 @@ pub struct AdjustCodexExtractedPartsResult {
     pub offset_x: i32,
     pub offset_y: i32,
     pub scale_percent: u32,
+    /// 適用後のパーツごとの位置補正値（全パーツ分。フロント側の表示同期用）
+    pub part_adjustments: std::collections::BTreeMap<String, PartAdjustment>,
 }
 
 #[derive(Serialize)]
@@ -544,6 +556,7 @@ fn read_extracted_parts_result(job_dir: &Path) -> Option<ExtractCodexGeneratedPa
         extracted_parts_path: extracted_dir.to_string_lossy().into_owned(),
         extracted_parts,
         warnings,
+        part_adjustments: read_typed_part_adjustments(&extracted_dir),
     })
 }
 
@@ -718,16 +731,40 @@ fn adjust_codex_extracted_parts_inner(
         }))
         .map_err(|error| AppError::General(format!("adjustment.json作成失敗: {error}")))?,
     )?;
+    let typed_adjustments: std::collections::BTreeMap<String, PartAdjustment> = part_adjustments
+        .into_iter()
+        .filter_map(|(part, value)| {
+            serde_json::from_value::<PartAdjustment>(value)
+                .ok()
+                .map(|adjustment| (part, adjustment))
+        })
+        .collect();
+
     Ok(AdjustCodexExtractedPartsResult {
         extracted_parts_path: extracted_dir.to_string_lossy().into_owned(),
         adjusted_parts,
         offset_x: request.offset_x,
         offset_y: request.offset_y,
         scale_percent: request.scale_percent,
+        part_adjustments: typed_adjustments,
     })
 }
 
-/// adjustment.json（v2）からパーツ個別の調整値を読む
+/// adjustment.json（v2）からパーツごとの位置補正値を読む（STEP5でパーツ切替時の表示用）
+fn read_typed_part_adjustments(
+    extracted_dir: &Path,
+) -> std::collections::BTreeMap<String, PartAdjustment> {
+    read_part_adjustments(extracted_dir)
+        .into_iter()
+        .filter_map(|(part, value)| {
+            serde_json::from_value::<PartAdjustment>(value)
+                .ok()
+                .map(|adjustment| (part, adjustment))
+        })
+        .collect()
+}
+
+/// adjustment.json（v2）からパーツ個別の調整値を読む（生のJSON値のまま）
 fn read_part_adjustments(
     extracted_dir: &Path,
 ) -> std::collections::BTreeMap<String, serde_json::Value> {
@@ -1214,6 +1251,7 @@ fn extract_codex_generated_parts_inner(
         extracted_parts_path: extracted_dir.to_string_lossy().into_owned(),
         extracted_parts,
         warnings,
+        part_adjustments: read_typed_part_adjustments(&extracted_dir),
     })
 }
 
