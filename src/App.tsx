@@ -106,6 +106,9 @@ function App() {
   /** STEP3実行中の工程表示（工程 n/N: ラベル）。null=一括分解以外の処理中 */
   const [seeThroughPhase, setSeeThroughPhase] = useState<{ index: number; total: number; label: string } | null>(null);
   const [seeThroughProfile, setSeeThroughProfile] = useState<SeeThroughProfile>("low-vram");
+  /** 検出済みGPU一覧と選択（null=最大VRAMを自動選択） */
+  const [seeThroughGpus, setSeeThroughGpus] = useState<Array<{ index: number; name: string; memoryMb: number }>>([]);
+  const [seeThroughGpuIndex, setSeeThroughGpuIndex] = useState<number | null>(null);
   /** ユーザーが手動でプロファイルを選んだら、環境確認による推奨自動選択を止める */
   const seeThroughProfileTouched = useRef(false);
   const applyRecommendedSeeThroughProfile = (runtime: SeeThroughRuntimeStatus) => {
@@ -1512,11 +1515,9 @@ function App() {
     try {
       const status = await invoke<WorkspaceGeneratedPartsStatus>("inspect_workspace_generated_parts", { workPath: expressionWorkspace.workPath });
       setWorkspaceGeneratedStatus(status);
-      if (status.ready) {
-        await setWorkspaceStepAndPersist(3);
-        showToast("Codex成果物が揃いました");
-      }
-      setStatus(status.ready ? "Codex成果物が揃いました" : `Codex成果物に不足があります（残り${status.missingParts.length}ファイル）`);
+      // 揃っていても自動でSTEP3へは進めない（進むのはユーザーの「次へ」だけ）
+      if (status.ready) showToast("Codex成果物が揃いました");
+      setStatus(status.ready ? "Codex成果物が揃いました。「次へ」でSee-Throughに進めます" : `Codex成果物に不足があります（残り${status.missingParts.length}ファイル）`);
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -1533,6 +1534,9 @@ function App() {
       const runtime = await invoke<SeeThroughRuntimeStatus>("get_see_through_runtime_status");
       setSeeThroughRuntime(runtime);
       applyRecommendedSeeThroughProfile(runtime);
+      await invoke<Array<{ index: number; name: string; memoryMb: number }>>("list_see_through_gpus")
+        .then(setSeeThroughGpus)
+        .catch(() => setSeeThroughGpus([]));
       setStatus(runtime.message);
       setSeeThroughProgress({ stage: "status", percent: 100, message: runtime.message });
     } catch (cause) {
@@ -2122,7 +2126,7 @@ function App() {
         </nav>
 
         <div
-          className={`workspace-flow-layout${workspaceStep === 1 ? " step-one" : ""}${workspaceStep === 2 || workspaceStep === 3 ? " single-panel" : ""}`}
+          className={`workspace-flow-layout${workspaceStep === 1 ? " step-one" : ""}${workspaceStep >= 2 && workspaceStep <= 4 ? " single-panel" : ""}`}
           style={workspaceStep === 7 ? { display: "none" } : undefined}
         >
           <section className="workspace-flow-panel">
@@ -2180,18 +2184,14 @@ function App() {
                 <div className="workspace-panel-heading">
                   <span>STEP 2</span>
                   <h3>Codex依頼を作成</h3>
-                  <p>この工程の画像生成はアプリの外（Codex）で行います。左から順に 1 → 2 → 3 と進めてください。</p>
+                  <p>この工程の画像生成はアプリの外（Codex）で行います。</p>
                 </div>
                 <div className="workspace-codex-steps">
                   <section className={`workspace-codex-card${codexPhase === 1 ? " current" : ""}`}>
                     <div>
                       <span>1</span>
                       <strong>依頼ファイルを作成 {codexPhase === 1 && <em className="workspace-phase-badge">いまここ</em>}{codexPhase > 1 && <em className="workspace-phase-done">✓ 済み</em>}</strong>
-                      <p>
-                        Codexへの指示書（<code>codex_request.md</code>）と元画像を
-                        <code>01_codex_request</code> フォルダに書き出します。
-                        プロンプトを考える必要はありません。
-                      </p>
+                      <p>PachiPakuGenがCodex向けの指示書と元画像を <code>01_codex_request</code> に書き出します。</p>
                     </div>
                     <div className="workspace-action-row">
                       <button className="btn btn-primary" disabled={workspaceBusy || !workspaceFiles.source} onClick={() => void prepareWorkspaceCodexRequest()}>依頼ファイルを作成</button>
@@ -2201,11 +2201,7 @@ function App() {
                     <div>
                       <span>2</span>
                       <strong>Codexで生成（アプリ外） {codexPhase === 2 && <em className="workspace-phase-badge">いまここ</em>}{codexPhase > 2 && <em className="workspace-phase-done">✓ 済み</em>}</strong>
-                      <p>
-                        <code>01_codex_request</code> を<b>フォルダごと</b>Codexへ渡すだけでOKです
-                        （何を作るかの指示はすべて <code>codex_request.md</code> に書いてあります）。
-                        生成された表情パーツのPNGを <code>02_generated_parts</code> に置いてください。
-                      </p>
+                      <p><code>01_codex_request</code> を<b>フォルダごと</b>Codexへ渡し（指示は同梱済み）、生成されたPNGを <code>02_generated_parts</code> に置いてください。</p>
                     </div>
                     <div className="workspace-action-row">
                       <button className="btn btn-secondary" onClick={() => revealItemInDir(workspace.codexRequestPath).catch(() => {})}>依頼フォルダを開く</button>
@@ -2218,10 +2214,10 @@ function App() {
                       <strong>配置を確認 {codexPhase === 3 ? <em className="workspace-phase-done">✓ 揃いました</em> : codexPhase === 2 ? <em className="workspace-phase-badge">自動確認中</em> : null}</strong>
                       <p>
                         {workspaceGeneratedStatus?.ready
-                          ? "必要なファイルがすべて揃いました。「次へ」でSee-Through分解に進めます。"
+                          ? "すべて揃いました。「次へ」で進んでください。"
                           : codexPhase === 2
-                            ? `配置状況を5秒ごとに自動確認しています（配置済み ${workspaceGeneratedStatus?.presentParts.length ?? 0}/${workspaceGeneratedStatus?.expectedParts.length ?? 7}）。`
-                            : "依頼ファイルを作成すると、必要なファイルの一覧がここに表示されます。"}
+                            ? `5秒ごとに自動確認中（${workspaceGeneratedStatus?.presentParts.length ?? 0}/${workspaceGeneratedStatus?.expectedParts.length ?? 7}）`
+                            : "依頼ファイル作成後に一覧が表示されます。"}
                       </p>
                       {workspaceGeneratedStatus && (
                         <div className="workspace-parts-checklist">
@@ -2229,9 +2225,8 @@ function App() {
                             const present = workspaceGeneratedStatus.presentParts.includes(part);
                             const mismatch = workspaceGeneratedStatus.sizeMismatches.includes(part);
                             return (
-                              <span key={part} className={mismatch ? "mismatch" : present ? "present" : "missing"} title={mismatch ? "サイズが立ち絵と一致していません。立ち絵と同じ縦横サイズで再生成してください" : undefined}>
+                              <span key={part} className={mismatch ? "mismatch" : present ? "present" : "missing"} title={mismatch ? "サイズが立ち絵と一致していません。立ち絵と同じ縦横サイズで再生成してください" : present ? "配置済み" : "未配置"}>
                                 <b>{mismatch ? "⚠" : present ? "✓" : "・"}</b>{part}
-                                <i>{mismatch ? "サイズ不一致" : present ? "配置済み" : "未配置"}</i>
                               </span>
                             );
                           })}
@@ -2270,18 +2265,54 @@ function App() {
                   <div className="workspace-option-card">
                     <span>実行プロファイル</span>
                     <div className="workspace-segmented">
-                      <button className={seeThroughProfile === "low-vram" ? "active" : ""} disabled={workspaceBusy} onClick={() => { seeThroughProfileTouched.current = true; setSeeThroughProfile("low-vram"); }}>
+                      <button
+                        className={seeThroughProfile === "low-vram" ? "active" : ""}
+                        disabled={workspaceBusy}
+                        title="目安: VRAM 8GB級でも動くようモデルを退避しながら実行します（低速）"
+                        onClick={() => { seeThroughProfileTouched.current = true; setSeeThroughProfile("low-vram"); }}
+                      >
                         省VRAM{seeThroughRuntime?.recommendedProfile === "low-vram" && <em className="workspace-recommend-badge">推奨</em>}
                       </button>
-                      <button className={seeThroughProfile === "standard" ? "active" : ""} disabled={workspaceBusy} onClick={() => { seeThroughProfileTouched.current = true; setSeeThroughProfile("standard"); }}>
+                      <button
+                        className={seeThroughProfile === "standard" ? "active" : ""}
+                        disabled={workspaceBusy}
+                        title="目安: VRAM 16GB以上のGPU向け。退避なしで最速です"
+                        onClick={() => { seeThroughProfileTouched.current = true; setSeeThroughProfile("standard"); }}
+                      >
                         高VRAM{seeThroughRuntime?.recommendedProfile === "standard" && <em className="workspace-recommend-badge">推奨</em>}
                       </button>
                     </div>
-                    {seeThroughRuntime?.gpuName && (
-                      <small className="workspace-gpu-info">
-                        GPU: {seeThroughRuntime.gpuName}
-                        {seeThroughRuntime.gpuMemoryMb ? ` (${Math.round(seeThroughRuntime.gpuMemoryMb / 1024)}GB)` : ""}
-                      </small>
+                    <small className="workspace-gpu-info">目安: 省VRAM=8GB級でも可（低速） / 高VRAM=16GB以上（最速）</small>
+                    {seeThroughGpus.length > 0 ? (
+                      <label className="workspace-gpu-select">
+                        <span>使用GPU</span>
+                        <select
+                          value={seeThroughGpuIndex ?? "auto"}
+                          disabled={workspaceBusy}
+                          onChange={(event) => {
+                            const value = event.target.value === "auto" ? null : Number(event.target.value);
+                            setSeeThroughGpuIndex(value);
+                            void invoke("set_see_through_gpu", { gpuIndex: value })
+                              .then(() => invoke<SeeThroughRuntimeStatus>("get_see_through_runtime_status"))
+                              .then(runtime => { setSeeThroughRuntime(runtime); applyRecommendedSeeThroughProfile(runtime); })
+                              .catch(cause => setError(String(cause)));
+                          }}
+                        >
+                          <option value="auto">自動（最大VRAMのGPU）</option>
+                          {seeThroughGpus.map(gpu => (
+                            <option key={gpu.index} value={gpu.index}>
+                              GPU{gpu.index}: {gpu.name}（{Math.round(gpu.memoryMb / 1024)}GB）
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    ) : (
+                      seeThroughRuntime?.gpuName && (
+                        <small className="workspace-gpu-info">
+                          GPU: {seeThroughRuntime.gpuName}
+                          {seeThroughRuntime.gpuMemoryMb ? ` (${Math.round(seeThroughRuntime.gpuMemoryMb / 1024)}GB)` : ""}
+                        </small>
+                      )
                     )}
                   </div>
                   <label className="workspace-toggle-option workspace-option-card">
@@ -2306,7 +2337,6 @@ function App() {
                       <label title="モデルをブロック単位でCPUメモリへ退避してVRAMを節約します。少し遅くなります。VRAM不足エラーが出る時に有効化"><span>Group offload <i className="workspace-info-mark">?</i></span><select value={seeThroughOptions.groupOffload} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, groupOffload: event.target.value as SeeThroughOptionMode })}><option value="default">標準</option><option value="on">有効</option><option value="off">無効</option></select></label>
                       <label title="モデル全体をCPUへ退避する最も強い省VRAM設定。大きく遅くなります。高VRAMプロファイルでは使いません"><span>CPU offload <i className="workspace-info-mark">?</i></span><select value={seeThroughOptions.cpuOffload} disabled={workspaceBusy || seeThroughProfile === "standard"} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, cpuOffload: event.target.value as SeeThroughOptionMode })}><option value="default">標準</option><option value="on">有効</option><option value="off">無効</option></select></label>
                     </div>
-                    <small className="workspace-option-note">各項目にマウスを重ねると説明が表示されます。</small>
                   </details>
                 </div>
                 <div className="workspace-start-seethrough">
@@ -2333,18 +2363,18 @@ function App() {
                 {workspaceCompositePreview?.basePreview ? (
                   <div className="workspace-status-card">
                     <strong>✓ 素体は保存済みです</strong>
-                    <span>右のプレビューが現在の素体です。直したい箇所があれば再調整できます。問題なければ「次へ」で差分位置調整に進んでください。</span>
+                    <span>直したい箇所があれば「再調整する」で調整画面を開き直せます。問題なければ「次へ」で差分位置調整に進んでください。</span>
                   </div>
                 ) : (
                   <div className="workspace-status-card">
-                    <strong>素体調整でできること</strong>
+                    <strong>「素体調整を開く」で専用の調整画面が開きます</strong>
                     <ul className="workspace-feature-list">
                       <li>レイヤーの表示/非表示と前後関係（描画順）の入れ替え</li>
-                      <li>腕・獣耳の分離出力（Motion Labの腕揺れ・耳ピコピコ用）</li>
+                      <li>腕・獣耳の分離出力（腕揺れ・耳ピコピコ用）</li>
                       <li>胸の切り出し（揺れ物理用の chest.png 分離）</li>
                       <li>ブラシによるレイヤーの継ぎ足し・削り（SAM3補助つき）</li>
                     </ul>
-                    <span>「保存して戻る」と自動でSTEP5（差分位置調整）へ進みます。</span>
+                    <span>調整画面で「保存して戻る」と自動でSTEP5（差分位置調整）へ進みます。</span>
                   </div>
                 )}
                 <div className="workspace-action-row">
@@ -2451,7 +2481,7 @@ function App() {
             )}
           </section>
 
-          {workspaceStep >= 4 && workspaceStep <= 6 && (
+          {workspaceStep >= 5 && workspaceStep <= 6 && (
             <aside className="workspace-flow-preview">
               <div className="preview-card-heading"><span>PREVIEW</span><strong>{mainPreviewLabel}</strong></div>
               <div className="workspace-preview-stage">
@@ -2571,11 +2601,7 @@ function App() {
             <div className="primary-workflow-copy">
               <span className="workflow-kicker">NEW WORKSPACE</span>
               <strong>はじめから</strong>
-              <p>
-                新しいキャラクターの作業を開始します。空のフォルダを作業フォルダとして選ぶと、
-                画像選択 → Codex依頼 → See-Through分解 → 素体調整 → 差分位置調整 → RIFE補完 → モーション調整
-                の7ステップを順番に進めて、SpriTalk用の素材一式を出力します。
-              </p>
+              <p>空のフォルダを作業フォルダとして選び、7つのSTEPを順に進めてSpriTalk用の素材一式を出力します。</p>
             </div>
             <span className="primary-workflow-cta">作業フォルダを選択</span>
           </button>
@@ -2583,11 +2609,7 @@ function App() {
             <div className="primary-workflow-copy">
               <span className="workflow-kicker">RESUME</span>
               <strong>つづきから</strong>
-              <p>
-                中断した作業を再開します。「はじめから」で使った作業フォルダ
-                （<code>project.json</code> が保存されているフォルダ）を選ぶと、
-                前回の工程まで自動で復元します。それ以外のフォルダを選ぶとエラーになります。
-              </p>
+              <p>「はじめから」で使った作業フォルダ（<code>project.json</code> のあるフォルダ）を選ぶと、前回の工程から再開します。</p>
             </div>
             <span className="primary-workflow-cta">作業フォルダを開く</span>
           </button>
@@ -2690,36 +2712,56 @@ function App() {
                 </div>
                 {mode === "correction" && <button className="btn-layer-add" onClick={() => void addCorrectionLayerImage()} disabled={loading}>PNG追加</button>}
               </div>
-              <div className="layer-bulk-row">
-                <button className="btn-layer-bulk" onClick={() => void setAllLayerVisibility(true)}>全ON</button>
-                <button className="btn-layer-bulk" onClick={() => void setAllLayerVisibility(false)}>全OFF</button>
-                <button className="btn-layer-bulk" onClick={() => void setAllBodyOpacities(1)}>全100%</button>
-                {!!expressionWorkspace && <button className="btn-layer-bulk" onClick={() => void applyRecommendedLayerOrder()}>推奨順</button>}
+              <div className="layer-bulk-section">
+                <small>表示</small>
+                <div className="layer-bulk-row">
+                  <button className="btn-layer-bulk" onClick={() => void setAllLayerVisibility(true)}>全ON</button>
+                  <button className="btn-layer-bulk" onClick={() => void setAllLayerVisibility(false)}>全OFF</button>
+                </div>
               </div>
-              {armSplitLayers.length > 0 && (
-                <label className="layer-arm-split-toggle" title="腕レイヤー（handwear-l/-r）を arm_l.png / arm_r.png として分離出力します。SpriTalk・Motion Labの腕揺れ用">
-                  <input type="checkbox" checked={armSplitActive} onChange={(e) => toggleArmSplit(e.target.checked)} />
-                  <span>腕を分離出力（arm_l / arm_r）</span>
-                </label>
-              )}
-              {earSplitLayers.length > 0 && (
-                <label className="layer-arm-split-toggle" title="獣耳レイヤー（ears-l/-r または headwear）を sway_ear*.png として分離出力します。Motion Labの獣耳ピコピコ・揺れパーツ用。犬耳がheadwear扱いのキャラにも対応">
-                  <input type="checkbox" checked={earSplitActive} onChange={(e) => toggleEarSplit(e.target.checked)} />
-                  <span>獣耳を分離出力（sway_ear*）</span>
-                </label>
-              )}
-              <div className="layer-bulk-row">
-                <button
-                  className={`btn-layer-bulk${chestMaskDataUrl ? " active" : ""}`}
-                  title="See-Throughにはchestレイヤーが無いため、bodyから胸部を塗って手動で切り出します（852話式・Motion Labの胸揺れ用）"
-                  onClick={initChestCut}
-                >
-                  胸を切出{chestMaskDataUrl ? "済み" : ""}
-                </button>
-                {chestMaskDataUrl && (
-                  <button className="btn-layer-bulk" onClick={() => setChestMaskDataUrl(null)}>胸切出を取消</button>
-                )}
+              <div className="layer-bulk-section">
+                <small>透明度</small>
+                <div className="layer-bulk-row">
+                  <button className="btn-layer-bulk" onClick={() => void setAllBodyOpacities(1)}>全100%</button>
+                  <button className="btn-layer-bulk" onClick={() => void setAllBodyOpacities(0.5)}>全50%</button>
+                  <button className="btn-layer-bulk" onClick={() => void setAllBodyOpacities(0)}>全0%</button>
+                </div>
               </div>
+              {!!expressionWorkspace && (
+                <div className="layer-bulk-section">
+                  <small>並び順</small>
+                  <div className="layer-bulk-row">
+                    <button className="btn-layer-bulk" title="SpriTalk向けの標準的な前後関係（後ろ髪→体→目口→前髪）に並べ直します" onClick={() => void applyRecommendedLayerOrder()}>推奨順に並べ直す</button>
+                  </div>
+                </div>
+              )}
+              <div className="layer-bulk-section">
+                <small>揺れ用パーツの分離</small>
+                  {armSplitLayers.length > 0 && (
+                    <label className="layer-arm-split-toggle" title="腕レイヤー（handwear-l/-r）を arm_l.png / arm_r.png として分離出力します。腕揺れ用">
+                      <input type="checkbox" checked={armSplitActive} onChange={(e) => toggleArmSplit(e.target.checked)} />
+                      <span>腕（arm_l / arm_r）</span>
+                    </label>
+                  )}
+                  {earSplitLayers.length > 0 && (
+                    <label className="layer-arm-split-toggle" title="獣耳レイヤー（ears-l/-r または headwear）を sway_ear*.png として分離出力します。獣耳ピコピコ用">
+                      <input type="checkbox" checked={earSplitActive} onChange={(e) => toggleEarSplit(e.target.checked)} />
+                      <span>獣耳（sway_ear*）</span>
+                    </label>
+                  )}
+                  <div className="layer-bulk-row">
+                    <button
+                      className={`btn-layer-bulk${chestMaskDataUrl ? " active" : ""}`}
+                      title="See-Throughにはchestレイヤーが無いため、bodyから胸部を塗って手動で切り出します（胸揺れ用）"
+                      onClick={initChestCut}
+                    >
+                      胸を切出{chestMaskDataUrl ? "（済み）" : ""}
+                    </button>
+                    {chestMaskDataUrl && (
+                      <button className="btn-layer-bulk" onClick={() => setChestMaskDataUrl(null)}>取消</button>
+                    )}
+                  </div>
+                </div>
               <div className="layer-sidebar-list">
                 {layerOrder.map((name, idx) => {
                   const layer = getBodyOrderItem(name);

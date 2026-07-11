@@ -401,12 +401,10 @@ body {
   overflow: auto;
 }
 
+/* STEP1も他STEPと同じ白パネル（border+背景）で統一する */
 .workspace-flow-layout.step-one .workspace-flow-panel {
   display: grid;
   min-height: 0;
-  padding: 10px 16px 0;
-  border: 0;
-  background: transparent;
 }
 
 .workspace-panel-heading span,
@@ -5504,8 +5502,9 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
-  max-width: min(720px, calc(100vw - 40px));
-  padding: 10px 14px;
+  max-width: calc(100vw - 48px);
+  width: max-content;
+  padding: 10px 16px;
   border: 1px solid #b3454f;
   border-left-width: 4px;
   border-radius: 6px;
@@ -5681,6 +5680,7 @@ body {
 
 .workspace-parts-checklist {
   display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 4px;
   margin-top: 4px;
 }
@@ -5688,25 +5688,21 @@ body {
 .workspace-parts-checklist span {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 4px 10px;
+  gap: 6px;
+  overflow: hidden;
+  padding: 3px 8px;
   border: 1px solid var(--border-color);
   border-radius: 4px;
   background: var(--surface-bg);
-  font-size: 12px;
+  font-size: 11.5px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .workspace-parts-checklist span b {
-  flex: 0 0 16px;
+  flex: 0 0 14px;
   text-align: center;
   font-weight: 700;
-}
-
-.workspace-parts-checklist span i {
-  margin-left: auto;
-  font-size: 10.5px;
-  font-style: normal;
-  white-space: nowrap;
 }
 
 .workspace-parts-checklist span.present {
@@ -5714,16 +5710,8 @@ body {
   color: #62c574;
 }
 
-.workspace-parts-checklist span.present i {
-  color: #62c574;
-}
-
 .workspace-parts-checklist span.missing {
   color: var(--text-secondary);
-}
-
-.workspace-parts-checklist span.missing i {
-  color: var(--text-muted);
 }
 
 .workspace-parts-checklist span.mismatch {
@@ -5841,4 +5829,39 @@ body {
   margin-top: 8px;
   color: var(--text-muted);
   font-size: 11px;
+}
+
+/* STEP3: GPU選択 */
+.workspace-gpu-select {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.workspace-gpu-select span {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.workspace-gpu-select select {
+  flex: 1;
+  min-width: 0;
+}
+
+/* 素体調整: 左パネルのグループ化 */
+.layer-bulk-section {
+  display: grid;
+  gap: 4px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.layer-bulk-section > small {
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
 }

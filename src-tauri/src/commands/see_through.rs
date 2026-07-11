@@ -72,6 +72,39 @@ struct GpuInfo {
     memory_mb: u32,
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeeThroughGpuInfo {
+    pub index: u32,
+    pub name: String,
+    pub memory_mb: u32,
+}
+
+#[tauri::command]
+pub async fn list_see_through_gpus() -> Result<Vec<SeeThroughGpuInfo>, AppError> {
+    tauri::async_runtime::spawn_blocking(|| {
+        Ok(detect_gpus()
+            .into_iter()
+            .map(|gpu| SeeThroughGpuInfo {
+                index: gpu.index,
+                name: gpu.name,
+                memory_mb: gpu.memory_mb,
+            })
+            .collect())
+    })
+    .await
+    .map_err(|error| AppError::General(format!("GPU一覧の取得に失敗: {error}")))?
+}
+
+#[tauri::command]
+pub fn set_see_through_gpu(
+    app: AppHandle,
+    gpu_index: Option<u32>,
+) -> Result<(), AppError> {
+    *app.state::<AppState>().see_through_gpu_index.lock().unwrap() = gpu_index;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn load_expression_source_preview(path: String) -> Result<String, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -150,7 +183,7 @@ fn runtime_status(app: &AppHandle) -> Result<SeeThroughRuntimeStatus, AppError> 
     let python = venv_python(&root);
     let marker = root.join("setup-complete.json");
     let installed_commit = git_commit(&repo);
-    let gpu = best_gpu();
+    let gpu = resolve_gpu(app);
     let recommended_profile = select_profile("auto", gpu.as_ref());
     let busy = app
         .state::<AppState>()
@@ -419,7 +452,7 @@ pub(crate) fn run_inference(
     let repo = PathBuf::from(&status.repo_path);
     apply_bf16_loading_compatibility_patch(&repo)?;
     let python = PathBuf::from(&status.python_path);
-    let gpu = best_gpu();
+    let gpu = resolve_gpu(app);
     let selected_profile = select_profile(requested_profile, gpu.as_ref());
     let job = root
         .join("jobs")
@@ -842,16 +875,18 @@ fn emit_progress(app: &AppHandle, stage: &str, percent: u32, message: &str) {
     );
 }
 
-fn best_gpu() -> Option<GpuInfo> {
-    let output = Command::new("nvidia-smi")
+fn detect_gpus() -> Vec<GpuInfo> {
+    let Ok(output) = Command::new("nvidia-smi")
         .args([
             "--query-gpu=index,uuid,name,memory.total",
             "--format=csv,noheader,nounits",
         ])
         .output()
-        .ok()?;
+    else {
+        return Vec::new();
+    };
     if !output.status.success() {
-        return None;
+        return Vec::new();
     }
     String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -864,7 +899,24 @@ fn best_gpu() -> Option<GpuInfo> {
                 memory_mb: fields.next()?.parse().ok()?,
             })
         })
-        .max_by_key(|gpu| gpu.memory_mb)
+        .collect()
+}
+
+fn best_gpu() -> Option<GpuInfo> {
+    detect_gpus().into_iter().max_by_key(|gpu| gpu.memory_mb)
+}
+
+/// 実行に使うGPUの解決: ユーザー選択（see_through_gpu_index）を優先し、
+/// 未選択または該当なしなら最大VRAMのGPUへフォールバック
+fn resolve_gpu(app: &AppHandle) -> Option<GpuInfo> {
+    let preferred = *app.state::<AppState>().see_through_gpu_index.lock().unwrap();
+    let gpus = detect_gpus();
+    if let Some(index) = preferred {
+        if let Some(gpu) = gpus.iter().find(|gpu| gpu.index == index) {
+            return Some(gpu.clone());
+        }
+    }
+    gpus.into_iter().max_by_key(|gpu| gpu.memory_mb)
 }
 
 fn select_profile(requested: &str, gpu: Option<&GpuInfo>) -> String {
