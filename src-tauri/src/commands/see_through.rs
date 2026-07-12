@@ -466,6 +466,10 @@ fn run_inference_with_recovery(
     }
 
     let root = PathBuf::from(&status.runtime_root);
+    // 推論ごとに作られるジョブ作業フォルダ（input/output）は使い捨てのスクラッチ領域。
+    // 完了後にPSD/画像を全てAppStateへ読み込み済みで再利用されないため、放置すると
+    // 無限に増え続けるディスクリークになる。新規ジョブ作成前に古いものを間引く
+    prune_stale_job_dirs(&root);
     let repo = PathBuf::from(&status.repo_path);
     apply_bf16_loading_compatibility_patch(&repo)?;
     let python = PathBuf::from(&status.python_path);
@@ -616,6 +620,30 @@ fn run_inference_with_recovery(
 
 /// 左右分割（--tblr_split）由来の失敗か。inference_utils.pyのlr_split系トレース
 /// バックが「直前のログ」としてエラーメッセージに含まれることを利用する
+/// 直近数件を残して古い推論ジョブ作業フォルダ（jobs/expression-<ミリ秒>）を削除する。
+/// 各ジョブはrun_inference完了時点で内容が全てAppStateへ読み込み済みで、フォルダ自体は
+/// 二度と参照されないスクラッチ領域のため安全に削除できる（実行のたびに増え続けるのを防止）
+fn prune_stale_job_dirs(root: &Path) {
+    const KEEP_RECENT: usize = 3;
+    let jobs_dir = root.join("jobs");
+    let Ok(entries) = fs::read_dir(&jobs_dir) else {
+        return;
+    };
+    let mut dirs: Vec<_> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .collect();
+    if dirs.len() <= KEEP_RECENT {
+        return;
+    }
+    // フォルダ名が expression-<unixミリ秒> のため、名前の降順=新しい順になる
+    dirs.sort_by_key(|entry| entry.file_name());
+    dirs.reverse();
+    for stale in dirs.into_iter().skip(KEEP_RECENT) {
+        let _ = fs::remove_dir_all(stale.path());
+    }
+}
+
 fn is_lr_split_failure(error: &AppError) -> bool {
     let text = error.to_string();
     text.contains("lr_split") || text.contains("further_extr")
@@ -813,16 +841,90 @@ fn option_mode(value: Option<&str>) -> Result<&str, AppError> {
     }
 }
 
+fn default_runtime_root(app: &AppHandle) -> Result<PathBuf, AppError> {
+    app.path()
+        .app_local_data_dir()
+        .map(|path| path.join("see-through"))
+        .map_err(|error| AppError::General(format!("アプリデータ保存先を取得できません: {error}")))
+}
+
+/// インストール先設定ファイルのパス（Python環境・モデル本体とは別の、軽量な設定置き場）
+fn install_location_config_path(app: &AppHandle) -> Result<PathBuf, AppError> {
+    app.path()
+        .app_config_dir()
+        .map(|path| path.join("see-through-location.json"))
+        .map_err(|error| AppError::General(format!("設定保存先を取得できません: {error}")))
+}
+
+/// ユーザーがSTEP3で指定したカスタムのインストール先（未設定ならNone）
+fn read_custom_runtime_root(app: &AppHandle) -> Option<PathBuf> {
+    let config_path = install_location_config_path(app).ok()?;
+    let bytes = fs::read(config_path).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let path = value.get("runtimeRoot")?.as_str()?;
+    if path.trim().is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(path))
+}
+
 fn runtime_root(app: &AppHandle) -> Result<PathBuf, AppError> {
     if let Ok(path) = std::env::var("PACHIPAKUGEN_SEE_THROUGH_ROOT") {
         if !path.trim().is_empty() {
             return Ok(PathBuf::from(path));
         }
     }
-    app.path()
-        .app_local_data_dir()
-        .map(|path| path.join("see-through"))
-        .map_err(|error| AppError::General(format!("アプリデータ保存先を取得できません: {error}")))
+    if let Some(custom) = read_custom_runtime_root(app) {
+        return Ok(custom);
+    }
+    default_runtime_root(app)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeeThroughInstallLocation {
+    pub path: String,
+    pub is_default: bool,
+}
+
+#[tauri::command]
+pub fn get_see_through_install_location(app: AppHandle) -> Result<SeeThroughInstallLocation, AppError> {
+    let current = runtime_root(&app)?;
+    let default_path = default_runtime_root(&app)?;
+    Ok(SeeThroughInstallLocation {
+        is_default: current == default_path,
+        path: current.to_string_lossy().into_owned(),
+    })
+}
+
+/// STEP3のインストール先変更。path=None（またはデフォルトと同一）で既定に戻す。
+/// 既存の保存先にあるPython環境・モデルは移動しない（新しい場所で初回セットアップが必要）
+#[tauri::command]
+pub fn set_see_through_install_location(
+    app: AppHandle,
+    path: Option<String>,
+) -> Result<SeeThroughInstallLocation, AppError> {
+    let config_path = install_location_config_path(&app)?;
+    if let Some(parent) = config_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let default_path = default_runtime_root(&app)?;
+    let trimmed = path.as_deref().map(str::trim).filter(|p| !p.is_empty());
+    match trimmed {
+        Some(custom) if PathBuf::from(custom) != default_path => {
+            fs::write(
+                &config_path,
+                serde_json::to_vec_pretty(&serde_json::json!({ "runtimeRoot": custom }))
+                    .map_err(|error| AppError::General(format!("設定の保存に失敗: {error}")))?,
+            )?;
+        }
+        _ => {
+            if config_path.is_file() {
+                fs::remove_file(&config_path)?;
+            }
+        }
+    }
+    get_see_through_install_location(app)
 }
 
 fn venv_python(root: &Path) -> PathBuf {

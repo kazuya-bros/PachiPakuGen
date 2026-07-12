@@ -44,6 +44,8 @@ pub fn run() {
             commands::see_through::cancel_see_through,
             commands::see_through::list_see_through_gpus,
             commands::see_through::set_see_through_gpu,
+            commands::see_through::get_see_through_install_location,
+            commands::see_through::set_see_through_install_location,
             commands::workspace::create_expression_workspace,
             commands::workspace::load_expression_workspace,
             commands::workspace::prepare_workspace_codex_request,

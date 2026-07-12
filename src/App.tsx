@@ -118,6 +118,8 @@ function App() {
       setSeeThroughProfile(runtime.recommendedProfile);
     }
   };
+  /** See-Through（Python環境+モデル本体、数〜十数GB）のインストール先 */
+  const [seeThroughInstallLocation, setSeeThroughInstallLocation] = useState<{ path: string; isDefault: boolean } | null>(null);
   const [seeThroughSplitParts, setSeeThroughSplitParts] = useState(true);
   const [seeThroughOptions, setSeeThroughOptions] = useState<SeeThroughOptions>(DEFAULT_SEE_THROUGH_OPTIONS);
   const [workspacePartOffsetX, setWorkspacePartOffsetX] = useState(0);
@@ -1578,8 +1580,47 @@ function App() {
       await invoke<Array<{ index: number; name: string; memoryMb: number }>>("list_see_through_gpus")
         .then(setSeeThroughGpus)
         .catch(() => setSeeThroughGpus([]));
+      await invoke<{ path: string; isDefault: boolean }>("get_see_through_install_location")
+        .then(setSeeThroughInstallLocation)
+        .catch(() => setSeeThroughInstallLocation(null));
       setStatus(runtime.message);
       setSeeThroughProgress({ stage: "status", percent: 100, message: runtime.message });
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setWorkspaceBusy(false);
+    }
+  }
+
+  async function changeSeeThroughInstallLocation() {
+    const selected = await open({ multiple: false, directory: true, title: "See-Throughのインストール先フォルダを選択" });
+    const dir = typeof selected === "string" ? selected : null;
+    if (!dir) return;
+    setError("");
+    setWorkspaceBusy(true);
+    try {
+      const location = await invoke<{ path: string; isDefault: boolean }>("set_see_through_install_location", { path: dir });
+      setSeeThroughInstallLocation(location);
+      setSeeThroughRuntime(null);
+      showToast("インストール先を変更しました。この場所で初回セットアップが必要です");
+      setStatus(`インストール先を変更しました: ${location.path}`);
+      await refreshWorkspaceSeeThroughStatus();
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setWorkspaceBusy(false);
+    }
+  }
+
+  async function resetSeeThroughInstallLocation() {
+    setError("");
+    setWorkspaceBusy(true);
+    try {
+      const location = await invoke<{ path: string; isDefault: boolean }>("set_see_through_install_location", { path: null });
+      setSeeThroughInstallLocation(location);
+      setSeeThroughRuntime(null);
+      showToast("インストール先を既定に戻しました");
+      await refreshWorkspaceSeeThroughStatus();
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -2428,6 +2469,22 @@ function App() {
                       <label title="深度推定のステップ数。-1で自動。省VRAMプロファイルでは固定のため変更できません"><span>Depth step <i className="workspace-info-mark">?</i></span><input type="number" min={-1} max={150} value={seeThroughOptions.inferenceStepsDepth} disabled={workspaceBusy || seeThroughProfile === "low-vram"} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, inferenceStepsDepth: Number(event.target.value) })} /></label>
                       <label title="モデルをブロック単位でCPUメモリへ退避してVRAMを節約します（少し低速）。「自動」はプロファイルの既定動作に任せます。VRAM不足エラーが出る時に有効化"><span>Group offload <i className="workspace-info-mark">?</i></span><select value={seeThroughOptions.groupOffload} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, groupOffload: event.target.value as SeeThroughOptionMode })}><option value="default">自動（推奨）</option><option value="on">有効</option><option value="off">無効</option></select></label>
                       <label title="モデル全体をCPUへ退避する最も強い省VRAM設定（大きく低速）。「自動」はプロファイルの既定動作に任せます。高VRAMプロファイルでは使いません"><span>CPU offload <i className="workspace-info-mark">?</i></span><select value={seeThroughOptions.cpuOffload} disabled={workspaceBusy || seeThroughProfile === "standard"} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, cpuOffload: event.target.value as SeeThroughOptionMode })}><option value="default">自動（推奨）</option><option value="on">有効</option><option value="off">無効</option></select></label>
+                    </div>
+                    <div className="workspace-option-header">
+                      <span>インストール先（Python環境+モデル本体、初回は約13〜18GB）</span>
+                    </div>
+                    <div className="workspace-install-location">
+                      <small title={seeThroughInstallLocation?.path} className="workspace-install-location-path">
+                        {seeThroughInstallLocation?.path ?? "取得中..."}
+                        {seeThroughInstallLocation?.isDefault && <em className="workspace-recommend-badge">既定</em>}
+                      </small>
+                      <button className="btn btn-secondary" disabled={workspaceBusy} onClick={() => void changeSeeThroughInstallLocation()}>変更...</button>
+                      {seeThroughInstallLocation && !seeThroughInstallLocation.isDefault && (
+                        <button className="btn btn-secondary" disabled={workspaceBusy} onClick={() => void resetSeeThroughInstallLocation()}>既定に戻す</button>
+                      )}
+                    </div>
+                    <div className="motion-lab-note">
+                      C:ドライブの空き容量が少ない場合に、大きな空きのあるドライブへ変更できます。変更すると新しい場所で初回セットアップ（Python環境構築+モデルダウンロード）が必要です。既存のインストール先にあるデータは自動移動されません。
                     </div>
                   </details>
                 </div>
