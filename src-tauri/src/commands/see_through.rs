@@ -9,7 +9,7 @@ use keyring_core::Entry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1215,14 +1215,38 @@ fn format_process_failure(code: i32, stdout: &str, stderr: &str) -> String {
     format!("{explanation}\n終了コード: {code}\n\n直前のログ:\n{tail}")
 }
 
+/// 改行(\n)だけでなくtqdm等が使うカーソル復帰(\r)でも区切って読む。
+/// BufRead::lines()は\nでしか区切らないため、tqdmのダウンロード進捗（\rでその場更新）は
+/// 完了/中断までまとめて1行として溜め込まれ、ユーザーからは「何も表示されないまま
+/// 何十分も止まっている」ように見えてしまっていた（実際は進んでいる場合も含めて）。
+/// \r単位で都度flushすることで、ダウンロードが本当に進んでいるかをリアルタイムに可視化する
 fn read_process_lines<R: std::io::Read>(reader: R, app: &AppHandle, stage: &str) -> String {
     let mut collected = String::new();
-    for line in BufReader::new(reader).lines().map_while(Result::ok) {
-        eprintln!("[PachiPakuGen] See-Through: {line}");
-        collected.push_str(&line);
+    let mut current: Vec<u8> = Vec::new();
+    let mut last_reported = String::new();
+    let mut flush = |current: &mut Vec<u8>| {
+        if current.is_empty() {
+            return;
+        }
+        let text = String::from_utf8_lossy(current).trim().to_string();
+        current.clear();
+        if text.is_empty() || text == last_reported {
+            return;
+        }
+        eprintln!("[PachiPakuGen] See-Through: {text}");
+        collected.push_str(&text);
         collected.push('\n');
-        emit_progress(app, stage, progress_from_line(&line), &line);
+        emit_progress(app, stage, progress_from_line(&text), &text);
+        last_reported = text;
+    };
+    for byte in BufReader::new(reader).bytes().map_while(Result::ok) {
+        if byte == b'\n' || byte == b'\r' {
+            flush(&mut current);
+        } else {
+            current.push(byte);
+        }
     }
+    flush(&mut current);
     collected
 }
 

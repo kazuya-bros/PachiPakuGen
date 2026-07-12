@@ -150,8 +150,20 @@ export function sanitizeSeeThroughLogMessage(message: string): string {
   }
   if (/running layerdiff/i.test(cleaned)) return "レイヤーを分解しています";
   if (/running marigold/i.test(cleaned)) return "深度を推定しています";
+  // tqdmの進捗バー（\r更新、例: "45%|████▌ | 2.62G/5.83G [02:15<02:45, 18.2MB/s]"）は
+  // 単に除去すると「本当に進んでいるか」が画面から分からなくなるため、内容を抽出して
+  // 表示する（ダウンロード/処理が生きていることを可視化する）
+  const tqdmMatch = cleaned.match(
+    /(\d+)%\|[^|]*\|\s*([^\s/]+)\/([^\s[]+)\s*\[([^<]+)<([^,\]]+),?\s*([^\]]*)\]/,
+  );
+  if (tqdmMatch) {
+    const [, percent, current, total, elapsed, remaining, speed] = tqdmMatch;
+    const remainingPart = remaining.trim() && remaining.trim() !== "?" ? `・残り${remaining.trim()}` : "";
+    const speedPart = speed.trim() ? `・${speed.trim()}` : "";
+    return `処理中 ${percent}%（${current}/${total}・経過${elapsed.trim()}${remainingPart}${speedPart}）`;
+  }
   cleaned = cleaned
-    // "100%|██████| 5/5 [00:02<00:00, 1.59it/s]" のようなtqdm断片を除去
+    // 上記でマッチしなかった残りのtqdm断片（不完全な行等）を除去
     .replace(/\d+%\|[^|]*\|\s*\d+\/\d+\s*(\[[^\]]*\])?/g, " ")
     .replace(/\[\d+:\d+<[^\]]*\]/g, " ")
     .replace(/\s+/g, " ")
