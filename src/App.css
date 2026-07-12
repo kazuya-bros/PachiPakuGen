@@ -5960,3 +5960,8 @@ body {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+.workspace-install-location input[type="password"] {
+  flex: 1;
+  min-width: 0;
+}

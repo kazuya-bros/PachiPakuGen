@@ -5,6 +5,7 @@ use crate::commands::parts::{
 use crate::error::AppError;
 use crate::processing::image_utils;
 use crate::state::AppState;
+use keyring_core::Entry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -16,6 +17,61 @@ use tauri::{AppHandle, Emitter, Manager};
 
 const SEE_THROUGH_REPO: &str = "https://github.com/shitagaki-lab/see-through.git";
 const SEE_THROUGH_COMMIT: &str = "e4cb250dc69defe6f982168dab684aa461552b5b";
+const KEYRING_SERVICE: &str = "com.kazuya.pachipakugen";
+const HF_TOKEN_CREDENTIAL: &str = "huggingface-token";
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HfTokenStatus {
+    pub configured: bool,
+}
+
+fn hf_token_entry() -> Result<Entry, AppError> {
+    Entry::new(KEYRING_SERVICE, HF_TOKEN_CREDENTIAL)
+        .map_err(|error| AppError::General(format!("Windows資格情報を開けませんでした: {error}")))
+}
+
+fn stored_hf_token() -> Option<String> {
+    hf_token_entry()
+        .ok()?
+        .get_password()
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+#[tauri::command]
+pub fn get_hf_token_status() -> HfTokenStatus {
+    HfTokenStatus {
+        configured: stored_hf_token().is_some(),
+    }
+}
+
+/// HuggingFaceのアクセストークンをWindows資格情報に安全に保存する。
+/// See-Throughのモデルダウンロードが匿名アクセスのレート制限を受けなくなる
+#[tauri::command]
+pub fn save_hf_token(token: String) -> Result<HfTokenStatus, AppError> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::General("トークンを入力してください".into()));
+    }
+    hf_token_entry()?
+        .set_password(trimmed)
+        .map_err(|error| AppError::General(format!("トークンを安全に保存できませんでした: {error}")))?;
+    Ok(HfTokenStatus { configured: true })
+}
+
+#[tauri::command]
+pub fn delete_hf_token() -> Result<HfTokenStatus, AppError> {
+    let entry = hf_token_entry()?;
+    if let Err(error) = entry.delete_credential() {
+        if !matches!(error, keyring_core::Error::NoEntry) {
+            return Err(AppError::General(format!(
+                "保存済みトークンを削除できませんでした: {error}"
+            )));
+        }
+    }
+    Ok(HfTokenStatus { configured: false })
+}
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -988,6 +1044,12 @@ fn run_managed_command(
     if let Some(gpu) = gpu {
         command.env("CUDA_VISIBLE_DEVICES", &gpu.uuid);
     }
+    // HuggingFaceトークンを設定済みなら渡す（匿名アクセスのレート制限緩和・高速化）。
+    // huggingface_hubのバージョンにより参照する変数名が異なるため両方セットする
+    if let Some(token) = stored_hf_token() {
+        command.env("HF_TOKEN", &token);
+        command.env("HUGGING_FACE_HUB_TOKEN", &token);
+    }
     let mut child = command
         .spawn()
         .map_err(|error| AppError::General(format!("{program}を起動できません: {error}")))?;
@@ -1028,8 +1090,13 @@ fn run_managed_command(
                     let _ = stdout_reader.join();
                     let _ = stderr_reader.join();
                     return Err(AppError::General(format!(
-                        "See-Through処理が{}分間応答しなかったため中断しました。GPUドライバの \
-問題（特に新しいGPUアーキテクチャでのbitsandbytes量子化）の可能性があります。\
+                        "See-Through処理が{}分間応答しなかったため中断しました。\
+考えられる原因は主に2つです。\
+(1) モデルのダウンロードが遅い/止まっている: 特に初回実行時やモデルキャッシュを削除した \
+直後は数〜十数GBの再ダウンロードが発生し、HuggingFaceの匿名アクセスではレート制限で \
+非常に遅くなることがあります。STEP3の「HuggingFaceトークン」を設定すると改善する場合が \
+あります。 \
+(2) GPUドライバの問題（特に新しいGPUアーキテクチャでのbitsandbytes量子化）: この場合は \
 STEP3で「高VRAM」プロファイルへ切り替えて再実行してください。",
                         HANG_TIMEOUT.as_secs() / 60
                     )));

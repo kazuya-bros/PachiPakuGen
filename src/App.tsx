@@ -120,6 +120,9 @@ function App() {
   };
   /** See-Through（Python環境+モデル本体、数〜十数GB）のインストール先 */
   const [seeThroughInstallLocation, setSeeThroughInstallLocation] = useState<{ path: string; isDefault: boolean } | null>(null);
+  /** HuggingFaceトークン設定状態（値そのものはフロントへ返さない） */
+  const [hfTokenStatus, setHfTokenStatus] = useState<{ configured: boolean } | null>(null);
+  const [hfTokenInput, setHfTokenInput] = useState("");
   const [seeThroughSplitParts, setSeeThroughSplitParts] = useState(true);
   const [seeThroughOptions, setSeeThroughOptions] = useState<SeeThroughOptions>(DEFAULT_SEE_THROUGH_OPTIONS);
   const [workspacePartOffsetX, setWorkspacePartOffsetX] = useState(0);
@@ -1583,6 +1586,9 @@ function App() {
       await invoke<{ path: string; isDefault: boolean }>("get_see_through_install_location")
         .then(setSeeThroughInstallLocation)
         .catch(() => setSeeThroughInstallLocation(null));
+      await invoke<{ configured: boolean }>("get_hf_token_status")
+        .then(setHfTokenStatus)
+        .catch(() => setHfTokenStatus(null));
       setStatus(runtime.message);
       setSeeThroughProgress({ stage: "status", percent: 100, message: runtime.message });
     } catch (cause) {
@@ -1621,6 +1627,36 @@ function App() {
       setSeeThroughRuntime(null);
       showToast("インストール先を既定に戻しました");
       await refreshWorkspaceSeeThroughStatus();
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setWorkspaceBusy(false);
+    }
+  }
+
+  async function saveHfToken() {
+    if (!hfTokenInput.trim()) return;
+    setError("");
+    setWorkspaceBusy(true);
+    try {
+      const status = await invoke<{ configured: boolean }>("save_hf_token", { token: hfTokenInput });
+      setHfTokenStatus(status);
+      setHfTokenInput("");
+      showToast("HuggingFaceトークンを保存しました");
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setWorkspaceBusy(false);
+    }
+  }
+
+  async function deleteHfToken() {
+    setError("");
+    setWorkspaceBusy(true);
+    try {
+      const status = await invoke<{ configured: boolean }>("delete_hf_token");
+      setHfTokenStatus(status);
+      showToast("HuggingFaceトークンを削除しました");
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -2492,6 +2528,31 @@ function App() {
                     </div>
                     <div className="motion-lab-note">
                       C:ドライブの空き容量が少ない場合に、大きな空きのあるドライブへ変更できます。変更すると新しい場所で初回セットアップ（Python環境構築+モデルダウンロード）が必要です。既存のインストール先にあるデータは自動移動されません。
+                    </div>
+                    <div className="workspace-option-header">
+                      <span>HuggingFaceトークン（任意・モデルDLの高速化）</span>
+                    </div>
+                    <div className="workspace-install-location">
+                      {hfTokenStatus?.configured ? (
+                        <>
+                          <small className="workspace-install-location-path">設定済み（huggingface.co/settings/tokens で発行したトークン）</small>
+                          <button className="btn btn-secondary" disabled={workspaceBusy} onClick={() => void deleteHfToken()}>削除</button>
+                        </>
+                      ) : (
+                        <>
+                          <input
+                            type="password"
+                            value={hfTokenInput}
+                            disabled={workspaceBusy}
+                            placeholder="hf_ から始まるトークンを貼り付け"
+                            onChange={(event) => setHfTokenInput(event.target.value)}
+                          />
+                          <button className="btn btn-secondary" disabled={workspaceBusy || !hfTokenInput.trim()} onClick={() => void saveHfToken()}>保存</button>
+                        </>
+                      )}
+                    </div>
+                    <div className="motion-lab-note">
+                      未設定でも動作しますが、匿名アクセスはHuggingFace側のレート制限で低速になったり、初回や再ダウンロード時に長く待たされることがあります。huggingface.co/settings/tokens で無料のトークンを発行して貼り付けると改善します。トークンはWindowsの資格情報マネージャーに安全に保存され、値が画面に表示されることはありません。
                     </div>
                   </details>
                 </div>
