@@ -1660,12 +1660,18 @@ function App() {
     setSeeThroughProgress({ stage: "inference", percent: 0, message: "See-Through一括分解中" });
     setSeeThroughPhase({ index: 1, total: 3, label: "立ち絵を分解しています" });
     try {
+      // ユーザーが手動でプロファイルを選んでいなければ "auto" を渡し、実行時点のGPU検出
+      // による判定（VRAM 16GB以上ならstandard等）をバックエンドに委ねる。
+      // フロント側stateの初期値（"low-vram"）をそのまま送ると、環境確認がまだ反映されて
+      // いない場面（再起動直後・ステップ再訪問等）で意図せず低速な量子化経路に落ちるため
       const base = await invoke<SeeThroughRunResult>("run_see_through", {
         sourcePath: workspaceFiles.source,
-        profile: seeThroughProfile,
+        profile: seeThroughProfileTouched.current ? seeThroughProfile : "auto",
         splitParts: seeThroughSplitParts,
         options: seeThroughOptions,
       });
+      // 実際に使われたプロファイルをUIへ反映（自動判定の結果を可視化）
+      setSeeThroughProfile(base.selectedProfile as SeeThroughProfile);
       // 左右分解が素材依存で失敗した場合、バックエンドが左右分解なしで自動リトライ済み。
       // 以降の工程（表情素材の分解）も左右分解なしに揃え、ユーザーへ報告する
       let effectiveSplitParts = seeThroughSplitParts;
@@ -1700,7 +1706,8 @@ function App() {
       setSeeThroughPhase({ index: 2, total: 3, label: "表情素材（Codex成果物）を分解しています" });
       const extracted = await invoke<ExtractCodexGeneratedPartsResult>("extract_codex_generated_parts", {
         jobPath: expressionWorkspace.workPath,
-        profile: seeThroughProfile,
+        // 1回目の呼び出しで確定した実際のプロファイルをそのまま使う（"auto"を再解決しない）
+        profile: base.selectedProfile,
         splitParts: effectiveSplitParts,
         options: seeThroughOptions,
       });

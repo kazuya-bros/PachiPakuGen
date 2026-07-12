@@ -11,7 +11,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
 const SEE_THROUGH_REPO: &str = "https://github.com/shitagaki-lab/see-through.git";
@@ -551,12 +551,15 @@ fn run_inference_with_recovery(
             return Ok(result);
         } else if allow_oom_retry
             && (is_cuda_oom_failure(&error)
-                || (is_native_crash(&error) && selected_profile == "low-vram"))
+                || ((is_native_crash(&error) || is_hang_timeout(&error))
+                    && selected_profile == "low-vram"))
         {
-            // low-vram（量子化）でのネイティブクラッシュは、新GPUでbitsandbytes 4bit
-            // カーネルが動かないケースが多い。CUDA OOMと同様に非量子化のstandardへ切替
+            // low-vram（量子化）でのネイティブクラッシュ/無応答タイムアウトは、
+            // 新GPUでbitsandbytes 4bitカーネルが動かない（クラッシュorハング）ケースが多い。
+            // CUDA OOMと同様に非量子化のstandardへ切替
             let quantization_kernel_issue = is_quantization_kernel_failure(&error)
-                || (is_native_crash(&error) && selected_profile == "low-vram");
+                || ((is_native_crash(&error) || is_hang_timeout(&error))
+                    && selected_profile == "low-vram");
             match oom_retry_plan(&selected_profile, options.as_ref(), quantization_kernel_issue) {
                 Some((retry_profile, retry_options, note)) => {
                     emit_progress(
@@ -578,9 +581,10 @@ fn run_inference_with_recovery(
                 }
                 None => return Err(augment_oom_error(error, quantization_kernel_issue)),
             }
-        } else if is_cuda_oom_failure(&error) || is_native_crash(&error) {
+        } else if is_cuda_oom_failure(&error) || is_native_crash(&error) || is_hang_timeout(&error) {
             let quantization_kernel_issue = is_quantization_kernel_failure(&error)
-                || (is_native_crash(&error) && selected_profile == "low-vram");
+                || ((is_native_crash(&error) || is_hang_timeout(&error))
+                    && selected_profile == "low-vram");
             return Err(augment_oom_error(error, quantization_kernel_issue));
         } else {
             return Err(error);
@@ -656,6 +660,11 @@ fn is_lr_split_failure(error: &AppError) -> bool {
 fn is_native_crash(error: &AppError) -> bool {
     let text = error.to_string();
     text.contains("-1073741819") || text.contains("ネイティブアクセス違反")
+}
+
+/// run_managed_commandの無応答タイムアウトで打ち切られた失敗か
+fn is_hang_timeout(error: &AppError) -> bool {
+    error.to_string().contains("応答しなかったため中断しました")
 }
 
 /// CUDA/cuBLASのメモリ確保失敗（cublasCreate等）由来の失敗か。
@@ -1002,7 +1011,34 @@ fn run_managed_command(
         std::thread::spawn(move || read_process_lines(stdout, &stdout_app, &stdout_stage));
     let stderr_reader =
         std::thread::spawn(move || read_process_lines(stderr, &stderr_app, &stderr_stage));
-    let process_status = child.wait()?;
+
+    // tqdmの進捗（\r更新）は改行区切りのログとして拾えないため、行が出ない=無反応とは
+    // 判定できない。そのため活動量ではなく、素直な上限時間で無応答プロセスを打ち切る
+    // （GPUドライバのデッドロック等でchild.wait()が永久に返らない事故の保険）。
+    const HANG_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+    let started = Instant::now();
+    let process_status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if started.elapsed() > HANG_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    *app.state::<AppState>().see_through_pid.lock().unwrap() = None;
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
+                    return Err(AppError::General(format!(
+                        "See-Through処理が{}分間応答しなかったため中断しました。GPUドライバの \
+問題（特に新しいGPUアーキテクチャでのbitsandbytes量子化）の可能性があります。\
+STEP3で「高VRAM」プロファイルへ切り替えて再実行してください。",
+                        HANG_TIMEOUT.as_secs() / 60
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            Err(error) => return Err(AppError::from(error)),
+        }
+    };
     *app.state::<AppState>().see_through_pid.lock().unwrap() = None;
     let stdout_text = stdout_reader.join().unwrap_or_default();
     let stderr_text = stderr_reader.join().unwrap_or_default();
