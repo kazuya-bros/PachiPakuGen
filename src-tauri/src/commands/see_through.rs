@@ -1127,7 +1127,11 @@ fn apply_bf16_loading_compatibility_patch(repo: &Path) -> Result<(), AppError> {
             path.display()
         ))
     })?;
-    let patched = match patch_bf16_loading(&original) {
+    // Windows(CRLF)でgit checkoutされたファイルだと、複数行にまたがるパターン
+    // （改行を含むもの）がLF前提の比較と一致せず常にスキップされてしまうため、
+    // 比較・書き戻しの前に改行をLFへ正規化する（Python実行には影響しない）
+    let normalized = original.replace("\r\n", "\n");
+    let patched = match patch_bf16_loading(&normalized) {
         Ok(patched) => patched,
         Err(error) => {
             eprintln!("[PachiPakuGen] See-Through compatibility patch skipped: {error}");
