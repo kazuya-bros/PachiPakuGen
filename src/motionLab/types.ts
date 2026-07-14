@@ -24,6 +24,8 @@ export interface MotionLabPartsResult {
   armR: string | null;
   chest: string | null;
   sways: Record<string, string>;
+  /** 腕と同じ変形へ追従し、描画順だけを独立させた切り出しパーツ */
+  linkedParts: Record<string, MotionLabLinkedPartResult>;
   eyewhite: string | null;
   irides: string | null;
   highlight: string | null;
@@ -35,6 +37,11 @@ export interface MotionLabPartsResult {
   warnings: string[];
 }
 
+export interface MotionLabLinkedPartResult {
+  parent: "arm_l" | "arm_r" | string;
+  image: string;
+}
+
 export interface MotionLabImageSet {
   body: HTMLImageElement;
   hair: HTMLImageElement | null;
@@ -43,6 +50,8 @@ export interface MotionLabImageSet {
   armR: HTMLImageElement | null;
   chest: HTMLImageElement | null;
   sways: Record<string, HTMLImageElement>;
+  /** linkedPartsの画像デコード後。parentの腕と同じ変形で描画する */
+  linkedParts: Record<string, { parent: string; image: HTMLImageElement }>;
   /** 視線ドリフト用: 白目=クリップ領域、虹彩=ドリフト対象（§8.4） */
   eyewhite: HTMLImageElement | null;
   irides: HTMLImageElement | null;

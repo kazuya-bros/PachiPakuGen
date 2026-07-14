@@ -54,6 +54,37 @@ const LR_SPLIT_LAYERS: &[&str] = &[
 
 const DEPTH_VISIBILITY_TOLERANCE: u8 = 2;
 const DEPTH_VISIBILITY_FEATHER_SIGMA: f32 = 1.0;
+const ARM_L_OVERLAY_PREFIX: &str = "arm_l_overlay_";
+const ARM_R_OVERLAY_PREFIX: &str = "arm_r_overlay_";
+
+/// 腕本体と同じ変形へ追従しつつ、独立したz位置で描画する切り出しパーツ。
+pub(crate) fn arm_overlay_parent(name: &str) -> Option<&'static str> {
+    if name.starts_with(ARM_L_OVERLAY_PREFIX) {
+        Some("arm_l")
+    } else if name.starts_with(ARM_R_OVERLAY_PREFIX) {
+        Some("arm_r")
+    } else {
+        None
+    }
+}
+
+pub(crate) fn is_arm_overlay_part_name(name: &str) -> bool {
+    arm_overlay_parent(name).is_some()
+}
+
+fn arm_overlay_part_name(parent: &str, patch_id: &str) -> String {
+    let suffix: String = patch_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{parent}_overlay_{}", if suffix.is_empty() { "patch" } else { &suffix })
+}
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -249,7 +280,8 @@ pub async fn get_base_preview(app: AppHandle) -> Result<String, AppError> {
         let parts = state.parts.lock().unwrap();
         let w = *state.canvas_width.lock().unwrap();
         let h = *state.canvas_height.lock().unwrap();
-        Ok(generate_composite_preview(&parts, w, h))
+        let draw_order = state.base_layer_group_order.lock().unwrap().clone();
+        Ok(generate_composite_preview(&parts, w, h, &draw_order))
     })
     .await
     .map_err(|e| AppError::General(format!("Task join error: {}", e)))?
@@ -876,41 +908,27 @@ fn create_base_inner(
 
     // グループ間z順（背面→前面）を保持。save_codex_base_parts が layer-order.json
     // として素材フォルダへ出力し、Motion Lab / SpriTalk が固定z順の代わりに使う
-    *state.base_layer_group_order.lock().unwrap() = if uses_unified_layer_order {
+    let base_layer_group_order = if uses_unified_layer_order {
         derive_group_draw_order(&body_layer_order, &body_layer_patches, &full_mapping)
     } else {
         Vec::new()
     };
+    *state.base_layer_group_order.lock().unwrap() = base_layer_group_order.clone();
 
     // 腕分離（オプション）: mapping で arm_l / arm_r に割り当てられたレイヤーを
     // 独立パーツとして合成する。未割り当てなら None = 従来どおり body に統合
     for arm_target in ["arm_l", "arm_r"] {
-        let arm_order = filter_layer_order_for_target(
+        parts.extend(build_linked_arm_parts(
+            current,
+            &depth_maps,
+            &full_mapping,
             &body_layer_order,
             &body_layer_patches,
-            &full_mapping,
+            &source_layer_order,
             arm_target,
-        );
-        let arm_img = if !arm_order.is_empty() {
-            let mut order_reversed = arm_order;
-            order_reversed.reverse();
-            let render_layers =
-                collect_ordered_render_layers(current, &order_reversed, &[], &HashMap::new(), None);
-            Some(compose_depth_gated_layers(render_layers, &depth_maps, w, h))
-        } else {
-            merge_layers_for_target(
-                current,
-                &depth_maps,
-                &full_mapping,
-                arm_target,
-                &source_layer_order,
-                w,
-                h,
-            )
-        };
-        if let Some(img) = arm_img {
-            parts.insert(arm_target.to_string(), img);
-        }
+            w,
+            h,
+        )?);
     }
 
     // 汎用揺れパーツ分離: mapping で "sway_" から始まるターゲットへ割り当てた
@@ -1232,7 +1250,7 @@ fn create_base_inner(
         parts.insert(base_mouth_slot.clone(), img);
     }
 
-    let composite_preview = generate_composite_preview(&parts, w, h);
+    let composite_preview = generate_composite_preview(&parts, w, h, &base_layer_group_order);
 
     // Store parts for future diff operations (keep base eye & mouth)
     drop(slot_layers);
@@ -1647,7 +1665,7 @@ pub(crate) fn get_mapping_preview_inner(
     if let (Some(body), Some(hair)) = (body.as_ref(), composite_parts.get_mut("hair")) {
         promote_body_foreground_over_hair(body, hair, current, &depth_maps, &full_mapping, w, h);
     }
-    let composite_preview = generate_composite_preview(&composite_parts, w, h);
+    let composite_preview = generate_composite_preview(&composite_parts, w, h, &[]);
 
     Ok(MappingPreviewResult {
         categories,
@@ -2402,25 +2420,37 @@ fn layer_order_entry_target<'a>(
     get_mapping_target(source_name, mapping)
 }
 
-/// unifiedレイヤー順（top=front）からグループ間の描画順（背面→前面）を導出する。
-/// 各グループの深さ=所属レイヤーのインデックス平均（大きいほど背面）。
-/// eye/mouth/chest は顔・胸の付随パーツとして body の直前面に固定挿入する。
+/// unifiedレイヤー順（top=front）から出力パーツ間の描画順（背面→前面）を導出する。
+/// 各パーツの深さは原則として所属レイヤーのインデックス平均（大きいほど背面）。
+/// bodyだけは多数の顔・服・首レイヤーを含むため平均だと腕の前後操作が薄まる。
+/// 腕と実際に重なる胴体の基準として topwear を優先し、素材に無ければ順次
+/// bottomwear / neckwear / face / neck / nose を使う。
+/// sway_* は個別の出力名を保持し、髪飾りと獣耳のように前後が異なるパーツを
+/// 一括グループへ潰さない。eye/mouth/chest は body の直前面に固定挿入する。
 pub(crate) fn derive_group_draw_order(
     unified_order: &[String],
     patches: &[LayerPatch],
     mapping: &HashMap<String, String>,
 ) -> Vec<String> {
     const GROUPS: &[&str] = &["hair_back", "hair", "body", "arm_l", "arm_r"];
-    let mut sums: HashMap<&str, (f64, u32)> = HashMap::new();
+    let mut sums: HashMap<String, (f64, u32)> = HashMap::new();
     for (index, layer_name) in unified_order.iter().enumerate() {
         let Some(target) = layer_order_entry_target(layer_name, patches, mapping) else {
             continue;
         };
-        // sway_* 分離パーツは一括の "sways" グループとして位置づける
-        let group = if target.starts_with("sway_") {
-            Some(&"sways")
+        let patch = patches.iter().find(|patch| patch.id == *layer_name);
+        // sway_* はそれぞれ独立した出力PNGなので、ターゲット名をそのまま保持する。
+        // 腕から切り出したパッチも、親腕とは別のz位置を保持するリンクパーツにする。
+        let group = if patch.is_some() && (target == "arm_l" || target == "arm_r") {
+            patch.map(|patch| arm_overlay_part_name(target, &patch.id))
+        } else if target.starts_with("sway_") {
+            Some(target.to_string())
         } else {
-            GROUPS.iter().find(|group| **group == target)
+            GROUPS
+                .iter()
+                .copied()
+                .find(|group| *group == target)
+                .map(str::to_string)
         };
         if let Some(group) = group {
             let entry = sums.entry(group).or_insert((0.0, 0));
@@ -2431,15 +2461,20 @@ pub(crate) fn derive_group_draw_order(
     if sums.is_empty() {
         return Vec::new();
     }
-    let mut order: Vec<(&str, f64)> = sums
+    let mut order: Vec<(String, f64)> = sums
         .into_iter()
         .map(|(group, (sum, count))| (group, sum / count as f64))
         .collect();
-    // top=front なのでインデックス平均の降順 = 背面→前面
+    if let Some(body_depth) = preferred_body_anchor_depth(unified_order, patches, mapping) {
+        if let Some((_, depth)) = order.iter_mut().find(|(group, _)| group == "body") {
+            *depth = body_depth;
+        }
+    }
+    // top=front なので深さの降順 = 背面→前面
     order.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     let mut result: Vec<String> = Vec::new();
     for (group, _) in order {
-        result.push(group.to_string());
+        result.push(group.clone());
         if group == "body" {
             result.push("chest".into());
             result.push("eye".into());
@@ -2447,6 +2482,49 @@ pub(crate) fn derive_group_draw_order(
         }
     }
     result
+}
+
+/// 腕の前後判定に使うbody代表レイヤーの深さを返す。
+/// STEP4ではユーザーが handwear と topwear の局所的な上下を見て調整するため、
+/// body全体の平均ではなく、その見た目に対応する胴体レイヤーを基準にする。
+fn preferred_body_anchor_depth(
+    unified_order: &[String],
+    patches: &[LayerPatch],
+    mapping: &HashMap<String, String>,
+) -> Option<f64> {
+    const BODY_ANCHORS: &[&str] = &[
+        "topwear",
+        "bottomwear",
+        "neckwear",
+        "face",
+        "neck",
+        "nose",
+    ];
+    for anchor in BODY_ANCHORS {
+        let mut sum = 0usize;
+        let mut count = 0usize;
+        for (index, layer_name) in unified_order.iter().enumerate() {
+            // 切り出しパッチは独立した描画位置なので、body基準深度には混ぜない。
+            if patches.iter().any(|patch| patch.id == *layer_name) {
+                continue;
+            }
+            let source_name = patches
+                .iter()
+                .find(|patch| patch.id == layer_name.as_str())
+                .map(|patch| patch.source_layer.as_str())
+                .unwrap_or(layer_name);
+            if normalize_layer_name(source_name) == *anchor
+                && get_mapping_target(source_name, mapping) == Some("body")
+            {
+                sum += index;
+                count += 1;
+            }
+        }
+        if count > 0 {
+            return Some(sum as f64 / count as f64);
+        }
+    }
+    None
 }
 
 fn filter_layer_order_for_target(
@@ -2460,6 +2538,82 @@ fn filter_layer_order_for_target(
         .filter(|layer_name| layer_order_entry_target(layer_name, patches, mapping) == Some(target))
         .cloned()
         .collect()
+}
+
+/// 腕本体と、STEP4で腕から切り出した前景パッチを別々の出力パーツにする。
+/// パッチは描画順だけ独立し、Motion Labでは親腕と同じ変形へ追従する。
+fn build_linked_arm_parts(
+    current: &HashMap<String, DynamicImage>,
+    depth_maps: &HashMap<String, GrayImage>,
+    mapping: &HashMap<String, String>,
+    unified_order: &[String],
+    patches: &[LayerPatch],
+    source_layer_order: &[String],
+    arm_target: &str,
+    width: u32,
+    height: u32,
+) -> Result<HashMap<String, DynamicImage>, AppError> {
+    let mut result = HashMap::new();
+    let arm_order = filter_layer_order_for_target(unified_order, patches, mapping, arm_target);
+    if arm_order.is_empty() {
+        if let Some(image) = merge_layers_for_target(
+            current,
+            depth_maps,
+            mapping,
+            arm_target,
+            source_layer_order,
+            width,
+            height,
+        ) {
+            result.insert(arm_target.to_string(), image);
+        }
+        return Ok(result);
+    }
+
+    let active_patches = active_patches_for_order(patches, &arm_order);
+    let patch_masks = prepare_patch_masks(&active_patches, width, height)?;
+    let patch_ids: HashSet<&str> = active_patches
+        .iter()
+        .map(|patch| patch.id.as_str())
+        .collect();
+
+    let mut main_order: Vec<String> = arm_order
+        .iter()
+        .filter(|layer_name| !patch_ids.contains(layer_name.as_str()))
+        .cloned()
+        .collect();
+    main_order.reverse();
+    let main_layers = collect_ordered_render_layers(
+        current,
+        &main_order,
+        &active_patches,
+        &patch_masks,
+        None,
+    );
+    if !main_layers.is_empty() {
+        result.insert(
+            arm_target.to_string(),
+            compose_depth_gated_layers(main_layers, depth_maps, width, height),
+        );
+    }
+
+    for patch in &active_patches {
+        let overlay_layers = collect_ordered_render_layers(
+            current,
+            std::slice::from_ref(&patch.id),
+            &active_patches,
+            &patch_masks,
+            None,
+        );
+        if !overlay_layers.is_empty() {
+            result.insert(
+                arm_overlay_part_name(arm_target, &patch.id),
+                compose_depth_gated_layers(overlay_layers, depth_maps, width, height),
+            );
+        }
+    }
+
+    Ok(result)
 }
 
 fn ordered_layer_names_for_target(
@@ -3058,32 +3212,89 @@ fn generate_composite_preview(
     parts: &HashMap<String, DynamicImage>,
     width: u32,
     height: u32,
+    draw_order: &[String],
 ) -> String {
-    let mut result = image::RgbaImage::new(width, height);
-    // Layer order: hair_back → body → eye → mouth → hair
-    for key in &["hair_back", "body", "chest", "arm_l", "arm_r"] {
-        if let Some(img) = parts.get(*key) {
-            alpha_composite_onto(&mut result, &img.to_rgba8(), width, height);
-        }
-    }
-    // Find first eye and mouth
-    for (k, img) in parts {
-        if k.starts_with("eye_") {
-            alpha_composite_onto(&mut result, &img.to_rgba8(), width, height);
-            break;
-        }
-    }
-    for (k, img) in parts {
-        if k.starts_with("mouth_") || k == "mouth_closed" {
-            alpha_composite_onto(&mut result, &img.to_rgba8(), width, height);
-            break;
-        }
-    }
-    if let Some(img) = parts.get("hair") {
-        alpha_composite_onto(&mut result, &img.to_rgba8(), width, height);
-    }
+    let result = compose_parts_preview(parts, width, height, draw_order);
     let composite = DynamicImage::ImageRgba8(result);
     image_utils::image_to_base64_png(&composite)
+}
+
+/// 素体パーツを出力時と同じ背面→前面順で合成する。
+/// draw_order が空なら旧データ向けの固定順へフォールバックする。
+fn compose_parts_preview(
+    parts: &HashMap<String, DynamicImage>,
+    width: u32,
+    height: u32,
+    draw_order: &[String],
+) -> RgbaImage {
+    const DEFAULT_ORDER: &[&str] = &[
+        "hair_back",
+        "body",
+        "chest",
+        "arm_l",
+        "arm_r",
+        "sways",
+        "eye",
+        "mouth",
+        "hair",
+    ];
+    let mut result = image::RgbaImage::new(width, height);
+    let order: Vec<&str> = if draw_order.is_empty() {
+        DEFAULT_ORDER.to_vec()
+    } else {
+        draw_order.iter().map(String::as_str).collect()
+    };
+    let explicitly_ordered_sways: HashSet<&str> = order
+        .iter()
+        .copied()
+        .filter(|key| key.starts_with("sway_"))
+        .collect();
+    let mut eye_keys: Vec<&String> = parts
+        .keys()
+        .filter(|key| key.starts_with("eye_"))
+        .collect();
+    eye_keys.sort();
+    let mut mouth_keys: Vec<&String> = parts
+        .keys()
+        .filter(|key| key.starts_with("mouth_") || key.as_str() == "mouth_closed")
+        .collect();
+    mouth_keys.sort();
+
+    for key in order {
+        match key {
+            "eye" => {
+                if let Some(image) = eye_keys.first().and_then(|key| parts.get(*key)) {
+                    alpha_composite_onto(&mut result, &image.to_rgba8(), width, height);
+                }
+            }
+            "mouth" => {
+                if let Some(image) = mouth_keys.first().and_then(|key| parts.get(*key)) {
+                    alpha_composite_onto(&mut result, &image.to_rgba8(), width, height);
+                }
+            }
+            "sways" => {
+                let mut sway_keys: Vec<&String> = parts
+                    .keys()
+                    .filter(|key| {
+                        key.starts_with("sway_")
+                            && !explicitly_ordered_sways.contains(key.as_str())
+                    })
+                    .collect();
+                sway_keys.sort();
+                for sway_key in sway_keys {
+                    if let Some(image) = parts.get(sway_key) {
+                        alpha_composite_onto(&mut result, &image.to_rgba8(), width, height);
+                    }
+                }
+            }
+            _ => {
+                if let Some(image) = parts.get(key) {
+                    alpha_composite_onto(&mut result, &image.to_rgba8(), width, height);
+                }
+            }
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -3131,12 +3342,208 @@ mod tests {
         assert!(order.is_empty());
     }
 
+    #[test]
+    fn derive_group_draw_order_preserves_individual_sway_depths() {
+        // top=front: 髪飾りは前髪より前、左右の獣耳は前髪より後ろ。
+        let unified: Vec<String> = [
+            "headwear",
+            "front_hair",
+            "ears-l",
+            "ears-r",
+            "face",
+            "back_hair",
+        ]
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+        let mapping = HashMap::from([
+            ("headwear".to_string(), "sway_ear".to_string()),
+            ("front_hair".to_string(), "hair".to_string()),
+            ("ears-l".to_string(), "sway_ear_l".to_string()),
+            ("ears-r".to_string(), "sway_ear_r".to_string()),
+            ("face".to_string(), "body".to_string()),
+            ("back_hair".to_string(), "hair_back".to_string()),
+        ]);
+
+        let order = derive_group_draw_order(&unified, &[], &mapping);
+
+        assert_eq!(
+            order,
+            vec![
+                "hair_back",
+                "body",
+                "chest",
+                "eye",
+                "mouth",
+                "sway_ear_r",
+                "sway_ear_l",
+                "hair",
+                "sway_ear",
+            ]
+        );
+    }
+
+    #[test]
+    fn derive_group_draw_order_uses_topwear_for_arm_front_back() {
+        // STEP4の表示順（top=front）。左腕は服より手前、右腕は服より奥。
+        // body全体の平均では body=(2+4+5)/3=3.67 となり、index=3の右腕まで
+        // 誤ってbody前面になるため、topwear(index=2)をbody基準にする。
+        let unified: Vec<String> = [
+            "front_hair",
+            "handwear-l",
+            "topwear",
+            "handwear-r",
+            "face",
+            "neck",
+            "back_hair",
+        ]
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
+        let mapping = HashMap::from([
+            ("front_hair".to_string(), "hair".to_string()),
+            ("handwear-l".to_string(), "arm_l".to_string()),
+            ("topwear".to_string(), "body".to_string()),
+            ("handwear-r".to_string(), "arm_r".to_string()),
+            ("face".to_string(), "body".to_string()),
+            ("neck".to_string(), "body".to_string()),
+            ("back_hair".to_string(), "hair_back".to_string()),
+        ]);
+
+        let order = derive_group_draw_order(&unified, &[], &mapping);
+
+        assert_eq!(
+            order,
+            vec![
+                "hair_back",
+                "arm_r",
+                "body",
+                "chest",
+                "eye",
+                "mouth",
+                "arm_l",
+                "hair",
+            ]
+        );
+    }
+
+    #[test]
+    fn arm_patch_keeps_independent_depth_in_group_order() {
+        // top=front: 指パッチはbody前、切り出し元の左腕はbody後ろ。
+        let unified = vec![
+            "finger_patch".to_string(),
+            "topwear".to_string(),
+            "handwear-l".to_string(),
+        ];
+        let patches = vec![LayerPatch {
+            id: "finger_patch".to_string(),
+            source_layer: "handwear-l".to_string(),
+            mask_png: String::new(),
+            cut_source: true,
+        }];
+        let mapping = HashMap::from([
+            ("topwear".to_string(), "body".to_string()),
+            ("handwear-l".to_string(), "arm_l".to_string()),
+        ]);
+
+        let order = derive_group_draw_order(&unified, &patches, &mapping);
+
+        assert_eq!(
+            order,
+            vec![
+                "arm_l",
+                "body",
+                "chest",
+                "eye",
+                "mouth",
+                "arm_l_overlay_finger_patch",
+            ]
+        );
+    }
+
+    #[test]
+    fn linked_arm_parts_cut_overlay_from_parent_image() {
+        let mut arm_pixels = RgbaImage::new(2, 1);
+        arm_pixels.put_pixel(0, 0, image::Rgba([255, 0, 0, 255]));
+        arm_pixels.put_pixel(1, 0, image::Rgba([0, 255, 0, 255]));
+        let current = HashMap::from([(
+            "handwear-l".to_string(),
+            DynamicImage::ImageRgba8(arm_pixels),
+        )]);
+        let mapping = HashMap::from([("handwear-l".to_string(), "arm_l".to_string())]);
+        let unified = vec!["finger_patch".to_string(), "handwear-l".to_string()];
+        let patches = vec![LayerPatch {
+            id: "finger_patch".to_string(),
+            source_layer: "handwear-l".to_string(),
+            mask_png: encode_test_mask(&[0, 255], 2, 1),
+            cut_source: true,
+        }];
+
+        let parts = build_linked_arm_parts(
+            &current,
+            &HashMap::new(),
+            &mapping,
+            &unified,
+            &patches,
+            &["handwear-l".to_string()],
+            "arm_l",
+            2,
+            1,
+        )
+        .unwrap();
+        let parent = parts.get("arm_l").unwrap().to_rgba8();
+        let overlay = parts
+            .get("arm_l_overlay_finger_patch")
+            .unwrap()
+            .to_rgba8();
+
+        assert_eq!(parent.get_pixel(0, 0)[3], 255);
+        assert_eq!(parent.get_pixel(1, 0)[3], 0);
+        assert_eq!(overlay.get_pixel(0, 0)[3], 0);
+        assert_eq!(overlay.get_pixel(1, 0).0, [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn parts_preview_respects_explicit_arm_order() {
+        let parts = HashMap::from([
+            ("body".to_string(), solid(0, 0, 255)),
+            ("arm_l".to_string(), solid(255, 0, 0)),
+        ]);
+        let behind = ["arm_l", "body"]
+            .iter()
+            .map(|key| key.to_string())
+            .collect::<Vec<_>>();
+        let front = ["body", "arm_l"]
+            .iter()
+            .map(|key| key.to_string())
+            .collect::<Vec<_>>();
+
+        let composite = compose_parts_preview(&parts, 1, 1, &behind);
+        assert_eq!(composite.get_pixel(0, 0).0, [0, 0, 255, 255]);
+        let composite = compose_parts_preview(&parts, 1, 1, &front);
+        assert_eq!(composite.get_pixel(0, 0).0, [255, 0, 0, 255]);
+    }
+
     fn solid(r: u8, g: u8, b: u8) -> DynamicImage {
         DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
             1,
             1,
             image::Rgba([r, g, b, 255]),
         ))
+    }
+
+    fn encode_test_mask(alpha: &[u8], width: u32, height: u32) -> String {
+        let mut image = RgbaImage::new(width, height);
+        for (index, value) in alpha.iter().copied().enumerate() {
+            let x = index as u32 % width;
+            let y = index as u32 / width;
+            image.put_pixel(x, y, image::Rgba([value, value, value, value]));
+        }
+        let mut cursor = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .unwrap();
+        STANDARD.encode(cursor.into_inner())
     }
 
     #[test]

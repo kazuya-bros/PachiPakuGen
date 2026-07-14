@@ -27,6 +27,7 @@ import {
   type InterpStep,
   type BaseStep,
   type WorkspaceStep,
+  type WorkspaceMouthCornerMode,
   type SeeThroughProfile,
   type SeeThroughOptionMode,
   type SeeThroughOptions,
@@ -65,6 +66,17 @@ import { MotionTunePanel } from "./motionLab/MotionTunePanel";
 type Mode = "select" | "workspace" | "base_input" | "hair_edit" | "base_edit" | "correction" | "interp";
 type ThemeMode = "dark" | "light";
 
+const WORKSPACE_MOUTH_CORNER_OPTIONS: Array<{
+  value: WorkspaceMouthCornerMode;
+  label: string;
+  description: string;
+}> = [
+  { value: "source", label: "元画像に合わせる", description: "元画像の口角の向き・強さ・自然な左右差を、各口形へ引き継ぎます。" },
+  { value: "up", label: "少し上げる（楽しい・嬉しい）", description: "口角だけを控えめに上げます。目・眉・頬は変えません。" },
+  { value: "flat", label: "普通・ニュートラル", description: "口角を意図的に上げ下げせず、自然な普通の口元にします。" },
+  { value: "down", label: "少し下げる（不満・怒り）", description: "口角だけを控えめに下げます。目・眉・頬は変えません。" },
+];
+
 function App() {
   const [mode, setMode] = useState<Mode>("select");
   const [themeMode, setThemeMode] = useState<ThemeMode>(() => {
@@ -81,6 +93,9 @@ function App() {
   const [expressionWorkspace, setExpressionWorkspace] = useState<ExpressionWorkspaceResult | null>(null);
   const [workspaceFiles, setWorkspaceFiles] = useState<Record<string, string>>({});
   const [workspaceImagePreviews, setWorkspaceImagePreviews] = useState<Record<string, string>>({});
+  const [workspaceCodexPrompt, setWorkspaceCodexPrompt] = useState("");
+  const [workspaceMouthCorner, setWorkspaceMouthCorner] = useState<WorkspaceMouthCornerMode>("flat");
+  const [workspaceCodexRequestDirty, setWorkspaceCodexRequestDirty] = useState(false);
   const [workspaceGeneratedStatus, setWorkspaceGeneratedStatus] = useState<WorkspaceGeneratedPartsStatus | null>(null);
   const [workspaceExtractResult, setWorkspaceExtractResult] = useState<ExtractCodexGeneratedPartsResult | null>(null);
   const [workspaceCompositePreview, setWorkspaceCompositePreview] = useState<PreviewCodexCompositeResult | null>(null);
@@ -112,17 +127,24 @@ function App() {
   const [seeThroughGpuIndex, setSeeThroughGpuIndex] = useState<number | null>(null);
   /** ユーザーが手動でプロファイルを選んだら、環境確認による推奨自動選択を止める */
   const seeThroughProfileTouched = useRef(false);
+  /** profile/GPU切替時に古い状態確認レスポンスがready表示を上書きしないための世代番号 */
+  const seeThroughStatusRequestId = useRef(0);
+  /** 明示キャンセル後に子プロセス終了エラーを通常の失敗として表示しないための印 */
+  const seeThroughCancelRequested = useRef(false);
   const applyRecommendedSeeThroughProfile = (runtime: SeeThroughRuntimeStatus) => {
     if (seeThroughProfileTouched.current) return;
     if (runtime.recommendedProfile === "low-vram" || runtime.recommendedProfile === "standard") {
       setSeeThroughProfile(runtime.recommendedProfile);
     }
   };
+  const requestedSeeThroughProfile = (): SeeThroughProfile | "auto" =>
+    seeThroughProfileTouched.current ? seeThroughProfile : "auto";
   /** See-Through（Python環境+モデル本体、数〜十数GB）のインストール先 */
   const [seeThroughInstallLocation, setSeeThroughInstallLocation] = useState<{ path: string; isDefault: boolean } | null>(null);
   /** HuggingFaceトークン設定状態（値そのものはフロントへ返さない） */
   const [hfTokenStatus, setHfTokenStatus] = useState<{ configured: boolean } | null>(null);
   const [hfTokenInput, setHfTokenInput] = useState("");
+  const [seeThroughModelDownloadLaunching, setSeeThroughModelDownloadLaunching] = useState(false);
   const [seeThroughSplitParts, setSeeThroughSplitParts] = useState(true);
   const [seeThroughOptions, setSeeThroughOptions] = useState<SeeThroughOptions>(DEFAULT_SEE_THROUGH_OPTIONS);
   const [workspacePartOffsetX, setWorkspacePartOffsetX] = useState(0);
@@ -357,12 +379,34 @@ function App() {
   const hairBackLayerOrderRef = useRef(hairBackLayerOrder);
   hairBackLayerOrderRef.current = hairBackLayerOrder;
 
+  // 旧版では ears* と headwear を同時に獣耳として扱っていたため、髪飾りまで
+  // sway_ear* に保存されている場合がある。明示的な ears* が存在する素材では
+  // headwear は髪飾りとして扱い、過去の誤分類だけを安全に hair へ戻す。
+  useEffect(() => {
+    if (!layerOrder.some(name => /^ears([-_][lr])?$/i.test(name))) return;
+    const misclassifiedHeadwear = layerOrder.filter(name => (
+      /^headwear([-_][lr])?$/i.test(name)
+      && (layerMapping[name] ?? "").startsWith("sway_")
+    ));
+    if (misclassifiedHeadwear.length === 0) return;
+    setLayerMapping(prev => {
+      const next = { ...prev };
+      for (const name of misclassifiedHeadwear) {
+        if ((next[name] ?? "").startsWith("sway_")) next[name] = "hair";
+      }
+      return next;
+    });
+  }, [layerOrder, layerMapping]);
+
   useEffect(() => {
     const unlisten = listen<ProgressPayload>("generation-progress", (event) => {
       setProgress({ current: event.payload.current, total: event.payload.total, pair_name: event.payload.pair_name });
     });
     const unlistenSeeThrough = listen<SeeThroughProgress>("see-through-progress", (event) => {
       setSeeThroughProgress(event.payload);
+      if (event.payload.stage === "model-download-complete" || event.payload.stage === "model-download-failed") {
+        setSeeThroughRuntime(current => current ? { ...current, modelDownloadBusy: false } : current);
+      }
       if (!isNoisySeeThroughWarning(event.payload.message)) {
         // tqdm等の生ログ断片はステータス/ログ履歴に流さず短文へ整形。無意味な断片は捨てる
         const cleaned = sanitizeSeeThroughLogMessage(event.payload.message);
@@ -914,6 +958,10 @@ function App() {
         await invoke<SaveCodexBasePartsResult>("save_codex_base_parts", {
           jobPath: workspacePath,
         });
+        // 素体画像とlayer-order.jsonが更新された時点で、同じ出力フォルダを参照する
+        // 既存のRIFE/Motion Lab結果は古い。再生成されるまで下流を無効化する。
+        setWorkspaceRifeResult(null);
+        setWorkspaceRifePreview(null);
         await refreshWorkspaceCompositePreview().catch(() => null);
         setBaseResult(result);
         setBaseStep(4);
@@ -1320,6 +1368,9 @@ function App() {
         ...(workspace.project.referenceImagePath ? { reference: workspace.project.referenceImagePath } : {}),
       };
       setWorkspaceFiles(nextFiles);
+      setWorkspaceCodexPrompt(workspace.project.codexPrompt ?? "");
+      setWorkspaceMouthCorner(workspace.project.mouthCorner ?? "flat");
+      setWorkspaceCodexRequestDirty(false);
       await loadWorkspaceImagePreviews(nextFiles);
       setWorkspaceGeneratedStatus(null);
       setWorkspaceExtractResult(null);
@@ -1366,11 +1417,13 @@ function App() {
 
   async function restoreWorkspaceProgress(workspace: ExpressionWorkspaceResult) {
     let restoredStep = Math.min(Math.max(workspace.project.currentStep || 1, 1), 7) as WorkspaceStep;
+    let workspaceGeneratedReady = false;
     try {
       const generated = await invoke<WorkspaceGeneratedPartsStatus>("inspect_workspace_generated_parts", {
         workPath: workspace.workPath,
       });
       setWorkspaceGeneratedStatus(generated);
+      workspaceGeneratedReady = generated.ready;
       if (generated.ready && restoredStep < 3) restoredStep = 3;
     } catch {
       // Step 1 workspaces may not have a source image or request files yet.
@@ -1380,7 +1433,6 @@ function App() {
       const loaded = await invoke<LoadCodexExpressionJobResult>("load_codex_expression_job", {
         jobPath: workspace.workPath,
       });
-      setWorkspaceGeneratedStatus(loaded.generatedParts);
       setWorkspaceExtractResult(loaded.extractedParts);
       setWorkspaceRifeResult(loaded.rifeOutput);
       // プレビュー再構築は保存済みbase_partsからのみ行う（推論は走らない）。
@@ -1404,7 +1456,7 @@ function App() {
           restoredStep = compositeReady
             ? (Math.max(restoredStep, 5) as WorkspaceStep)
             : (Math.min(Math.max(restoredStep, 4), 4) as WorkspaceStep);
-        } else if (loaded.generatedParts.ready) {
+        } else if (workspaceGeneratedReady) {
           restoredStep = Math.max(restoredStep, 3) as WorkspaceStep;
         }
       }
@@ -1538,12 +1590,13 @@ function App() {
           workPath: expressionWorkspace.workPath,
           sourceImagePath: workspaceFiles.source,
           referenceImagePath: workspaceFiles.reference || null,
-          prompt: "Keep character identity, pose, hair, clothes, lighting, and background unchanged. Edit only the requested eyes or mouth.",
-          mouthCorner: "neutral",
+          prompt: workspaceCodexPrompt,
+          mouthCorner: workspaceMouthCorner,
           mouthSize: "normal",
         },
       });
       setWorkspaceGeneratedStatus(status);
+      setWorkspaceCodexRequestDirty(false);
       await setWorkspaceStepAndPersist(2);
       setStatus("Codex依頼ファイルを作成しました。依頼フォルダの内容をCodexへ渡してください");
       showToast("依頼ファイルを作成しました");
@@ -1571,13 +1624,18 @@ function App() {
     }
   }
 
-  async function refreshWorkspaceSeeThroughStatus() {
+  async function refreshWorkspaceSeeThroughStatus(
+    profile: SeeThroughProfile | "auto" = requestedSeeThroughProfile(),
+  ) {
+    const requestId = ++seeThroughStatusRequestId.current;
     setError("");
+    setSeeThroughRuntime(null);
     setWorkspaceBusy(true);
     setSeeThroughProgress({ stage: "status", percent: 0, message: "See-Through環境を確認しています" });
     setStatus("See-Through環境を確認しています");
     try {
-      const runtime = await invoke<SeeThroughRuntimeStatus>("get_see_through_runtime_status");
+      const runtime = await invoke<SeeThroughRuntimeStatus>("get_see_through_runtime_status", { profile });
+      if (requestId !== seeThroughStatusRequestId.current) return;
       setSeeThroughRuntime(runtime);
       applyRecommendedSeeThroughProfile(runtime);
       await invoke<Array<{ index: number; name: string; memoryMb: number }>>("list_see_through_gpus")
@@ -1589,12 +1647,35 @@ function App() {
       await invoke<{ configured: boolean }>("get_hf_token_status")
         .then(setHfTokenStatus)
         .catch(() => setHfTokenStatus(null));
+      if (requestId !== seeThroughStatusRequestId.current) return;
       setStatus(runtime.message);
       setSeeThroughProgress({ stage: "status", percent: 100, message: runtime.message });
     } catch (cause) {
-      setError(String(cause));
+      if (requestId === seeThroughStatusRequestId.current) setError(String(cause));
     } finally {
-      setWorkspaceBusy(false);
+      if (requestId === seeThroughStatusRequestId.current) setWorkspaceBusy(false);
+    }
+  }
+
+  async function changeSeeThroughGpuSelection(gpuIndex: number | null) {
+    const requestId = ++seeThroughStatusRequestId.current;
+    setError("");
+    setSeeThroughRuntime(null);
+    setWorkspaceBusy(true);
+    setSeeThroughGpuIndex(gpuIndex);
+    try {
+      await invoke("set_see_through_gpu", { gpuIndex });
+      const runtime = await invoke<SeeThroughRuntimeStatus>("get_see_through_runtime_status", {
+        profile: requestedSeeThroughProfile(),
+      });
+      if (requestId !== seeThroughStatusRequestId.current) return;
+      setSeeThroughRuntime(runtime);
+      applyRecommendedSeeThroughProfile(runtime);
+      setStatus(runtime.message);
+    } catch (cause) {
+      if (requestId === seeThroughStatusRequestId.current) setError(String(cause));
+    } finally {
+      if (requestId === seeThroughStatusRequestId.current) setWorkspaceBusy(false);
     }
   }
 
@@ -1665,18 +1746,72 @@ function App() {
   }
 
   async function prepareWorkspaceSeeThroughRuntime() {
+    ++seeThroughStatusRequestId.current;
+    seeThroughCancelRequested.current = false;
     setError("");
+    setSeeThroughRuntime(null);
     setWorkspaceBusy(true);
+    setSeeThroughStartedAt(Date.now());
+    setSeeThroughElapsedSeconds(0);
+    setSeeThroughPhase(null);
     setSeeThroughProgress({ stage: "prepare", percent: 0, message: "See-Throughを準備しています" });
     try {
-      const runtime = await invoke<SeeThroughRuntimeStatus>("prepare_see_through_runtime");
+      const runtime = await invoke<SeeThroughRuntimeStatus>("prepare_see_through_runtime", {
+        profile: requestedSeeThroughProfile(),
+      });
       setSeeThroughRuntime(runtime);
       applyRecommendedSeeThroughProfile(runtime);
       setStatus(runtime.message);
     } catch (cause) {
-      setError(String(cause));
+      if (seeThroughCancelRequested.current) {
+        setError("");
+        setStatus("ランタイムのセットアップを中止しました。もう一度実行できます");
+        setSeeThroughProgress({ stage: "cancelled", percent: 0, message: "ランタイムのセットアップを中止しました" });
+      } else {
+        setError(String(cause));
+      }
     } finally {
       setWorkspaceBusy(false);
+      setSeeThroughStartedAt(null);
+      setSeeThroughPhase(null);
+      seeThroughCancelRequested.current = false;
+    }
+  }
+
+  async function cancelWorkspaceSeeThroughSetup() {
+    seeThroughCancelRequested.current = true;
+    setError("");
+    setStatus("See-Throughセットアップを中止しています");
+    try {
+      const cancelled = await invoke<boolean>("cancel_see_through");
+      if (!cancelled) {
+        seeThroughCancelRequested.current = false;
+        setError("停止対象のSee-Throughプロセスが見つかりませんでした");
+      }
+    } catch (cause) {
+      seeThroughCancelRequested.current = false;
+      setError(String(cause));
+    }
+  }
+
+  async function startWorkspaceSeeThroughModelDownload() {
+    setError("");
+    setSeeThroughModelDownloadLaunching(true);
+    try {
+      const launch = await invoke<{ started: boolean; message: string }>("start_see_through_model_download", {
+        profile: requestedSeeThroughProfile(),
+      });
+      setStatus(launch.started ? `${launch.message}。完了までコンソールを開いたままにしてください` : launch.message);
+      if (launch.started) {
+        setSeeThroughProgress({ stage: "model-download-external", percent: 0, message: launch.message });
+        setSeeThroughRuntime(current => current ? { ...current, modelDownloadBusy: true } : current);
+      } else {
+        void refreshWorkspaceSeeThroughStatus();
+      }
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setSeeThroughModelDownloadLaunching(false);
     }
   }
 
@@ -1685,8 +1820,8 @@ function App() {
       setError("立ち絵とCodex成果物を先に揃えてください");
       return;
     }
-    if (!seeThroughRuntime?.ready) {
-      setError("See-Throughの初回セットアップを先に完了してください");
+    if (!seeThroughRuntime?.ready || seeThroughRuntime.selectedProfile !== seeThroughProfile) {
+      setError(seeThroughRuntime?.message ?? "See-Throughの初回セットアップを先に完了してください");
       return;
     }
     setError("");
@@ -1718,14 +1853,19 @@ function App() {
         setStatus("左右パーツ分解がこの素材では失敗したため、左右分解なしで処理を続行しました（目・耳は左右一体のレイヤーになります）");
       }
       if (base.oomRetryNote) {
-        showToast(`GPUエラーのため設定を変更して続行しています（${base.oomRetryNote}）`);
-        pushWorkspaceLog("info", `警告: GPUエラーのため自動リトライしました（${base.oomRetryNote}）`);
-        // 高VRAM（非量子化）へ切り替わった場合はUIのプロファイル表示も揃える
-        if (base.oomRetryNote.includes("高VRAM") || base.oomRetryNote.includes("standard")) {
-          seeThroughProfileTouched.current = true;
-          setSeeThroughProfile("standard");
-        }
+        showToast(`推論エラーのため設定を変更して続行しています（${base.oomRetryNote}）`);
+        pushWorkspaceLog("info", `警告: 推論エラーのため自動リトライしました（${base.oomRetryNote}）`);
+        // 自動リトライで実際に成功したprofileを次回以降も使い、autoが失敗側へ戻るのを防ぐ
+        seeThroughProfileTouched.current = true;
+        setSeeThroughProfile(base.selectedProfile as SeeThroughProfile);
       }
+      const effectiveSeeThroughOptions = base.effectiveOptions ?? seeThroughOptions;
+      if (base.effectiveOptions) setSeeThroughOptions(base.effectiveOptions);
+      const runtimeAfterInference = await invoke<SeeThroughRuntimeStatus>("get_see_through_runtime_status", {
+        profile: base.selectedProfile,
+      });
+      ++seeThroughStatusRequestId.current;
+      setSeeThroughRuntime(runtimeAfterInference);
       await invoke<string>("cache_codex_source_see_through", {
         jobPath: expressionWorkspace.workPath,
         psdPath: base.psdPath,
@@ -1745,8 +1885,12 @@ function App() {
         // 1回目の呼び出しで確定した実際のプロファイルをそのまま使う（"auto"を再解決しない）
         profile: base.selectedProfile,
         splitParts: effectiveSplitParts,
-        options: seeThroughOptions,
+        options: effectiveSeeThroughOptions,
       });
+      seeThroughProfileTouched.current = true;
+      setSeeThroughProfile(extracted.selectedProfile as SeeThroughProfile);
+      if (extracted.effectiveOptions) setSeeThroughOptions(extracted.effectiveOptions);
+      setSeeThroughSplitParts(extracted.splitParts);
       // 左右分解フォールバック等の警告は作業ログへ残す（トーストでは流れてしまうため）
       for (const warning of extracted.warnings) {
         pushWorkspaceLog("info", `警告: ${warning}`);
@@ -1755,8 +1899,8 @@ function App() {
         setSeeThroughSplitParts(false);
         showToast("左右パーツ分解に失敗したため、分解なしで続行しました");
       }
-      if (extracted.warnings.some(warning => warning.includes("GPUエラーのため自動リトライしました"))) {
-        showToast("GPUエラーのため設定を変更して続行しました");
+      if (extracted.warnings.some(warning => warning.includes("推論エラーのため自動リトライしました"))) {
+        showToast("推論エラーのため設定を変更して続行しました");
       }
       // 期待する全表情（目開閉＋口6種）のうち、抽出できず欠落したものを明示する
       const EXPECTED_EXPRESSION_PARTS = ["eyes-open", "eyes-closed", "mouth-closed", "mouth-a", "mouth-i", "mouth-u", "mouth-e", "mouth-o"];
@@ -1811,6 +1955,7 @@ function App() {
         },
       });
       setWorkspaceExtractResult({
+        ...workspaceExtractResult,
         extractedPartsPath: result.extractedPartsPath,
         // 個別適用時は対象1件しか返らないため、一覧は維持する
         extractedParts: workspaceAdjustTarget === "all" ? result.adjustedParts : workspaceExtractResult.extractedParts,
@@ -1849,11 +1994,15 @@ function App() {
       setError("先にSee-Through一括分解を完了してください");
       return;
     }
+    // 出力先は毎回同じため、古いMotionTunePanelを先にアンマウントしてキャッシュを捨てる。
+    // 成功後に結果を再設定すると、新しいPNGとlayer-order.jsonを必ず読み直す。
+    setWorkspaceRifeResult(null);
+    setWorkspaceRifePreview(null);
     setWorkspaceBusy(true);
     try {
       await invoke<SaveCodexBasePartsResult>("save_codex_base_parts", {
         jobPath: expressionWorkspace.workPath,
-      }).catch(() => null);
+      });
       const result = await invoke<GenerateCodexRifeOutputResult>("generate_codex_rife_outputs", {
         jobPath: expressionWorkspace.workPath,
         frameCount,
@@ -2227,7 +2376,7 @@ function App() {
       if (workspaceBusy) return false;
       if (step === 1) return true;
       if (step === 2) return !!workspaceFiles.source;
-      if (step === 3) return !!workspaceGeneratedStatus?.ready;
+      if (step === 3) return !!workspaceGeneratedStatus?.ready && !workspaceCodexRequestDirty;
       if (step === 4) return !!mappingPreview || !!workspaceFiles.source;
       if (step === 5) return !!workspaceExtractResult && !!workspaceCompositePreview?.basePreview;
       if (step === 6) return !!workspaceExtractResult && !!workspaceCompositePreview?.basePreview;
@@ -2236,13 +2385,15 @@ function App() {
     const canAdvanceWorkspaceStep = () => {
       if (workspaceBusy) return false;
       if (workspaceStep === 1) return !!workspaceFiles.source;
-      if (workspaceStep === 2) return !!workspaceGeneratedStatus?.ready;
+      if (workspaceStep === 2) return !!workspaceGeneratedStatus?.ready && !workspaceCodexRequestDirty;
       if (workspaceStep === 3) return !!mappingPreview;
       if (workspaceStep === 4) return !!workspaceCompositePreview?.basePreview;
       if (workspaceStep === 5) return !!workspaceExtractResult && !!workspaceCompositePreview?.basePreview;
       if (workspaceStep === 6) return !!workspaceRifeResult;
       return false;
     };
+    const runtimeMatchesSelectedProfile = seeThroughRuntime?.selectedProfile === seeThroughProfile;
+    const selectedProfileReady = !!seeThroughRuntime?.ready && runtimeMatchesSelectedProfile;
     const seeThroughRunning = workspaceBusy && !!seeThroughProgress && ["prepare", "inference", "load"].includes(seeThroughProgress.stage);
     const activePreviewSet = workspaceStep >= 6 && workspaceRifePreview ? workspaceRifePreview : workspaceCompositePreview;
     const selectedPreview = workspaceSelectedPreviewPart === "base"
@@ -2268,9 +2419,11 @@ function App() {
       switch (workspaceStep) {
         case 1: return "立ち絵を選択すると次へ進めます";
         case 2: {
-          const missing = workspaceGeneratedStatus?.missingParts.length ?? 0;
-          return missing > 0
-            ? `Codex成果物が揃うと進めます（残り${missing}ファイル）`
+          if (workspaceCodexRequestDirty) return "依頼設定を指示書へ反映すると進めます";
+          const pending = (workspaceGeneratedStatus?.missingParts.length ?? 0)
+            + (workspaceGeneratedStatus?.staleParts?.length ?? 0);
+          return pending > 0
+            ? `Codex成果物が揃うと進めます（未生成・再生成が残り${pending}ファイル）`
             : "「依頼ファイルを作成」してCodexの成果物を配置してください";
         }
         case 3: return "「一括分解を開始」が完了すると次へ進めます";
@@ -2354,7 +2507,8 @@ function App() {
 
             {workspaceStep === 2 && (() => {
               // ①依頼作成 → ②Codexで生成（このアプリの外の作業）→ ③配置確認 の現在地
-              const codexPhase = workspaceGeneratedStatus?.ready ? 3 : workspaceGeneratedStatus ? 2 : 1;
+              const codexPhase = workspaceCodexRequestDirty ? 1 : workspaceGeneratedStatus?.ready ? 3 : workspaceGeneratedStatus ? 2 : 1;
+              const mouthCornerDescription = WORKSPACE_MOUTH_CORNER_OPTIONS.find(option => option.value === workspaceMouthCorner)?.description ?? "";
               return (
               <>
                 <div className="workspace-panel-heading">
@@ -2362,6 +2516,43 @@ function App() {
                   <h3>Codex依頼を作成</h3>
                   <p>この工程の画像生成はアプリの外（Codex）で行います。</p>
                 </div>
+                <div className="workspace-mouth-corner-setting">
+                  <label>
+                    <span>口角の向き</span>
+                    <select
+                      aria-label="生成する口画像の口角"
+                      value={workspaceMouthCorner}
+                      disabled={workspaceBusy}
+                      onChange={(event) => {
+                        setWorkspaceMouthCorner(event.target.value as WorkspaceMouthCornerMode);
+                        setWorkspaceCodexRequestDirty(true);
+                      }}
+                    >
+                      {WORKSPACE_MOUTH_CORNER_OPTIONS.map(option => (
+                        <option key={option.value} value={option.value}>{option.label}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <p>{mouthCornerDescription}<small>閉じ口＋あいうえおの6枚に共通適用。閉じ目画像の口は元画像のまま維持します。</small></p>
+                </div>
+                <details className="advanced-prompt">
+                  <summary>追加指示（任意）{workspaceCodexRequestDirty ? " — 依頼書へ未反映" : ""}</summary>
+                  <textarea
+                    aria-label="Codexへの追加指示"
+                    value={workspaceCodexPrompt}
+                    maxLength={2000}
+                    disabled={workspaceBusy}
+                    placeholder="例: このキャラクター固有の口内色を維持する。口以外の表情は元画像から変えない。"
+                    onChange={(event) => {
+                      setWorkspaceCodexPrompt(event.target.value);
+                      setWorkspaceCodexRequestDirty(true);
+                    }}
+                  />
+                  <p className="workspace-codex-prompt-note">
+                    入力内容は唯一の指示書の「追加指示」に入ります。共通の変更範囲や口形仕様と矛盾する場合は共通ルールが優先されます。
+                    <span>{workspaceCodexPrompt.length}/2000</span>
+                  </p>
+                </details>
                 <div className="workspace-codex-steps">
                   <section className={`workspace-codex-card${codexPhase === 1 ? " current" : ""}`}>
                     <div>
@@ -2370,7 +2561,7 @@ function App() {
                       <p>PachiPakuGenがCodex向けの指示書と元画像を <code>01_codex_request</code> に書き出します。</p>
                     </div>
                     <div className="workspace-action-row">
-                      <button className="btn btn-primary" disabled={workspaceBusy || !workspaceFiles.source} onClick={() => void prepareWorkspaceCodexRequest()}>依頼ファイルを作成</button>
+                      <button className="btn btn-primary" disabled={workspaceBusy || !workspaceFiles.source} onClick={() => void prepareWorkspaceCodexRequest()}>{workspaceGeneratedStatus && workspaceCodexRequestDirty ? "指示書を更新" : "依頼ファイルを作成"}</button>
                     </div>
                   </section>
                   <section className={`workspace-codex-card${codexPhase === 2 ? " current" : ""}`}>
@@ -2389,7 +2580,9 @@ function App() {
                       <span>3</span>
                       <strong>配置を確認 {codexPhase === 3 ? <em className="workspace-phase-done">✓ 揃いました</em> : codexPhase === 2 ? <em className="workspace-phase-badge">自動確認中</em> : null}</strong>
                       <p>
-                        {workspaceGeneratedStatus?.ready
+                        {workspaceCodexRequestDirty
+                          ? "口角設定または追加指示を反映するため、指示書を更新してください。"
+                          : workspaceGeneratedStatus?.ready
                           ? "すべて揃いました。「次へ」で進んでください。"
                           : codexPhase === 2
                             ? `5秒ごとに自動確認中（${workspaceGeneratedStatus?.presentParts.length ?? 0}/${workspaceGeneratedStatus?.expectedParts.length ?? 7}）`
@@ -2399,10 +2592,11 @@ function App() {
                         <div className="workspace-parts-checklist">
                           {workspaceGeneratedStatus.expectedParts.map(part => {
                             const present = workspaceGeneratedStatus.presentParts.includes(part);
-                            const mismatch = workspaceGeneratedStatus.sizeMismatches.includes(part);
+                            const stale = workspaceGeneratedStatus.staleParts?.includes(part) ?? false;
+                            const mismatch = workspaceGeneratedStatus.sizeMismatches.some(item => item.startsWith(`${part}.png:`));
                             return (
-                              <span key={part} className={mismatch ? "mismatch" : present ? "present" : "missing"} title={mismatch ? "サイズが立ち絵と一致していません。立ち絵と同じ縦横サイズで再生成してください" : present ? "配置済み" : "未配置"}>
-                                <b>{mismatch ? "⚠" : present ? "✓" : "・"}</b>{part}
+                              <span key={part} className={mismatch ? "mismatch" : stale ? "stale" : present ? "present" : "missing"} title={mismatch ? "サイズが立ち絵と一致していません。立ち絵と同じ縦横サイズで再生成してください" : stale ? "依頼書の設定変更後に再生成してください" : present ? "配置済み" : "未配置"}>
+                                <b>{mismatch ? "⚠" : stale ? "↻" : present ? "✓" : "・"}</b>{part}
                               </span>
                             );
                           })}
@@ -2429,31 +2623,95 @@ function App() {
                   <div className="workspace-step3-env">
                     <div className="workspace-action-row">
                       <button className="btn btn-secondary" disabled={workspaceBusy} onClick={() => void refreshWorkspaceSeeThroughStatus()}>環境を再確認</button>
-                      {seeThroughRuntime?.ready ? (
-                        <span className="workspace-action-done">セットアップ済み</span>
-                      ) : (
-                        <button className="btn btn-secondary" disabled={workspaceBusy} onClick={() => void prepareWorkspaceSeeThroughRuntime()}>初回セットアップ</button>
+                      {selectedProfileReady ? (
+                        <span className="workspace-action-done">
+                          セットアップ済み（{seeThroughRuntime.selectedProfile === "low-vram" ? "省VRAM" : "高VRAM"}）
+                        </span>
+                      ) : null}
+                      {workspaceBusy && seeThroughProgress?.stage === "prepare" && (
+                        <button className="btn btn-secondary" onClick={() => void cancelWorkspaceSeeThroughSetup()}>
+                          ランタイム構築を中止
+                        </button>
                       )}
                     </div>
                   </div>
                 </div>
+                <div className={`workspace-process-card${!seeThroughRuntime?.runtimeReady ? " primary" : ""}`}>
+                  <div>
+                    <span>準備 1/2</span>
+                    <strong>ランタイム初期セットアップ</strong>
+                    <p>See-Through本体、専用Python環境、CUDA依存関係だけをアプリ内で準備します。大容量モデルはまだ取得しません。</p>
+                  </div>
+                  <div className="workspace-action-row">
+                    {seeThroughRuntime?.runtimeReady ? (
+                      <span className="workspace-action-done">準備済み</span>
+                    ) : (
+                      <button className="btn btn-secondary" disabled={workspaceBusy} onClick={() => void prepareWorkspaceSeeThroughRuntime()}>
+                        ランタイムをセットアップ
+                      </button>
+                    )}
+                  </div>
+                </div>
+                <div className={`workspace-process-card${seeThroughRuntime?.runtimeReady && !selectedProfileReady ? " primary" : ""}`}>
+                  <div>
+                    <span>準備 2/2</span>
+                    <strong>モデルを事前ダウンロード</strong>
+                    <p>
+                      選択中の{seeThroughProfile === "low-vram" ? "省VRAM" : "高VRAM"}モデル
+                      （約{seeThroughProfile === "low-vram" ? "5.7" : "13.4"}GB）を別コンソールで取得します。実バイト進捗を確認でき、ウィンドウを閉じても再実行時に途中から再開します。
+                    </p>
+                  </div>
+                  <div className="workspace-action-row">
+                    {selectedProfileReady ? (
+                      <span className="workspace-action-done">モデル準備済み</span>
+                    ) : seeThroughRuntime?.modelDownloadBusy ? (
+                      <span className="workspace-action-done">別コンソールで取得中</span>
+                    ) : (
+                      <button
+                        className="btn btn-secondary"
+                        disabled={workspaceBusy || seeThroughModelDownloadLaunching || !seeThroughRuntime?.runtimeReady}
+                        onClick={() => void startWorkspaceSeeThroughModelDownload()}
+                      >
+                        {seeThroughModelDownloadLaunching ? "コンソールを起動中..." : "モデルDL用コンソールを開く"}
+                      </button>
+                    )}
+                  </div>
+                </div>
+                {seeThroughRuntime && !selectedProfileReady && (
+                  <div className={`motion-lab-note${seeThroughRuntime.runtimeReady ? " workspace-setup-error" : ""}`} role={seeThroughRuntime.runtimeReady ? "alert" : undefined}>
+                    <strong>{seeThroughRuntime.runtimeReady ? "モデル未準備:" : "ランタイム未準備:"}</strong> {seeThroughRuntime.message}
+                  </div>
+                )}
+                {hfTokenStatus?.configured === false && !selectedProfileReady && (
+                  <div className="motion-lab-note" role="status">
+                    別コンソールでの大容量モデル取得ではHuggingFaceトークンの設定を推奨します。匿名取得はレート制限で遅くなるため、下の「詳細設定」で無料のreadトークンを保存してから開始してください。
+                  </div>
+                )}
                 <div className="workspace-seethrough-options">
                   <div className="workspace-option-card">
                     <span>実行プロファイル</span>
                     <div className="workspace-segmented">
                       <button
                         className={seeThroughProfile === "low-vram" ? "active" : ""}
-                        disabled={workspaceBusy}
+                        disabled={workspaceBusy || !!seeThroughRuntime?.modelDownloadBusy}
                         title="目安: VRAM 8GB級でも動くようモデルを退避しながら実行します（低速）"
-                        onClick={() => { seeThroughProfileTouched.current = true; setSeeThroughProfile("low-vram"); }}
+                        onClick={() => {
+                          seeThroughProfileTouched.current = true;
+                          setSeeThroughProfile("low-vram");
+                          void refreshWorkspaceSeeThroughStatus("low-vram");
+                        }}
                       >
                         省VRAM{seeThroughRuntime?.recommendedProfile === "low-vram" && <em className="workspace-recommend-badge">推奨</em>}
                       </button>
                       <button
                         className={seeThroughProfile === "standard" ? "active" : ""}
-                        disabled={workspaceBusy}
+                        disabled={workspaceBusy || !!seeThroughRuntime?.modelDownloadBusy}
                         title="目安: VRAM 16GB以上のGPU向け。退避なしで最速です"
-                        onClick={() => { seeThroughProfileTouched.current = true; setSeeThroughProfile("standard"); }}
+                        onClick={() => {
+                          seeThroughProfileTouched.current = true;
+                          setSeeThroughProfile("standard");
+                          void refreshWorkspaceSeeThroughStatus("standard");
+                        }}
                       >
                         高VRAM{seeThroughRuntime?.recommendedProfile === "standard" && <em className="workspace-recommend-badge">推奨</em>}
                       </button>
@@ -2464,14 +2722,10 @@ function App() {
                         <span>使用GPU</span>
                         <select
                           value={seeThroughGpuIndex ?? "auto"}
-                          disabled={workspaceBusy}
+                          disabled={workspaceBusy || !!seeThroughRuntime?.modelDownloadBusy}
                           onChange={(event) => {
                             const value = event.target.value === "auto" ? null : Number(event.target.value);
-                            setSeeThroughGpuIndex(value);
-                            void invoke("set_see_through_gpu", { gpuIndex: value })
-                              .then(() => invoke<SeeThroughRuntimeStatus>("get_see_through_runtime_status"))
-                              .then(runtime => { setSeeThroughRuntime(runtime); applyRecommendedSeeThroughProfile(runtime); })
-                              .catch(cause => setError(String(cause)));
+                            void changeSeeThroughGpuSelection(value);
                           }}
                         >
                           <option value="auto">自動（最大VRAMのGPU）</option>
@@ -2507,30 +2761,30 @@ function App() {
                     <div className="workspace-option-grid">
                       <label title="生成の乱数シード。同じ値なら同じ分解結果になります。分解結果が気に入らない時に値を変えて再実行してください"><span>Seed <i className="workspace-info-mark">?</i></span><input type="number" value={seeThroughOptions.seed} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, seed: Number(event.target.value) })} /></label>
                       <label title="レイヤー分解の処理解像度。大きいほど輪郭が精細になりますがVRAM消費と処理時間が増えます"><span>LayerDiff解像度 <i className="workspace-info-mark">?</i></span><input type="number" min={256} max={4096} step={64} value={seeThroughOptions.resolution} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, resolution: Number(event.target.value) })} /></label>
-                      <label title="深度（前後関係）推定の処理解像度。-1で自動。レイヤー前後の判定が怪しい時に上げます"><span>Depth解像度 <i className="workspace-info-mark">?</i></span><input type="number" min={-1} max={4096} step={64} value={seeThroughOptions.resolutionDepth} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, resolutionDepth: Number(event.target.value) })} /></label>
+                      <label title="深度（前後関係）推定の処理解像度。-1で自動、それ以外は256〜4096の64倍数。レイヤー前後の判定が怪しい時に上げます"><span>Depth解像度 <i className="workspace-info-mark">?</i></span><input type="number" min={-1} max={4096} step={1} value={seeThroughOptions.resolutionDepth} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, resolutionDepth: Number(event.target.value) })} /></label>
                       <label title="レイヤー分解の推論ステップ数。多いほど品質が上がりますが遅くなります（既定30）"><span>LayerDiff step <i className="workspace-info-mark">?</i></span><input type="number" min={1} max={150} value={seeThroughOptions.inferenceSteps} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, inferenceSteps: Number(event.target.value) })} /></label>
                       <label title="深度推定のステップ数。-1で自動。省VRAMプロファイルでは固定のため変更できません"><span>Depth step <i className="workspace-info-mark">?</i></span><input type="number" min={-1} max={150} value={seeThroughOptions.inferenceStepsDepth} disabled={workspaceBusy || seeThroughProfile === "low-vram"} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, inferenceStepsDepth: Number(event.target.value) })} /></label>
                       <label title="モデルをブロック単位でCPUメモリへ退避してVRAMを節約します（少し低速）。「自動」はプロファイルの既定動作に任せます。VRAM不足エラーが出る時に有効化"><span>Group offload <i className="workspace-info-mark">?</i></span><select value={seeThroughOptions.groupOffload} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, groupOffload: event.target.value as SeeThroughOptionMode })}><option value="default">自動（推奨）</option><option value="on">有効</option><option value="off">無効</option></select></label>
-                      <label title="モデル全体をCPUへ退避する最も強い省VRAM設定（大きく低速）。「自動」はプロファイルの既定動作に任せます。高VRAMプロファイルでは使いません"><span>CPU offload <i className="workspace-info-mark">?</i></span><select value={seeThroughOptions.cpuOffload} disabled={workspaceBusy || seeThroughProfile === "standard"} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, cpuOffload: event.target.value as SeeThroughOptionMode })}><option value="default">自動（推奨）</option><option value="on">有効</option><option value="off">無効</option></select></label>
+                      <label title="大型UNetをCPUへ退避する互換設定（低速）。本家のカスタムVAEはGPUに残るため、処理条件によってはピークVRAMが減らないことがあります。有効時はGroup offloadより優先します。通常は自動を推奨します"><span>CPU offload <i className="workspace-info-mark">?</i></span><select value={seeThroughOptions.cpuOffload} disabled={workspaceBusy || seeThroughProfile === "standard"} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, cpuOffload: event.target.value as SeeThroughOptionMode })}><option value="default">自動（推奨）</option><option value="on">有効（互換設定）</option><option value="off">無効</option></select></label>
                     </div>
                     <div className="workspace-option-header">
-                      <span>インストール先（Python環境+モデル本体、初回は約13〜18GB）</span>
+                      <span>インストール先（Python環境+選択モデル、省VRAM約14GB / 高VRAM約22GB）</span>
                     </div>
                     <div className="workspace-install-location">
                       <small title={seeThroughInstallLocation?.path} className="workspace-install-location-path">
                         {seeThroughInstallLocation?.path ?? "取得中..."}
                         {seeThroughInstallLocation?.isDefault && <em className="workspace-recommend-badge">既定</em>}
                       </small>
-                      <button className="btn btn-secondary" disabled={workspaceBusy} onClick={() => void changeSeeThroughInstallLocation()}>変更...</button>
+                      <button className="btn btn-secondary" disabled={workspaceBusy || !!seeThroughRuntime?.modelDownloadBusy} onClick={() => void changeSeeThroughInstallLocation()}>変更...</button>
                       {seeThroughInstallLocation && !seeThroughInstallLocation.isDefault && (
-                        <button className="btn btn-secondary" disabled={workspaceBusy} onClick={() => void resetSeeThroughInstallLocation()}>既定に戻す</button>
+                        <button className="btn btn-secondary" disabled={workspaceBusy || !!seeThroughRuntime?.modelDownloadBusy} onClick={() => void resetSeeThroughInstallLocation()}>既定に戻す</button>
                       )}
                     </div>
                     <div className="motion-lab-note">
-                      C:ドライブの空き容量が少ない場合に、大きな空きのあるドライブへ変更できます。変更すると新しい場所で初回セットアップ（Python環境構築+モデルダウンロード）が必要です。既存のインストール先にあるデータは自動移動されません。
+                      C:ドライブの空き容量が少ない場合に、大きな空きのあるドライブへ変更できます。変更すると新しい場所でランタイム構築とモデル事前ダウンロードがそれぞれ必要です。別プロファイルへ切り替える場合は、そのモデルを追加取得します。既存のインストール先にあるデータは自動移動されません。
                     </div>
                     <div className="workspace-option-header">
-                      <span>HuggingFaceトークン（任意・モデルDLの高速化）</span>
+                      <span>HuggingFaceトークン（初回モデルDLで推奨）</span>
                     </div>
                     <div className="workspace-install-location">
                       {hfTokenStatus?.configured ? (
@@ -2552,13 +2806,13 @@ function App() {
                       )}
                     </div>
                     <div className="motion-lab-note">
-                      未設定でも動作しますが、匿名アクセスはHuggingFace側のレート制限で低速になったり、初回や再ダウンロード時に長く待たされることがあります。huggingface.co/settings/tokens で無料のトークンを発行して貼り付けると改善します。トークンはWindowsの資格情報マネージャーに安全に保存され、値が画面に表示されることはありません。
+                      匿名取得も可能ですが、HuggingFace側のレート制限で低速になります。モデルDL用コンソールを開く前にhuggingface.co/settings/tokens で無料のreadトークンを発行して貼り付けてください。保存済みトークンはコンソールの環境変数にだけ渡され、コマンド行や画面には表示されません。
                     </div>
                   </details>
                 </div>
                 <div className="workspace-start-seethrough">
                   <div><strong>分解処理を開始</strong><p>立ち絵、閉じ目、閉じ口、あいうえお口の素材をまとめて分解します。</p></div>
-                  <button className="btn btn-primary" disabled={workspaceBusy || !seeThroughRuntime?.ready || !workspaceGeneratedStatus?.ready} onClick={() => void runWorkspaceSeeThroughBatch()}>{seeThroughRunning ? "分解処理中..." : "一括分解を開始"}</button>
+                  <button className="btn btn-primary" disabled={workspaceBusy || !selectedProfileReady || !workspaceGeneratedStatus?.ready} onClick={() => void runWorkspaceSeeThroughBatch()}>{seeThroughRunning ? "分解処理中..." : "一括分解を開始"}</button>
                 </div>
               </>
             )}
@@ -2879,16 +3133,25 @@ function App() {
         return next;
       });
     };
-    // 獣耳分離オプション: ears(-l/-r) / headwear（犬耳・獣耳がheadwear扱いのキャラ用）を
-    // sway_ear* として独立出力（Motion Lab の獣耳ピコピコ・SpriTalk の汎用揺れパーツ用）
-    const earSplitLayers = layerOrder.filter(name => /^(ears|headwear)([-_][lr])?$/i.test(name));
+    // 獣耳分離オプション: 明示的な ears(-l/-r) を優先する。ears* が無い素材でのみ
+    // headwear（犬耳・獣耳がheadwear扱いのキャラ）をフォールバックとして使う。
+    const explicitEarSplitLayers = layerOrder.filter(name => /^ears([-_][lr])?$/i.test(name));
+    const headwearEarFallbackLayers = layerOrder.filter(name => /^headwear([-_][lr])?$/i.test(name));
+    const earSplitUsesHeadwearFallback = explicitEarSplitLayers.length === 0;
+    const earSplitLayers = earSplitUsesHeadwearFallback ? headwearEarFallbackLayers : explicitEarSplitLayers;
     const earSplitActive = earSplitLayers.some(name => (layerMapping[name] ?? "").startsWith("sway_"));
     const toggleEarSplit = (enable: boolean) => {
       setLayerMapping(prev => {
         const next = { ...prev };
+        if (!earSplitUsesHeadwearFallback) {
+          // 旧版で獣耳と一緒に sway_* へ入った髪飾りを、切替操作時にも確実に戻す。
+          for (const name of headwearEarFallbackLayers) {
+            if ((next[name] ?? "").startsWith("sway_")) next[name] = "hair";
+          }
+        }
         for (const name of earSplitLayers) {
           if (enable) {
-            // 左右サフィックス無し（headwear等の一枚もの）は sway_ear として出力
+            // 左右サフィックス無し（ears/headwearの一枚もの）は sway_ear として出力
             next[name] = /[-_]r$/i.test(name) ? "sway_ear_r" : /[-_]l$/i.test(name) ? "sway_ear_l" : "sway_ear";
           } else {
             delete next[name];
@@ -2963,13 +3226,18 @@ function App() {
                 <small>揺れ用の分離</small>
                 <div className="layer-bulk-body">
                   {armSplitLayers.length > 0 && (
-                    <label className="layer-arm-split-toggle" title="腕レイヤー（handwear-l/-r）を arm_l.png / arm_r.png として分離出力します。腕揺れ用">
+                    <label className="layer-arm-split-toggle" title="腕レイヤー（handwear-l/-r）を分離出力します。レイヤー一覧で topwear より上なら体の前、下なら体の後ろに描画されます。">
                       <input type="checkbox" checked={armSplitActive} onChange={(e) => toggleArmSplit(e.target.checked)} />
                       <span>腕</span>
                     </label>
                   )}
                   {earSplitLayers.length > 0 && (
-                    <label className="layer-arm-split-toggle" title="獣耳レイヤー（ears-l/-r または headwear）を sway_ear*.png として分離出力します。獣耳ピコピコ用">
+                    <label
+                      className="layer-arm-split-toggle"
+                      title={earSplitUsesHeadwearFallback
+                        ? "earsレイヤーが無いため、headwearを sway_ear*.png として分離出力します。獣耳ピコピコ用"
+                        : "獣耳レイヤー（ears-l/-r）を sway_ear*.png として分離出力します。獣耳ピコピコ用"}
+                    >
                       <input type="checkbox" checked={earSplitActive} onChange={(e) => toggleEarSplit(e.target.checked)} />
                       <span>獣耳</span>
                     </label>
@@ -3017,7 +3285,7 @@ function App() {
                   <div className="layer-adjust-values">
                     {patchDraftSource === CHEST_CUT_SENTINEL
                       ? "bodyのプレビュー上で胸部を塗ってください。保存時に chest.png として分離されます。"
-                      : "塗った範囲を別レイヤーとして切り出し、元レイヤーから抜きます。"}
+                      : "塗った範囲を別レイヤーとして切り出します。腕から切り出したパーツは腕の動きに追従したまま、一覧の前後関係を保持します。"}
                   </div>
                   <div className="patch-tool-row">
                     <button className={`btn-nudge ${patchTool === "paint" ? "active" : ""}`} onClick={() => setPatchTool("paint")}>塗る</button>

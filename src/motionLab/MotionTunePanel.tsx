@@ -134,6 +134,12 @@ export function MotionTunePanel({ partsDir, active = true, onNotify, onError }: 
         const swayEntries = await Promise.all(
           Object.entries(current.sways).map(async ([name, source]) => [name, await loadMotionLabImage(source)] as const),
         );
+        const linkedPartEntries = await Promise.all(
+          Object.entries(current.linkedParts ?? {}).map(async ([name, linked]) => [
+            name,
+            { parent: linked.parent, image: await loadMotionLabImage(linked.image) },
+          ] as const),
+        );
         const nextImages: MotionLabImageSet = {
           body: await loadMotionLabImage(current.body),
           hair: current.hair ? await loadMotionLabImage(current.hair) : null,
@@ -142,6 +148,7 @@ export function MotionTunePanel({ partsDir, active = true, onNotify, onError }: 
           armR: current.armR ? await loadMotionLabImage(current.armR) : null,
           chest: current.chest ? await loadMotionLabImage(current.chest) : null,
           sways: Object.fromEntries(swayEntries),
+          linkedParts: Object.fromEntries(linkedPartEntries),
           eyewhite: current.eyewhite ? await loadMotionLabImage(current.eyewhite) : null,
           irides: current.irides ? await loadMotionLabImage(current.irides) : null,
           highlight: current.highlight ? await loadMotionLabImage(current.highlight) : null,

@@ -40,6 +40,7 @@ pub fn run() {
             commands::see_through::load_expression_source_preview,
             commands::see_through::get_see_through_runtime_status,
             commands::see_through::prepare_see_through_runtime,
+            commands::see_through::start_see_through_model_download,
             commands::see_through::run_see_through,
             commands::see_through::cancel_see_through,
             commands::see_through::list_see_through_gpus,

@@ -1,3 +1,4 @@
+use crate::commands::parts::{arm_overlay_parent, is_arm_overlay_part_name};
 use crate::error::AppError;
 use crate::processing::image_utils;
 use image::DynamicImage;
@@ -17,6 +18,14 @@ const MOUTH_FOLDERS: &[(&str, &str)] = &[
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MotionLabLinkedPartResult {
+    /// このパーツが追従する腕（arm_l / arm_r）。描画順だけは独立している。
+    pub parent: String,
+    pub image: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MotionLabPartsResult {
     pub source_dir: String,
     pub width: u32,
@@ -29,6 +38,8 @@ pub struct MotionLabPartsResult {
     pub chest: Option<String>,
     /// sway_<name>.png（汎用揺れパーツ）。キーはファイル名のstem（例: "sway_ribbon"）
     pub sways: HashMap<String, String>,
+    /// 腕と同じ変形へ追従し、layer-order.json上では独立したz位置を持つ切り出し片。
+    pub linked_parts: HashMap<String, MotionLabLinkedPartResult>,
     /// 視線ドリフト用（§8.4）: 白目=クリップ領域、虹彩=ドリフト対象
     pub eyewhite: Option<String>,
     pub irides: Option<String>,
@@ -137,6 +148,7 @@ fn load_motion_lab_parts_inner(dir: &str) -> Result<MotionLabPartsResult, AppErr
     let arm_r = read_optional_image_aliases(&root, &["arm_r.png", "arm-r.png", "arm_right.png"])?;
     let chest = read_optional_image_aliases(&root, &["chest.png"])?;
     let sways = read_sway_images(&root)?;
+    let linked_parts = read_linked_arm_images(&root)?;
     let eyewhite = read_optional_image_aliases(&root, &["eyewhite.png", "eye_white.png"])?;
     let irides = read_optional_image_aliases(&root, &["irides.png", "iris.png"])?;
     let highlight = read_optional_image_aliases(&root, &["highlight.png", "eye_highlight.png"])?;
@@ -204,6 +216,7 @@ fn load_motion_lab_parts_inner(dir: &str) -> Result<MotionLabPartsResult, AppErr
         arm_r,
         chest,
         sways,
+        linked_parts,
         eyewhite,
         irides,
         highlight,
@@ -277,6 +290,51 @@ fn read_sway_images(root: &Path) -> Result<HashMap<String, String>, AppError> {
         );
     }
     Ok(sways)
+}
+
+/// arm_l_overlay_*.png / arm_r_overlay_*.png を親腕つきの独立描画パーツとして収集する。
+/// 旧素材には該当ファイルがないため、空mapのまま従来どおり動作する。
+fn read_linked_arm_images(
+    root: &Path,
+) -> Result<HashMap<String, MotionLabLinkedPartResult>, AppError> {
+    let mut linked_parts = HashMap::new();
+    if !root.is_dir() {
+        return Ok(linked_parts);
+    }
+    let mut paths = fs::read_dir(root)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .map(|ext| ext.eq_ignore_ascii_case("png"))
+                    .unwrap_or(false)
+                && path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(is_arm_overlay_part_name)
+                    .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let Some(parent) = arm_overlay_parent(stem) else {
+            continue;
+        };
+        linked_parts.insert(
+            stem.to_string(),
+            MotionLabLinkedPartResult {
+                parent: parent.to_string(),
+                image: image_utils::image_to_base64_png(&open_image(&path)?),
+            },
+        );
+    }
+    Ok(linked_parts)
 }
 
 fn save_motion_lab_manifest_inner(
@@ -455,6 +513,7 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("mouth_closed")));
+        assert!(result.linked_parts.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }
@@ -532,6 +591,12 @@ mod tests {
         RgbaImage::from_pixel(4, 4, Rgba([5, 5, 5, 255]))
             .save(root.join("sway_necktie.png"))
             .unwrap();
+        RgbaImage::from_pixel(4, 4, Rgba([6, 6, 6, 255]))
+            .save(root.join("arm_l_overlay_patch_fingers.png"))
+            .unwrap();
+        RgbaImage::from_pixel(4, 4, Rgba([7, 7, 7, 255]))
+            .save(root.join("arm_r_overlay_patch_sleeve.png"))
+            .unwrap();
         RgbaImage::from_pixel(4, 4, Rgba([250, 250, 250, 255]))
             .save(root.join("eyewhite.png"))
             .unwrap();
@@ -550,9 +615,79 @@ mod tests {
         assert_eq!(result.sways.len(), 2);
         assert!(result.sways.contains_key("sway_ribbon"));
         assert!(result.sways.contains_key("sway_necktie"));
+        assert_eq!(result.linked_parts.len(), 2);
+        assert_eq!(
+            result
+                .linked_parts
+                .get("arm_l_overlay_patch_fingers")
+                .map(|part| part.parent.as_str()),
+            Some("arm_l")
+        );
+        assert!(result
+            .linked_parts
+            .get("arm_l_overlay_patch_fingers")
+            .is_some_and(|part| part.image.starts_with("data:image/png;base64,")));
+        assert_eq!(
+            result
+                .linked_parts
+                .get("arm_r_overlay_patch_sleeve")
+                .map(|part| part.parent.as_str()),
+            Some("arm_r")
+        );
         assert!(result.eyewhite.is_some());
         assert!(result.irides.is_some());
         assert!(result.highlight.is_some());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_motion_lab_parts_preserves_saved_layer_order() {
+        let root = std::env::temp_dir().join(format!(
+            "pachipakugen_motion_lab_layer_order_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        RgbaImage::from_pixel(4, 4, Rgba([10, 20, 30, 255]))
+            .save(root.join("body.png"))
+            .unwrap();
+        fs::write(
+            root.join("layer-order.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "formatVersion": 1,
+                "drawOrder": [
+                    "hair_back",
+                    "arm_r",
+                    "arm_l",
+                    "body",
+                    "sway_ear_r",
+                    "sway_ear_l",
+                    "hair",
+                    "sway_ear"
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let result = load_motion_lab_parts_inner(&root.to_string_lossy()).unwrap();
+
+        assert_eq!(
+            result.layer_order,
+            vec![
+                "hair_back",
+                "arm_r",
+                "arm_l",
+                "body",
+                "sway_ear_r",
+                "sway_ear_l",
+                "hair",
+                "sway_ear"
+            ]
+        );
 
         let _ = fs::remove_dir_all(root);
     }

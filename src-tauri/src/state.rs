@@ -45,6 +45,14 @@ pub struct AppState {
     // PID of the currently running See-Through setup or inference process.
     pub see_through_pid: Mutex<Option<u32>>,
 
+    // Serializes runtime checkout/patching and inference. The UI also disables concurrent
+    // actions, but this backend guard prevents races from direct command invocation.
+    pub see_through_runtime_lock: Mutex<()>,
+
+    // PID of the user-visible console used only for the large model pre-download.
+    // Kept separate so setup/inference cancellation cannot kill a user-managed download.
+    pub see_through_model_download_pid: Mutex<Option<u32>>,
+
     // ユーザーが選択したSee-Through実行GPU（nvidia-smiのindex）。None=最大VRAMを自動選択
     pub see_through_gpu_index: Mutex<Option<u32>>,
 
@@ -70,6 +78,8 @@ impl Default for AppState {
             cached_mouth_originals: Mutex::new(HashMap::new()),
             cached_mouth_raw_masks: Mutex::new(HashMap::new()),
             see_through_pid: Mutex::new(None),
+            see_through_runtime_lock: Mutex::new(()),
+            see_through_model_download_pid: Mutex::new(None),
             see_through_gpu_index: Mutex::new(None),
             base_layer_group_order: Mutex::new(Vec::new()),
         }

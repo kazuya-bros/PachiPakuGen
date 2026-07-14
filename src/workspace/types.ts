@@ -21,6 +21,7 @@ export type DiffPreview = { pairName: string; label: string; frames: string[] };
 export type InterpStep = 1 | 2 | 3 | 4;
 export type BaseStep = 1 | 2 | 3 | 4;
 export type WorkspaceStep = 1 | 2 | 3 | 4 | 5 | 6 | 7;
+export type WorkspaceMouthCornerMode = "source" | "up" | "flat" | "down";
 export type SeeThroughProfile = "low-vram" | "standard";
 export type SeeThroughOptionMode = "default" | "on" | "off";
 
@@ -50,7 +51,9 @@ export const RIFE_FRAME_RECOMMENDED = "4〜8";
 
 export interface SeeThroughRuntimeStatus {
   ready: boolean;
+  runtimeReady: boolean;
   busy: boolean;
+  modelDownloadBusy: boolean;
   runtimeRoot: string;
   repoPath: string;
   pythonPath: string;
@@ -60,6 +63,7 @@ export interface SeeThroughRuntimeStatus {
   gpuName: string | null;
   gpuMemoryMb: number | null;
   recommendedProfile: string;
+  selectedProfile: string;
   message: string;
 }
 export interface SeeThroughProgress { stage: string; percent: number; message: string; }
@@ -67,11 +71,13 @@ export interface SeeThroughRunResult {
   psdPath: string;
   outputDir: string;
   selectedProfile: string;
+  /** 自動回復を含め、実際に成功した設定 */
+  effectiveOptions: SeeThroughOptions | null;
   slotLoad: SlotLoadResult;
   mappingPreview: MappingPreviewResult;
   /** 左右パーツ分解に失敗し、左右分解なしで自動リトライされた場合にtrue */
   splitPartsFallback: boolean;
-  /** GPU VRAM不足で自動リトライされた場合、その内容の説明文 */
+  /** GPU/ネイティブ推論エラーで自動リトライされた場合、その内容の説明文 */
   oomRetryNote: string | null;
 }
 export interface WorkspaceProject {
@@ -81,6 +87,9 @@ export interface WorkspaceProject {
   currentStep: number;
   sourceImagePath: string | null;
   referenceImagePath: string | null;
+  codexPrompt: string | null;
+  /** 旧バックエンド／旧project.jsonでは未定義のため、UI側でflatへフォールバックする。 */
+  mouthCorner?: WorkspaceMouthCornerMode;
 }
 export interface ExpressionWorkspaceResult {
   workPath: string;
@@ -93,11 +102,12 @@ export interface ExpressionWorkspaceResult {
 }
 export interface WorkspaceGeneratedPartsStatus {
   requestPath: string;
-  handoffPath: string;
   generatedPartsPath: string;
   expectedParts: string[];
   presentParts: string[];
   missingParts: string[];
+  /** 口角設定導入前のバックエンド応答やHMR中の保持状態では未定義。 */
+  staleParts?: string[];
   sizeMismatches: string[];
   ready: boolean;
 }
@@ -113,6 +123,9 @@ export interface ExtractCodexGeneratedPartsResult {
   extractedPartsPath: string;
   extractedParts: string[];
   warnings: string[];
+  selectedProfile: string;
+  effectiveOptions: SeeThroughOptions | null;
+  splitParts: boolean;
   /** パーツごとの現在の位置補正値。STEP5でパーツ切替時に実際の値を表示するために使う */
   partAdjustments: Record<string, PartAdjustment>;
 }
@@ -141,6 +154,14 @@ export function sanitizeSeeThroughLogMessage(message: string): string {
   let cleaned = message
     .replace(/\[[0-9;]*[A-Za-z]/g, " ")
     .replace(/(^|\s)\[[A-Z](?=\s|$)/g, " ");
+  const modelDownload = cleaned.match(/^Model download (\d+\/\d+): (.+) \(([^)]+)\)$/i);
+  if (modelDownload) {
+    return `モデル取得 ${modelDownload[1]}: ${modelDownload[2]} (${modelDownload[3]})`;
+  }
+  const preparingModel = cleaned.match(/^Preparing required See-Through model: (.+)$/i);
+  if (preparingModel) return `必須モデルを準備しています: ${preparingModel[1]}`;
+  const repairingModel = cleaned.match(/^Repairing incomplete model file: (.+)$/i);
+  if (repairingModel) return `不完全なモデルファイルを再取得しています: ${repairingModel[1]}`;
   if (/Loading pipeline components|Loading weights|Loading checkpoint/i.test(cleaned)) {
     return "モデルを読み込んでいます";
   }
@@ -255,9 +276,17 @@ export interface PrepareCodexExpressionJobResult {
   expectedParts: string[];
   missingParts: string[];
 }
+export interface InspectCodexGeneratedPartsResult {
+  generatedPartsPath: string;
+  expectedParts: string[];
+  presentParts: string[];
+  missingParts: string[];
+  sizeMismatches: string[];
+  ready: boolean;
+}
 export interface LoadCodexExpressionJobResult {
   job: PrepareCodexExpressionJobResult;
-  generatedParts: WorkspaceGeneratedPartsStatus;
+  generatedParts: InspectCodexGeneratedPartsResult;
   extractedParts: ExtractCodexGeneratedPartsResult | null;
   rifeOutput: GenerateCodexRifeOutputResult | null;
   resumeStep: number;

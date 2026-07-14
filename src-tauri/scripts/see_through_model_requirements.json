@@ -1,0 +1,111 @@
+{
+  "schemaVersion": 1,
+  "profiles": {
+    "low-vram": [
+      {
+        "repoId": "24yearsold/seethroughv0.0.2_layerdiff3d_nf4",
+        "revision": "39b9881340189810bebabe5462756fb2e8fbd5fa",
+        "files": [
+          { "path": "model_index.json", "size": 668 },
+          { "path": "scheduler/scheduler_config.json", "size": 992 },
+          { "path": "text_encoder/config.json", "size": 1036 },
+          { "path": "text_encoder/model.safetensors", "size": 124089024 },
+          { "path": "text_encoder_2/config.json", "size": 1046 },
+          { "path": "text_encoder_2/model.safetensors", "size": 485089576 },
+          { "path": "tokenizer/merges.txt", "size": 524619 },
+          { "path": "tokenizer/special_tokens_map.json", "size": 585 },
+          { "path": "tokenizer/tokenizer_config.json", "size": 755 },
+          { "path": "tokenizer/vocab.json", "size": 1059962 },
+          { "path": "tokenizer_2/merges.txt", "size": 524619 },
+          { "path": "tokenizer_2/special_tokens_map.json", "size": 574 },
+          { "path": "tokenizer_2/tokenizer_config.json", "size": 906 },
+          { "path": "tokenizer_2/vocab.json", "size": 1059962 },
+          { "path": "trans_vae/config.json", "size": 139 },
+          { "path": "trans_vae/diffusion_pytorch_model.safetensors", "size": 210639792 },
+          { "path": "unet/config.json", "size": 2527 },
+          { "path": "unet/diffusion_pytorch_model.safetensors", "size": 2774123207 },
+          { "path": "vae/config.json", "size": 932 },
+          { "path": "vae/diffusion_pytorch_model.safetensors", "size": 167335590 }
+        ]
+      },
+      {
+        "repoId": "24yearsold/seethroughv0.0.1_marigold_nf4",
+        "revision": "aad13aafa9f3c72defb40a9d9225cec70b0eab16",
+        "files": [
+          { "path": "model_index.json", "size": 499 },
+          { "path": "scheduler/scheduler_config.json", "size": 538 },
+          { "path": "text_encoder/config.json", "size": 1031 },
+          { "path": "text_encoder/model.safetensors", "size": 264872716 },
+          { "path": "tokenizer/merges.txt", "size": 524619 },
+          { "path": "tokenizer/special_tokens_map.json", "size": 460 },
+          { "path": "tokenizer/tokenizer_config.json", "size": 886 },
+          { "path": "tokenizer/vocab.json", "size": 1059962 },
+          { "path": "unet/config.json", "size": 2571 },
+          { "path": "unet/diffusion_pytorch_model.safetensors", "size": 1494967495 },
+          { "path": "vae/config.json", "size": 919 },
+          { "path": "vae/diffusion_pytorch_model.safetensors", "size": 167335590 }
+        ]
+      },
+      {
+        "repoId": "frankjoshua/juggernautXL_version6Rundiffusion",
+        "revision": "aadab4c7cb252b83a0e2d6f3386b8c837af23932",
+        "files": [
+          { "path": "scheduler/scheduler_config.json", "size": 479 }
+        ]
+      }
+    ],
+    "standard": [
+      {
+        "repoId": "layerdifforg/seethroughv0.0.2_layerdiff3d",
+        "revision": "966721bb4ef2ddc3af3696862fa10b3f78d9785d",
+        "files": [
+          { "path": "model_index.json", "size": 668 },
+          { "path": "scheduler/scheduler_config.json", "size": 992 },
+          { "path": "text_encoder/config.json", "size": 561 },
+          { "path": "text_encoder/model.safetensors", "size": 246144352 },
+          { "path": "text_encoder_2/config.json", "size": 571 },
+          { "path": "text_encoder_2/model.safetensors", "size": 1389382688 },
+          { "path": "tokenizer/merges.txt", "size": 524619 },
+          { "path": "tokenizer/special_tokens_map.json", "size": 585 },
+          { "path": "tokenizer/tokenizer_config.json", "size": 755 },
+          { "path": "tokenizer/vocab.json", "size": 1059962 },
+          { "path": "tokenizer_2/merges.txt", "size": 524619 },
+          { "path": "tokenizer_2/special_tokens_map.json", "size": 574 },
+          { "path": "tokenizer_2/tokenizer_config.json", "size": 906 },
+          { "path": "tokenizer_2/vocab.json", "size": 1059962 },
+          { "path": "trans_vae/config.json", "size": 139 },
+          { "path": "trans_vae/diffusion_pytorch_model.safetensors", "size": 210639792 },
+          { "path": "unet/config.json", "size": 1985 },
+          { "path": "unet/diffusion_pytorch_model.safetensors", "size": 8142919672 },
+          { "path": "vae/config.json", "size": 932 },
+          { "path": "vae/diffusion_pytorch_model.safetensors", "size": 167335590 }
+        ]
+      },
+      {
+        "repoId": "24yearsold/seethroughv0.0.1_marigold",
+        "revision": "aa7a892f83ff68d7b09186a405ba08d5d33f770f",
+        "files": [
+          { "path": "model_index.json", "size": 499 },
+          { "path": "scheduler/scheduler_config.json", "size": 538 },
+          { "path": "text_encoder/config.json", "size": 556 },
+          { "path": "text_encoder/model.safetensors", "size": 680820760 },
+          { "path": "tokenizer/merges.txt", "size": 524619 },
+          { "path": "tokenizer/special_tokens_map.json", "size": 460 },
+          { "path": "tokenizer/tokenizer_config.json", "size": 886 },
+          { "path": "tokenizer/vocab.json", "size": 1059962 },
+          { "path": "unet/config.json", "size": 1890 },
+          { "path": "unet/diffusion_pytorch_model.safetensors", "size": 2426482432 },
+          { "path": "vae/config.json", "size": 919 },
+          { "path": "vae/diffusion_pytorch_model.safetensors", "size": 167335590 }
+        ]
+      },
+      {
+        "repoId": "frankjoshua/juggernautXL_version6Rundiffusion",
+        "revision": "aadab4c7cb252b83a0e2d6f3386b8c837af23932",
+        "files": [
+          { "path": "scheduler/scheduler_config.json", "size": 479 }
+        ]
+      }
+    ]
+  }
+}

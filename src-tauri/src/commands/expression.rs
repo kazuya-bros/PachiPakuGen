@@ -1,6 +1,6 @@
 use crate::commands::parts::{
-    get_mapping_preview_inner, load_slot_inner, MappingPreviewResult, ProgressPayload,
-    SlotLoadResult,
+    arm_overlay_parent, get_mapping_preview_inner, is_arm_overlay_part_name, load_slot_inner,
+    MappingPreviewResult, ProgressPayload, SlotLoadResult,
 };
 use crate::commands::see_through;
 use crate::error::AppError;
@@ -15,7 +15,7 @@ use keyring_core::Entry;
 use reqwest::blocking::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -120,6 +120,9 @@ pub struct ExtractCodexGeneratedPartsResult {
     pub extracted_parts_path: String,
     pub extracted_parts: Vec<String>,
     pub warnings: Vec<String>,
+    pub selected_profile: String,
+    pub effective_options: Option<see_through::SeeThroughOptions>,
+    pub split_parts: bool,
     /// パーツごとの現在の位置補正値（STEP5でパーツ切替時に実際の値を表示するため）
     pub part_adjustments: std::collections::BTreeMap<String, PartAdjustment>,
 }
@@ -556,6 +559,9 @@ fn read_extracted_parts_result(job_dir: &Path) -> Option<ExtractCodexGeneratedPa
         extracted_parts_path: extracted_dir.to_string_lossy().into_owned(),
         extracted_parts,
         warnings,
+        selected_profile: "cached".to_string(),
+        effective_options: None,
+        split_parts: true,
         part_adjustments: read_typed_part_adjustments(&extracted_dir),
     })
 }
@@ -643,13 +649,31 @@ fn save_layer_draw_order(app: &AppHandle, output_dir: &Path) -> Result<(), AppEr
     }
     fs::write(
         &path,
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "formatVersion": 1,
-            "drawOrder": group_order,
-        }))
-        .map_err(|error| AppError::General(format!("layer-order.json作成失敗: {error}")))?,
+        serde_json::to_vec_pretty(&layer_order_document(&group_order))
+            .map_err(|error| AppError::General(format!("layer-order.json作成失敗: {error}")))?,
     )?;
     Ok(())
+}
+
+fn layer_order_document(group_order: &[String]) -> serde_json::Value {
+    let mut document = serde_json::Map::new();
+    document.insert("formatVersion".into(), serde_json::Value::from(1));
+    document.insert("drawOrder".into(), serde_json::json!(group_order));
+
+    let mut linked_parts = serde_json::Map::new();
+    for part_name in group_order {
+        let Some(parent) = arm_overlay_parent(part_name) else {
+            continue;
+        };
+        linked_parts.insert(part_name.clone(), serde_json::json!({ "parent": parent }));
+    }
+    if !linked_parts.is_empty() {
+        document.insert(
+            "linkedParts".into(),
+            serde_json::Value::Object(linked_parts),
+        );
+    }
+    serde_json::Value::Object(document)
 }
 
 fn adjust_codex_extracted_parts_inner(
@@ -843,13 +867,17 @@ fn current_base_parts(app: &AppHandle) -> Option<HashMap<String, DynamicImage>> 
             cloned.insert(key.to_string(), image.clone());
         }
     }
-    // 汎用揺れパーツ（sway_*）はマッピング由来で名前が動的
+    // 汎用揺れパーツと腕追従オーバーレイはマッピング由来で名前が動的
     for (key, image) in parts.iter() {
-        if key.starts_with("sway_") {
+        if is_dynamic_base_part_name(key) {
             cloned.insert(key.clone(), image.clone());
         }
     }
     Some(cloned)
+}
+
+fn is_dynamic_base_part_name(name: &str) -> bool {
+    name.starts_with("sway_") || is_arm_overlay_part_name(name)
 }
 
 fn save_base_parts(
@@ -876,25 +904,27 @@ fn save_base_parts(
             image.save(path)?;
         }
     }
-    // 汎用揺れパーツ（sway_*）: 旧ファイルを掃除してから今回分を保存
+    // 動的パーツ: 旧ファイルを掃除してから今回分を保存する。
+    // 腕オーバーレイは本体とは別の前後関係を持つ一方、Motion Labでは親腕へ追従する。
     if let Ok(entries) = fs::read_dir(output_dir) {
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
-            let is_stale_sway = path.is_file()
+            let is_stale_dynamic_part = path.is_file()
                 && path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.to_ascii_lowercase().starts_with("sway_")
-                            && name.to_ascii_lowercase().ends_with(".png")
-                    });
-            if is_stale_sway {
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
+                && path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| is_dynamic_base_part_name(&stem.to_ascii_lowercase()));
+            if is_stale_dynamic_part {
                 fs::remove_file(path)?;
             }
         }
     }
     for (key, image) in parts.iter() {
-        if key.starts_with("sway_") {
+        if is_dynamic_base_part_name(key) {
             image.save(output_dir.join(format!("{key}.png")))?;
         }
     }
@@ -1032,6 +1062,9 @@ fn extract_codex_generated_parts_inner(
     let mut extracted_parts = Vec::new();
     let mut warnings = Vec::new();
     let total = status.expected_parts.len() as u32;
+    let mut effective_profile = profile.to_string();
+    let mut effective_options = options;
+    let mut effective_split_parts = split_parts;
 
     // 直前に実行された source の See-Through 分解をスナップショット。
     // 生成素材の分解でグローバル状態が上書きされるため、eyes-open生成・
@@ -1047,18 +1080,21 @@ fn extract_codex_generated_parts_inner(
             let source_result = see_through::run_inference(
                 &app,
                 &source_path.to_string_lossy(),
-                profile,
-                split_parts,
-                options.clone(),
+                &effective_profile,
+                effective_split_parts,
+                effective_options.clone(),
             )?;
+            effective_profile = source_result.selected_profile.clone();
+            effective_options = source_result.effective_options.clone();
             if source_result.split_parts_fallback {
+                effective_split_parts = false;
                 warnings.push(
                     "元画像: 左右パーツ分解に失敗したため、左右分解なしで処理しました".into(),
                 );
             }
             if let Some(note) = &source_result.oom_retry_note {
                 warnings.push(format!(
-                    "元画像: GPUエラーのため自動リトライしました（{note}）"
+                    "元画像: 推論エラーのため自動リトライしました（{note}）"
                 ));
             }
             snapshot_current_decomposition(&app).ok_or_else(|| {
@@ -1124,18 +1160,21 @@ fn extract_codex_generated_parts_inner(
         let see_through_result = see_through::run_inference(
             &app,
             &generated_path.to_string_lossy(),
-            profile,
-            split_parts,
-            options.clone(),
+            &effective_profile,
+            effective_split_parts,
+            effective_options.clone(),
         )?;
+        effective_profile = see_through_result.selected_profile.clone();
+        effective_options = see_through_result.effective_options.clone();
         if see_through_result.split_parts_fallback {
+            effective_split_parts = false;
             warnings.push(format!(
                 "{part}: 左右パーツ分解に失敗したため、左右分解なしで処理しました"
             ));
         }
         if let Some(note) = &see_through_result.oom_retry_note {
             warnings.push(format!(
-                "{part}: GPUエラーのため自動リトライしました（{note}）"
+                "{part}: 推論エラーのため自動リトライしました（{note}）"
             ));
         }
         let state = app.state::<AppState>();
@@ -1229,6 +1268,11 @@ fn extract_codex_generated_parts_inner(
     // （この後の素体調整が source を対象に動くようにする）
     restore_decomposition_snapshot(&app, &source_snapshot);
 
+    // eyes-open は生成素材ではなく source から別経路で作るため、通常の抽出ループには
+    // 含まれない。実ファイルが作成（または有効な既存ファイルが維持）されていれば、
+    // manifest と即時レスポンスの一覧にも必ず反映する。
+    include_existing_eyes_open(&extracted_dir, &mut extracted_parts);
+
     let manifest = json!({
         "formatVersion": 2,
         "mode": "codex-generated-parts-extracted",
@@ -1249,6 +1293,9 @@ fn extract_codex_generated_parts_inner(
         extracted_parts_path: extracted_dir.to_string_lossy().into_owned(),
         extracted_parts,
         warnings,
+        selected_profile: effective_profile,
+        effective_options,
+        split_parts: effective_split_parts,
         part_adjustments: read_typed_part_adjustments(&extracted_dir),
     })
 }
@@ -1294,6 +1341,14 @@ fn restore_decomposition_snapshot(app: &AppHandle, snapshot: &DecompositionSnaps
     *state.slot_depth_maps.lock().unwrap() = snapshot.depth_maps.clone();
     *state.canvas_width.lock().unwrap() = snapshot.width;
     *state.canvas_height.lock().unwrap() = snapshot.height;
+}
+
+fn include_existing_eyes_open(extracted_dir: &Path, extracted_parts: &mut Vec<String>) {
+    if extracted_dir.join("eyes-open.png").is_file()
+        && !extracted_parts.iter().any(|part| part == "eyes-open")
+    {
+        extracted_parts.insert(0, "eyes-open".to_string());
+    }
 }
 
 /// eyes-open.png を元画像から再生成する。RIFEの開き目始点は常に source 由来とし、
@@ -1477,20 +1532,20 @@ fn load_job_base_parts(job_dir: &Path) -> Result<Option<HashMap<String, DynamicI
             parts.insert(key.to_string(), image);
         }
     }
-    // 汎用揺れパーツ（sway_*、獣耳等）も合成対象に含める
+    // 汎用揺れパーツ（sway_*、獣耳等）と腕追従オーバーレイも合成対象に含める
     if let Ok(entries) = fs::read_dir(&base_dir) {
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
             let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
                 continue;
             };
-            let is_sway_png = path.is_file()
-                && stem.to_ascii_lowercase().starts_with("sway_")
+            let is_dynamic_part_png = path.is_file()
+                && is_dynamic_base_part_name(&stem.to_ascii_lowercase())
                 && path
                     .extension()
                     .and_then(|ext| ext.to_str())
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("png"));
-            if is_sway_png {
+            if is_dynamic_part_png {
                 if let Ok(image) = image::open(&path) {
                     parts.insert(stem.to_string(), image);
                 }
@@ -1527,11 +1582,16 @@ fn resolve_base_draw_order(custom: &[String]) -> Vec<String> {
     const DEFAULT: [&str; 10] = [
         "hair_back", "body", "neck", "chest", "arm_l", "arm_r", "sways", "eye", "mouth", "hair",
     ];
-    let mut order: Vec<String> = custom
-        .iter()
-        .filter(|key| DEFAULT.contains(&key.as_str()))
-        .cloned()
-        .collect();
+    let mut order = Vec::new();
+    let mut seen = HashSet::new();
+    for key in custom {
+        // 動的パーツはSTEP4で個別に前後関係を持つため、固定グループへ潰さず保持する。
+        if (DEFAULT.contains(&key.as_str()) || is_dynamic_base_part_name(key))
+            && seen.insert(key.clone())
+        {
+            order.push(key.clone());
+        }
+    }
     for (index, key) in DEFAULT.iter().enumerate() {
         if order.iter().any(|entry| entry == key) {
             continue;
@@ -1728,7 +1788,12 @@ fn compose_base_parts_ordered(
     include_face_defaults: bool,
 ) -> RgbaImage {
     let mut result = RgbaImage::new(width, height);
-    let mut draw = |result: &mut RgbaImage, image: &DynamicImage| {
+    let explicitly_ordered_sways: HashSet<&str> = order
+        .iter()
+        .map(String::as_str)
+        .filter(|key| key.starts_with("sway_"))
+        .collect();
+    let draw = |result: &mut RgbaImage, image: &DynamicImage| {
         alpha_composite_onto(result, &resized_rgba(image, width, height), width, height);
     };
     for key in order {
@@ -1754,7 +1819,12 @@ fn compose_base_parts_ordered(
             "sways" => {
                 let mut sway_keys: Vec<&String> = base_parts
                     .keys()
-                    .filter(|key| key.starts_with("sway_"))
+                    // 旧layer-order.jsonの`sways`は後方互換用。個別指定済みの
+                    // swayはその位置で描画されるため、ここでは未指定分だけを補完する。
+                    .filter(|key| {
+                        key.starts_with("sway_")
+                            && !explicitly_ordered_sways.contains(key.as_str())
+                    })
                     .collect();
                 sway_keys.sort();
                 for sway_key in sway_keys {
@@ -2084,7 +2154,7 @@ fn materialize_spritalk_static_assets(
     }
     fs::write(
         output_root.join("README.txt"),
-        "PachiPakuGen SpriTalk output\nSelect this folder in SpriTalk layer import.\nRequired: body.png\nOptional: hair.png, hair_back.png, arm_l.png, arm_r.png, chest.png, sway_*.png\nAnimation folders: eye, mouth_a, mouth_i, mouth_u, mouth_e, mouth_o\n",
+        "PachiPakuGen SpriTalk output\nSelect this folder in SpriTalk layer import.\nRequired: body.png\nOptional: hair.png, hair_back.png, arm_l.png, arm_r.png, chest.png, sway_*.png, arm_l_overlay_*.png, arm_r_overlay_*.png\nLayer linkage and draw order: layer-order.json\nAnimation folders: eye, mouth_a, mouth_i, mouth_u, mouth_e, mouth_o\n",
     )?;
     Ok(copied)
 }
@@ -2133,16 +2203,39 @@ fn copy_spritalk_root_assets(
             }
         }
     }
-    // 汎用揺れパーツ sway_*.png（base_parts に手動配置されたものも伝搬する）
+    // 再出力で削除・改名された動的パーツを残さない。現行sourceを正本としてからコピーする。
+    for entry in fs::read_dir(output_root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        let is_dynamic_part_png = path.is_file()
+            && is_dynamic_base_part_name(&stem.to_ascii_lowercase())
+            && path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("png"));
+        if is_dynamic_part_png {
+            fs::remove_file(path)?;
+        }
+    }
+    // 汎用揺れパーツと腕追従オーバーレイをそのままルートへ伝搬する。
     if let Ok(entries) = fs::read_dir(source_dir) {
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
             if path.is_file()
-                && name.to_ascii_lowercase().starts_with("sway_")
-                && name.to_ascii_lowercase().ends_with(".png")
+                && is_dynamic_base_part_name(&stem.to_ascii_lowercase())
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
             {
                 let dest_path = output_root.join(name);
                 fs::copy(&path, &dest_path)?;
@@ -3699,6 +3792,115 @@ mod tests {
     }
 
     #[test]
+    fn resolve_base_draw_order_preserves_unique_individual_sways() {
+        let custom: Vec<String> = [
+            "hair_back",
+            "body",
+            "sway_ear_r",
+            "sway_ear_l",
+            "hair",
+            "sway_ear",
+            "sway_ear",
+            "unknown",
+        ]
+        .iter()
+        .map(|key| (*key).to_string())
+        .collect();
+
+        let order = resolve_base_draw_order(&custom);
+        let position = |key: &str| order.iter().position(|entry| entry == key).unwrap();
+
+        assert!(position("sway_ear_r") < position("sway_ear_l"));
+        assert!(position("sway_ear_l") < position("hair"));
+        assert!(position("hair") < position("sway_ear"));
+        assert_eq!(order.iter().filter(|key| *key == "sway_ear").count(), 1);
+        assert!(!order.iter().any(|key| key == "unknown"));
+    }
+
+    #[test]
+    fn resolve_base_draw_order_preserves_arm_overlay_position() {
+        let overlay = "arm_l_overlay_patch_fingers";
+        let custom: Vec<String> = ["arm_l", "body", overlay, "hair"]
+            .iter()
+            .map(|key| (*key).to_string())
+            .collect();
+
+        let order = resolve_base_draw_order(&custom);
+        let position = |key: &str| order.iter().position(|entry| entry == key).unwrap();
+
+        assert!(position("arm_l") < position("body"));
+        assert!(position("body") < position(overlay));
+        assert!(position(overlay) < position("hair"));
+        assert_eq!(order.iter().filter(|key| *key == overlay).count(), 1);
+    }
+
+    #[test]
+    fn layer_order_document_describes_linked_arm_overlays() {
+        let order: Vec<String> = [
+            "arm_l",
+            "body",
+            "arm_l_overlay_patch_fingers",
+            "arm_r_overlay_patch_sleeve",
+            "hair",
+        ]
+        .iter()
+        .map(|key| (*key).to_string())
+        .collect();
+
+        let document = layer_order_document(&order);
+
+        assert_eq!(document["formatVersion"], 1);
+        assert_eq!(document["drawOrder"], serde_json::json!(order));
+        assert_eq!(
+            document["linkedParts"]["arm_l_overlay_patch_fingers"]["parent"],
+            "arm_l"
+        );
+        assert_eq!(
+            document["linkedParts"]["arm_r_overlay_patch_sleeve"]["parent"],
+            "arm_r"
+        );
+
+        let legacy = layer_order_document(&["body".into(), "hair".into()]);
+        assert!(legacy.get("linkedParts").is_none());
+    }
+
+    #[test]
+    fn save_and_load_base_parts_preserves_arm_overlays_and_removes_stale_files() {
+        let root = std::env::temp_dir().join(format!(
+            "pachipakugen_arm_overlay_parts_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let base_dir = root.join("base_parts");
+        fs::create_dir_all(&base_dir).unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 255, 0, 255]))
+            .save(base_dir.join("arm_l_overlay_stale.png"))
+            .unwrap();
+
+        let mut parts = HashMap::new();
+        parts.insert(
+            "body".into(),
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, Rgba([1, 2, 3, 255]))),
+        );
+        parts.insert(
+            "arm_l_overlay_patch_fingers".into(),
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, Rgba([4, 5, 6, 255]))),
+        );
+
+        save_base_parts(&parts, &base_dir).unwrap();
+        let loaded = load_job_base_parts(&root).unwrap().unwrap();
+
+        assert!(!base_dir.join("arm_l_overlay_stale.png").exists());
+        assert!(base_dir.join("arm_l_overlay_patch_fingers.png").is_file());
+        assert!(loaded.contains_key("body"));
+        assert!(loaded.contains_key("arm_l_overlay_patch_fingers"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn compose_base_parts_ordered_respects_arm_behind_body() {
         // 腕(赤)が body(青) の背面指定なら、重なり部は body の色になる
         let mut parts: HashMap<String, DynamicImage> = HashMap::new();
@@ -3716,6 +3918,87 @@ mod tests {
         let front: Vec<String> = ["body", "arm_l"].iter().map(|s| s.to_string()).collect();
         let composite = compose_base_parts_ordered(&parts, 2, 2, &front, None, None, true);
         assert_eq!(composite.get_pixel(0, 0), &Rgba([255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn compose_base_parts_ordered_draws_arm_overlay_at_its_own_depth() {
+        let mut parts: HashMap<String, DynamicImage> = HashMap::new();
+        parts.insert(
+            "body".into(),
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, Rgba([0, 0, 255, 255]))),
+        );
+        parts.insert(
+            "arm_l".into(),
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, Rgba([255, 0, 0, 255]))),
+        );
+        parts.insert(
+            "arm_l_overlay_patch_fingers".into(),
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, Rgba([0, 255, 0, 255]))),
+        );
+
+        let order: Vec<String> = ["arm_l", "body", "arm_l_overlay_patch_fingers"]
+            .iter()
+            .map(|key| (*key).to_string())
+            .collect();
+        let composite = compose_base_parts_ordered(&parts, 2, 2, &order, None, None, true);
+
+        assert_eq!(composite.get_pixel(0, 0), &Rgba([0, 255, 0, 255]));
+    }
+
+    #[test]
+    fn compose_base_parts_ordered_draws_explicit_sway_only_at_its_position() {
+        let mut parts: HashMap<String, DynamicImage> = HashMap::new();
+        parts.insert(
+            "sway_ear".into(),
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, Rgba([255, 0, 0, 255]))),
+        );
+        parts.insert(
+            "hair".into(),
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, Rgba([0, 0, 255, 255]))),
+        );
+
+        // 個別swayをhairの背面に指定した場合、後方互換`sways`で再描画されてはならない。
+        let explicit: Vec<String> = ["sway_ear", "hair", "sways"]
+            .iter()
+            .map(|key| (*key).to_string())
+            .collect();
+        let composite = compose_base_parts_ordered(&parts, 2, 2, &explicit, None, None, true);
+        assert_eq!(composite.get_pixel(0, 0), &Rgba([0, 0, 255, 255]));
+
+        // 旧形式は`sways`位置で従来どおり全swayを描画する。
+        let legacy: Vec<String> = ["hair", "sways"]
+            .iter()
+            .map(|key| (*key).to_string())
+            .collect();
+        let composite = compose_base_parts_ordered(&parts, 2, 2, &legacy, None, None, true);
+        assert_eq!(composite.get_pixel(0, 0), &Rgba([255, 0, 0, 255]));
+    }
+
+    #[test]
+    fn existing_eyes_open_is_reported_once_in_extracted_parts() {
+        let root = std::env::temp_dir().join(format!(
+            "pachipakugen_eyes_open_result_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("eyes-open.png"), []).unwrap();
+        let mut parts = vec!["mouth-a".to_string()];
+
+        include_existing_eyes_open(&root, &mut parts);
+        include_existing_eyes_open(&root, &mut parts);
+
+        assert_eq!(parts.first().map(String::as_str), Some("eyes-open"));
+        assert_eq!(parts.iter().filter(|part| *part == "eyes-open").count(), 1);
+
+        fs::remove_file(root.join("eyes-open.png")).unwrap();
+        let mut missing = vec!["mouth-a".to_string()];
+        include_existing_eyes_open(&root, &mut missing);
+        assert_eq!(missing, vec!["mouth-a"]);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     fn request(targets: &[&str]) -> GenerateExpressionSetRequest {
@@ -3839,11 +4122,41 @@ mod tests {
         image::RgbaImage::from_pixel(2, 2, image::Rgba([7, 8, 9, 192]))
             .save(base_dir.join("hair.png"))
             .unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]))
+            .save(base_dir.join("sway_ear.png"))
+            .unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([40, 50, 60, 255]))
+            .save(base_dir.join("arm_l_overlay_patch_fingers.png"))
+            .unwrap();
+        let layer_order = serde_json::json!({
+            "formatVersion": 1,
+            "drawOrder": [
+                "hair_back",
+                "arm_l",
+                "body",
+                "arm_l_overlay_patch_fingers",
+                "hair"
+            ],
+            "linkedParts": {
+                "arm_l_overlay_patch_fingers": { "parent": "arm_l" }
+            }
+        });
+        fs::write(
+            base_dir.join("layer-order.json"),
+            serde_json::to_vec_pretty(&layer_order).unwrap(),
+        )
+        .unwrap();
         image::RgbaImage::from_pixel(2, 2, image::Rgba([4, 5, 6, 128]))
             .save(extracted_dir.join("mouth-a.png"))
             .unwrap();
         fs::create_dir_all(output_dir.join("base_parts")).unwrap();
         fs::create_dir_all(output_dir.join("extracted_parts")).unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 255, 0, 255]))
+            .save(output_dir.join("sway_stale.png"))
+            .unwrap();
+        image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 255, 255]))
+            .save(output_dir.join("arm_r_overlay_stale.png"))
+            .unwrap();
         image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]))
             .save(output_dir.join("base_parts").join("body.png"))
             .unwrap();
@@ -3853,11 +4166,36 @@ mod tests {
 
         assert!(output_dir.join("body.png").is_file());
         assert!(output_dir.join("hair.png").is_file());
+        assert!(output_dir.join("sway_ear.png").is_file());
+        assert!(output_dir.join("arm_l_overlay_patch_fingers.png").is_file());
+        assert!(!output_dir.join("sway_stale.png").exists());
+        assert!(!output_dir.join("arm_r_overlay_stale.png").exists());
+        assert_eq!(
+            image::open(output_dir.join("sway_ear.png"))
+                .unwrap()
+                .to_rgba8()
+                .get_pixel(0, 0),
+            &image::Rgba([10, 20, 30, 255])
+        );
+        assert_eq!(
+            image::open(output_dir.join("arm_l_overlay_patch_fingers.png"))
+                .unwrap()
+                .to_rgba8()
+                .get_pixel(0, 0),
+            &image::Rgba([40, 50, 60, 255])
+        );
+        let copied_layer_order: serde_json::Value =
+            serde_json::from_slice(&fs::read(output_dir.join("layer-order.json")).unwrap())
+                .unwrap();
+        assert_eq!(copied_layer_order, layer_order);
         assert!(!output_dir.join("base_parts").exists());
         assert!(!output_dir.join("extracted_parts").exists());
         assert!(!output_dir.join("mouth-a.png").is_file());
         assert!(output_dir.join("README.txt").is_file());
-        assert_eq!(copied.len(), 2);
+        assert!(fs::read_to_string(output_dir.join("README.txt"))
+            .unwrap()
+            .contains("arm_l_overlay_*.png"));
+        assert_eq!(copied.len(), 5);
 
         let _ = fs::remove_dir_all(root);
     }

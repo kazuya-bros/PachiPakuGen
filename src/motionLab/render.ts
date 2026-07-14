@@ -50,8 +50,9 @@ import {
 } from "./constants";
 
 /**
- * グループ描画順の解決: layer-order.json（Step4のレイヤー調整由来）があればそれを優先し、
- * 記載のないグループ（sways等）は既定順の相対位置へ補完する。
+ * パーツ描画順の解決: layer-order.json（Step4のレイヤー調整由来）があればそれを優先し、
+ * 記載のない既定グループは既定順の相対位置へ補完する。個別の sway_* も
+ * そのままの位置で描画し、旧形式の sways グループも受け付ける。
  * 無ければ従来の固定z順（armBehindBody で腕をbody背面へ）。
  */
 export function drawMotionLabOrderedLayers(
@@ -61,7 +62,14 @@ export function drawMotionLabOrderedLayers(
 ) {
   let order: string[];
   if (layerOrder.length > 0) {
-    order = layerOrder.filter(key => key in draws);
+    // 壊れたlayer-order.jsonに同じキーが複数回あっても二重描画しない。
+    const seen = new Set<string>();
+    order = [];
+    for (const key of layerOrder) {
+      if (!(key in draws) || seen.has(key)) continue;
+      seen.add(key);
+      order.push(key);
+    }
     for (const key of MOTION_LAB_DEFAULT_DRAW_ORDER) {
       if (order.includes(key)) continue;
       // 既定順で直前にあるグループの直後へ挿入（見つからなければ末尾）
@@ -837,7 +845,10 @@ export function drawMotionLabScene(
     part: "arm_l" | "arm_r",
   ) => {
     if (!image) return;
-    const bbox = alphaBBox(image);
+    // 指などの切り出しオーバーレイも、親腕と完全に同じ肩ピボットを使う。
+    // オーバーレイ自身の小さなbboxを基準にすると、回転時に腕からずれてしまう。
+    const parentImage = part === "arm_l" ? images.armL : images.armR;
+    const bbox = alphaBBox(parentImage ?? image);
     // 回転軸: エディタ指定 > bbox上端中央（=肩推定）＋armPivotRatio下方調整
     const pivot = settings.pivots[part] ?? {
       x: bbox.x + bbox.w / 2,
@@ -897,8 +908,7 @@ export function drawMotionLabScene(
   // 汎用揺れパーツ sway_*: 腕と同系のチェーン物理（ピボット=bbox上端中央）。
   // 獣耳（sway_ear*）は頭に付いているパーツなので、前髪と同じ頭基準の変換
   // （呼吸遅延・パララックス首振り・頷き込み）に連動させ、その上でツイッチを乗せる
-  const drawSways = () => {
-    for (const [name, image] of Object.entries(images.sways)) {
+  const drawOneSway = (name: string, image: HTMLImageElement) => {
       const isEar = /(^|_)ears?(_|$)/i.test(name);
       const base = isEar ? hairFrontTransform : bodyTransform;
       // 土台の傾き（耳=頭、その他=体）を常に継承する
@@ -943,8 +953,31 @@ export function drawMotionLabScene(
       }
       const bbox = alphaBBox(image);
       drawMotionLabPivotLayer(ctx, image, width, height, base, { x: bbox.x + bbox.w / 2, y: bbox.y }, angle, twitchOffsetY);
+  };
+
+  const swayEntries = Object.entries(images.sways)
+    .sort(([left], [right]) => left.localeCompare(right));
+  const explicitlyOrderedSways = new Set(
+    parts.layerOrder.filter(name => name.startsWith("sway_") && name in images.sways),
+  );
+  const drawSways = () => {
+    // 旧layer-order.jsonのswaysキー用。新形式で個別指定済みの画像は二重描画しない。
+    for (const [name, image] of swayEntries) {
+      if (!explicitlyOrderedSways.has(name)) drawOneSway(name, image);
     }
   };
+  const individualSwayDraws: Record<string, () => void> = {};
+  for (const [name, image] of swayEntries) {
+    individualSwayDraws[name] = () => drawOneSway(name, image);
+  }
+  const linkedPartDraws: Record<string, () => void> = {};
+  for (const [name, linked] of Object.entries(images.linkedParts ?? {})) {
+    if (linked.parent === "arm_l") {
+      linkedPartDraws[name] = () => drawArm(linked.image, armOut?.left ?? null, "arm_l");
+    } else if (linked.parent === "arm_r") {
+      linkedPartDraws[name] = () => drawArm(linked.image, armOut?.right ?? null, "arm_r");
+    }
+  }
 
   // ===== 視線ドリフト＋瞳クリップ（852話式・§8.4）: eyewhite < irides < highlight < eye連番 =====
   const drawEyeCluster = () => {
@@ -1110,6 +1143,8 @@ export function drawMotionLabScene(
     arm_l: () => drawArm(images.armL, armOut?.left ?? null, "arm_l"),
     arm_r: () => drawArm(images.armR, armOut?.right ?? null, "arm_r"),
     sways: drawSways,
+    ...individualSwayDraws,
+    ...linkedPartDraws,
     eye: drawEyeCluster,
     mouth: drawMouth,
     hair: drawHair,
