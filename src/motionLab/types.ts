@@ -1,9 +1,10 @@
-import type { ArmSwayState, ChainState, SpringState } from "../motionLabPhysics";
+import type { ArmSwayState, ChainState, HairStrandSpringState, SpringState } from "../motionLabPhysics";
 
 export type MotionLabMouthKey = "closed" | "a" | "i" | "u" | "e" | "o";
 export type MotionLabMethod = "baseline" | "smooth" | "bridge";
 export type MotionLabLayerMode = "simple" | "spring" | "mesh";
 export type MotionLabPreset = "calm" | "normal" | "lively";
+export type MotionLabBlinkPhase = "idle" | "centering" | "closing" | "opening" | "settling";
 export type MotionLabVerdict = "undecided" | "promising" | "hold" | "reject";
 export type MotionLabReviewKey =
   | "mouthSmoothness"
@@ -26,6 +27,8 @@ export interface MotionLabPartsResult {
   sways: Record<string, string>;
   /** 腕と同じ変形へ追従し、描画順だけを独立させた切り出しパーツ */
   linkedParts: Record<string, MotionLabLinkedPartResult>;
+  /** Independent eyebrow overlay. Null means legacy eye frames still own the brows. */
+  eyebrow: string | null;
   eyewhite: string | null;
   irides: string | null;
   highlight: string | null;
@@ -52,6 +55,8 @@ export interface MotionLabImageSet {
   sways: Record<string, HTMLImageElement>;
   /** linkedPartsの画像デコード後。parentの腕と同じ変形で描画する */
   linkedParts: Record<string, { parent: string; image: HTMLImageElement }>;
+  /** Independent eyebrow overlay; absent for legacy baked-eye assets. */
+  eyebrow: HTMLImageElement | null;
   /** 視線ドリフト用: 白目=クリップ領域、虹彩=ドリフト対象（§8.4） */
   eyewhite: HTMLImageElement | null;
   irides: HTMLImageElement | null;
@@ -79,16 +84,23 @@ export interface MotionLabPhysicsState {
   chest: SpringState;
   sways: Map<string, ChainState>;
   /** 獣耳ピコピコ（sway_ear*）: 次ツイッチまでの残り秒＋縦跳ねバネ */
-  earTwitches: Map<string, { wait: number; spring: SpringState }>;
-  /** 後ろ髪の房ごとチェーン（前髪用は strandChains） */
-  strandChainsBack: ChainState[];
+  earTwitches: Map<string, {
+    wait: number;
+    spring: SpringState;
+    queuedFollowUp?: boolean;
+    mode?: MotionLabEarTwitchMode;
+  }>;
+  /** 後ろ髪の房ごとの硬・柔2本バネ */
+  strandSpringsBack: HairStrandSpringState[];
   /** A4エンベロープ出力（A1のSmoothDamp前段） */
   envOpen: number;
   mouthVel: { v: number };
   speaking: boolean;
   /** 自動瞬き: 次の瞬きまでの残り秒 */
   blinkWait: number;
-  /** 瞬き進行ms（-1=待機中） */
+  /** 瞬きの描画所有権を切り替える現在フェーズ */
+  blinkPhase: MotionLabBlinkPhase;
+  /** 現在の瞬きフェーズ内での経過ms */
   blinkT: number;
   /** パララックス首振り: ヘッドターンのノイズ位相（§8.3） */
   headTurnT: number;
@@ -101,11 +113,12 @@ export interface MotionLabPhysicsState {
   gazeT: number;
   /** ハイライトドリフトのノイズ位相 */
   highlightT: number;
-  /** 房ごと髪物理: 房別チェーン（房分割OFF時は未使用） */
-  strandChains: ChainState[];
-  /** 房のsoftバネ（852話式 stiff+soft 二重バネ混合の柔らかい側） */
-  strandChainsSoft: ChainState[];
-  strandChainsBackSoft: ChainState[];
+  /** 瞬き前に中央へ滑らかに戻すためのハイライト表示位置 */
+  highlight: { x: number; y: number };
+  highlightVelX: { v: number };
+  highlightVelY: { v: number };
+  /** 前髪の房ごとの硬・柔2本バネ（房分割OFF時は未使用） */
+  strandSprings: HairStrandSpringState[];
   /** 発話ぴょこバウンス（PuruPuru pyoko参考。voice→バネで縦に弾む、px） */
   pyoko: SpringState;
   /** ランダムグランス（852話 auto.rand参考）: 次の目標変更までの残り秒と現在バイアス */
@@ -126,6 +139,14 @@ export interface MotionLabMouthRuntime {
   physics: MotionLabPhysicsState;
   /** 瞳クリップ合成用スクラッチキャンバス（レーン毎に保持） */
   gazeScratch?: HTMLCanvasElement;
+  /** うるみ反射を虹彩アルファだけへ限定するマスク用キャンバス */
+  eyeWetnessScratch?: HTMLCanvasElement;
+  /** Independent left/right eyebrow transform scratch canvas. */
+  browScratch?: HTMLCanvasElement;
+  /** 眉専用の発話エンベロープ。口より少し遅れて反応し、急な角度変化を防ぐ。 */
+  browVoice: number;
+  /** 胸部の局所ラスターワープ用スクラッチ（ランタイムごとに再利用） */
+  chestWarpScratch?: HTMLCanvasElement;
 }
 
 export interface MotionLabLayerTransform {
@@ -175,12 +196,14 @@ export interface MotionLabRenderSettings {
   chestMax: number;
   /** 後ろ髪の揺れ倍率（1=従来。揺れすぎ調整用） */
   hairBackScale: number;
-  /** 髪の揺れ方式: false=バネ物理（B1/B3）、true=波揺れ（ろてじん式進行波） */
+  /** 髪の揺れ方式: false=バネ物理（B1/B3）、true=進行波によるウェーブ */
   hairWaveMode: boolean;
   /** 波揺れの強さ倍率（1=既定） */
   hairWaveStrength: number;
   /** sway_ear* パーツの獣耳ピコピコ揺れ */
   earTwitch: boolean;
+  /** 獣耳ピコピコの動き方 */
+  earTwitchMode: MotionLabEarTwitchMode;
   /** 発話ぴょこバウンス振幅（px。PuruPuru pyoko参考、バネ平滑） */
   pyokoBounce: number;
   /** ランダムグランス（852話 auto.rand参考）: 数秒ごとに顔向き・視線がふっと変わる */
@@ -189,12 +212,21 @@ export interface MotionLabRenderSettings {
   hairMotionEnabled: boolean;
   /** 視線ドリフト（eyewhite/irides素材時）。false=瞳は正面固定 */
   gazeEnabled: boolean;
+  /** 左右の虹彩を各中心でごく小さく伸縮する */
+  irisBreathEnabled: boolean;
+  /** 虹彩下辺に控えめな反射を重ねる */
+  wetnessEnabled: boolean;
+  /** Independent eyebrow micro motion. */
+  browEnabled: boolean;
   /** 自動まばたき */
   blinkEnabled: boolean;
   /** エフェクト個別の強さ倍率（1=既定） */
   hairMotionStrength: number;
   glanceStrength: number;
   gazeStrength: number;
+  irisBreathStrength: number;
+  wetnessStrength: number;
+  browStrength: number;
   /** まばたき頻度倍率（1=既定、2=2倍の頻度） */
   blinkRate: number;
   liftStrength: number;
@@ -209,19 +241,31 @@ export interface MotionLabRenderSettings {
   pivotEditPart: string | null;
   /** パララックス首振りの強さ（0=無効、1=既定。§8.3） */
   parallaxScale: number;
-  /** B3を房ごとチェーンに分割（852話式・§8.1 #5） */
+  /** B3を房ごとのスプリングへ分割（§8.1 #5） */
   strandsEnabled: boolean;
   /** 腕を体の後ろに描く（素体で腕をbody背面に置いた素材向け。layer-order.json があればそちら優先） */
   armBehindBody: boolean;
   /** 口パクタイムライン（未指定なら内蔵の「あいうえお」テスト） */
   timeline?: MotionLabTimelineEvent[];
   timelineDurationMs?: number;
+  /** ライブ表示用の口入力。指定中はタイムラインより優先する。 */
+  liveInput?: () => {
+    mouth: MotionLabMouthKey;
+    energy: number;
+    openness: number;
+  } | null;
+  /** オフライン描画用の乱数源。未指定時は通常プレビューと同じ Math.random。 */
+  random?: () => number;
 }
 
 export interface MotionLabManifest {
   schema?: string;
   sourcePartsDir?: string;
   createdAt?: string;
+  /** 現在の調整値と再生内容から算出した、出力の鮮度判定用ID。 */
+  contentFingerprints?: {
+    spritalk?: string;
+  };
   methods?: {
     baseline?: {
       enabled?: boolean;
@@ -261,14 +305,19 @@ export interface MotionLabManifest {
       hairEngine?: string;
       hairWaveStrength?: number;
       earTwitch?: boolean;
+      earTwitchMode?: MotionLabEarTwitchMode;
       pyokoBounce?: number;
       randomGlance?: boolean;
       /** エフェクト単位ON/OFF（v3 additive。旧フィールドより優先） */
       effects?: Record<string, boolean>;
+      /** モーション方式。現行の保存値は wave / springRig（旧版の値は読込時に正規化）。 */
       engineFamily?: string;
       hairMotionStrength?: number;
       glanceStrength?: number;
       gazeStrength?: number;
+      irisBreathStrength?: number;
+      wetnessStrength?: number;
+      browStrength?: number;
       blinkRate?: number;
       liftStrength?: number;
       earTwitchScale?: number;
@@ -280,7 +329,12 @@ export interface MotionLabManifest {
       armBehindBody?: boolean;
     };
   };
-  timeline?: { type?: string };
+  timeline?: {
+    type?: "builtInVowelTest" | "text" | string;
+    text?: string;
+    durationMs?: number;
+    events?: MotionLabTimelineEvent[];
+  };
   review?: {
     verdict?: MotionLabVerdict;
     note?: string;
@@ -298,8 +352,20 @@ export interface SpritalkMotionProfile {
   sourcePartsDir: string;
   createdAt: string;
   generatedBy: string;
+  /** motion-preview-manifest.json と照合する出力鮮度ID。 */
+  contentFingerprint: string;
   blink: {
     mode: "keepExisting";
+    coordination: {
+      strategy: "centerThenRife";
+      centerMs: number;
+      closeMs: number;
+      openMs: number;
+      settleMs: number;
+      suppressGazeDuringRife: boolean;
+      suppressHighlightDuringRife: boolean;
+      resumeDynamicEyeAfterSettle: boolean;
+    };
   };
   lipSync: {
     method: MotionLabMethod;
@@ -353,7 +419,7 @@ export interface SpritalkMotionProfile {
       c: number;
       wind: number;
       drive: number;
-      /** 房ごとチェーン分割（852話式・最大6房自動検出） */
+      /** 房ごとのスプリング分割（最大6房自動検出） */
       strands: boolean;
     };
     arm: {
@@ -366,13 +432,66 @@ export interface SpritalkMotionProfile {
       lift: { enabled: boolean; coupling: number; bounce: number; max: number };
     };
     chest: { k: number; c: number; max: number };
-    sway: { k: number; c: number };
+    sway: {
+      k: number;
+      c: number;
+      /** sway_ear* など、素材単位の回転軸・可動域・揺れ倍率。旧consumerは無視できる追加情報。 */
+      partOverrides: {
+        pivots: Record<string, { x: number; y: number }>;
+        rangesDeg: Record<string, number>;
+        swingScale: Record<string, number>;
+      };
+    };
+    earTwitch: {
+      enabled: boolean;
+      mode: MotionLabEarTwitchMode;
+      strength: number;
+      bounceVelocity: number;
+      rotationVelocity: number;
+      maxOffsetPx: number;
+      intervalMin: number;
+      intervalMax: number;
+      followUpScale: number;
+      followUpIntervalMin: number;
+      followUpIntervalMax: number;
+    };
     /** パララックス首振り（§8.3。scale=0で無効） */
     parallax: { shiftRatio: number; shearMax: number; scale: number };
     /** 視線ドリフト（§8.4。eyewhite/irides読込時のみ有効） */
-    gaze: { rangeRatio: number; returnToFrontOnSpeech: boolean };
+    gaze: {
+      enabled: boolean;
+      strength: number;
+      /** 旧ランタイム互換。現行は虹彩実寸からpx上限を算出するため0。 */
+      rangeRatio: number;
+      maxRangePx: number;
+      periodSeconds: number;
+      returnToFrontOnSpeech: boolean;
+    };
     /** 目ハイライトの微小ドリフト（§8.1 #6） */
     highlight: { driftPx: number };
+    /** 虹彩全体の微小伸縮。左右を別中心で処理する */
+    irisBreath: {
+      maxScaleDelta: number;
+      strength: number;
+      responseCurve: "quadratic";
+      periodMs: number;
+    };
+    /** 虹彩下辺へ加える控えめな水分反射 */
+    wetness: {
+      maxAlpha: number;
+      minAlpha: number;
+      strength: number;
+      responseCurve: "power2.2";
+      periodMs: number;
+    };
+    /** Optional independent eyebrow micro motion. */
+    brow: {
+      enabled: boolean;
+      strength: number;
+      maxLiftPx: number;
+      maxTiltDeg: number;
+      response: "idleAndVoice" | "smoothedVoiceLiftAndAsymmetricTilt";
+    };
   };
   // v2 additive: SpriTalk特性連動（設計書§8.6）
   presence: {
@@ -404,9 +523,10 @@ export type MotionLabTimelineEvent = { timeMs: number; mouth: MotionLabMouthKey;
 /** かんたん設定のエフェクト単位ON/OFF（「ソロ」で1効果だけを体感できる） */
 export type MotionLabEffectKey =
   | "breath" | "bodySway" | "pyoko" | "hairMotion" | "hairBack" | "parallax"
-  | "glance" | "gaze" | "blink" | "arm" | "lift" | "chest" | "earTwitch";
-/** 方式（エンジン系統）: ろてじん式=波揺れ＋ぷるぷる弾み / 852話式=バネ・チェーンリグ */
-export type MotionLabEngineFamily = "rotejin" | "hachigoni";
+  | "glance" | "gaze" | "irisBreath" | "wetness" | "brow" | "blink" | "arm" | "lift" | "chest" | "earTwitch";
+export type MotionLabEarTwitchMode = "bounce" | "tilt" | "double";
+/** モーション方式: 波揺れ＋弾み / スプリングリグ */
+export type MotionLabEngineFamily = "wave" | "springRig";
 
 /** モーションテンプレート: 調整済みパラメータの一括適用セット（適用後に個別微調整可） */
 export interface MotionLabTemplate {

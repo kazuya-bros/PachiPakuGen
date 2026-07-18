@@ -1,19 +1,36 @@
 import {
-  type ChainState,
   alphaBBox,
   chainAverage,
   chainFoldOffsets,
   clampDt,
   createArmSway,
   createChain,
-  detectHairStrandCenters,
+  createHairStrandSpring,
+  detectHairStrands,
   envelopeStep,
   noise1d,
   smoothDamp,
   springStep,
+  stepHairStrandSpring,
   stepChain,
   updateArmSway,
 } from "../motionLabPhysics";
+import {
+  motionLabChestWarpBounds,
+  resolveMotionLabChestWarpRegion,
+} from "./chestWarp";
+import {
+  detectMotionLabEyeRegions,
+  MOTION_LAB_IRIS_BREATH_MAX_SCALE_DELTA,
+  MOTION_LAB_WETNESS_MAX_ALPHA,
+  motionLabBrowMotion,
+  motionLabBrowRotationDeg,
+  motionLabHorizontalGazeAt,
+  motionLabIrisBreathScale,
+  motionLabWetnessGeometry,
+  motionLabWetnessOpacity,
+  type MotionLabEyeRegion,
+} from "./eyeEffects";
 import type {
   MotionLabImageSet,
   MotionLabLayerMode,
@@ -39,7 +56,6 @@ import {
   MOTION_LAB_EAR_TWITCH,
   MOTION_LAB_GAZE_DEFAULTS,
   MOTION_LAB_HAIR_SEGMENTS,
-  MOTION_LAB_HIGHLIGHT_DEFAULTS,
   MOTION_LAB_NOD_DEFAULTS,
   MOTION_LAB_PARALLAX_DEFAULTS,
   MOTION_LAB_PRESENCE_DEFAULTS,
@@ -48,6 +64,12 @@ import {
   MOTION_LAB_TARGET_OPEN,
   MOTION_LAB_TIMELINE,
 } from "./constants";
+import { stepMotionLabBlink } from "./blinkState";
+import {
+  motionLabInitialEarTwitchWait,
+  motionLabEarTwitchImpulse,
+  motionLabNextEarTwitchWait,
+} from "./earTwitch";
 
 /**
  * パーツ描画順の解決: layer-order.json（Step4のレイヤー調整由来）があればそれを優先し、
@@ -173,6 +195,170 @@ export function drawMotionLabLayer(
   ctx.restore();
 }
 
+interface MotionLabRasterSource {
+  width: number;
+  height: number;
+  pixels: Uint8ClampedArray;
+}
+
+const motionLabRasterSourceCache = new WeakMap<HTMLImageElement, Map<string, MotionLabRasterSource>>();
+const motionLabEyeRegionCache = new WeakMap<HTMLImageElement, Map<string, MotionLabEyeRegion[]>>();
+
+function motionLabRasterSource(
+  image: HTMLImageElement,
+  width: number,
+  height: number,
+): MotionLabRasterSource | null {
+  const cacheKey = `${width}x${height}`;
+  let imageCache = motionLabRasterSourceCache.get(image);
+  const cached = imageCache?.get(cacheKey);
+  if (cached) return cached;
+
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const sourceCtx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!sourceCtx) return null;
+  sourceCtx.drawImage(image, 0, 0, width, height);
+  const source: MotionLabRasterSource = {
+    width,
+    height,
+    pixels: sourceCtx.getImageData(0, 0, width, height).data,
+  };
+  imageCache ??= new Map();
+  imageCache.set(cacheKey, source);
+  motionLabRasterSourceCache.set(image, imageCache);
+  return source;
+}
+
+function motionLabEyeRegions(
+  image: HTMLImageElement,
+  width: number,
+  height: number,
+): MotionLabEyeRegion[] {
+  const cacheKey = `${width}x${height}`;
+  let imageCache = motionLabEyeRegionCache.get(image);
+  const cached = imageCache?.get(cacheKey);
+  if (cached) return cached;
+  const source = motionLabRasterSource(image, width, height);
+  const regions = source ? detectMotionLabEyeRegions(source.pixels, width, height) : [];
+  imageCache ??= new Map();
+  imageCache.set(cacheKey, regions);
+  motionLabEyeRegionCache.set(image, imageCache);
+  return regions;
+}
+
+function sampleMotionLabRaster(
+  source: MotionLabRasterSource,
+  sourceX: number,
+  sourceY: number,
+  output: Uint8ClampedArray,
+  outputIndex: number,
+) {
+  // この変形はY方向だけなので、X補間は不要。縦2画素だけを混ぜて
+  // ライブプレビューの画素処理量を抑える。
+  const x = Math.round(clamp(sourceX, 0, source.width - 1));
+  const y = clamp(sourceY, 0, source.height - 1);
+  const y0 = Math.floor(y);
+  const y1 = Math.min(source.height - 1, y0 + 1);
+  const ty = y - y0;
+  const weights = [1 - ty, ty];
+  const indexes = [
+    (y0 * source.width + x) * 4,
+    (y1 * source.width + x) * 4,
+  ];
+  let alpha = 0;
+  let red = 0;
+  let green = 0;
+  let blue = 0;
+  for (let index = 0; index < 2; index += 1) {
+    const sourceIndex = indexes[index];
+    const weightedAlpha = (source.pixels[sourceIndex + 3] / 255) * weights[index];
+    alpha += weightedAlpha;
+    red += source.pixels[sourceIndex] * weightedAlpha;
+    green += source.pixels[sourceIndex + 1] * weightedAlpha;
+    blue += source.pixels[sourceIndex + 2] * weightedAlpha;
+  }
+  output[outputIndex] = alpha > 0 ? red / alpha : 0;
+  output[outputIndex + 1] = alpha > 0 ? green / alpha : 0;
+  output[outputIndex + 2] = alpha > 0 ? blue / alpha : 0;
+  output[outputIndex + 3] = alpha * 255;
+}
+
+/**
+ * bodyを一枚のまま局所変形する胸部追従。
+ * chest.png は描画せず、存在する場合だけ範囲ガイドとして利用する。
+ */
+export function drawMotionLabChestWarp(
+  ctx: CanvasRenderingContext2D,
+  body: HTMLImageElement,
+  guide: HTMLImageElement | null,
+  width: number,
+  height: number,
+  transform: MotionLabLayerTransform,
+  offsetY: number,
+  runtime: MotionLabMouthRuntime,
+) {
+  if (Math.abs(offsetY) < 0.02) {
+    drawMotionLabLayer(ctx, body, width, height, transform);
+    return;
+  }
+
+  const source = motionLabRasterSource(body, width, height);
+  if (!source) {
+    drawMotionLabLayer(ctx, body, width, height, transform);
+    return;
+  }
+
+  let scratch = runtime.chestWarpScratch;
+  if (!scratch || scratch.width !== width || scratch.height !== height) {
+    scratch = document.createElement("canvas");
+    scratch.width = width;
+    scratch.height = height;
+    runtime.chestWarpScratch = scratch;
+  }
+  const scratchCtx = scratch.getContext("2d", { willReadFrequently: true });
+  if (!scratchCtx) {
+    drawMotionLabLayer(ctx, body, width, height, transform);
+    return;
+  }
+  scratchCtx.clearRect(0, 0, width, height);
+  scratchCtx.drawImage(body, 0, 0, width, height);
+
+  const region = resolveMotionLabChestWarpRegion(
+    width,
+    height,
+    alphaBBox(body),
+    guide ? alphaBBox(guide) : null,
+  );
+  const bounds = motionLabChestWarpBounds(width, height, region);
+  if (bounds.w <= 0 || bounds.h <= 0) {
+    drawMotionLabLayer(ctx, body, width, height, transform);
+    return;
+  }
+  const warped = scratchCtx.getImageData(bounds.x, bounds.y, bounds.w, bounds.h);
+  const xWeights = new Float32Array(bounds.w);
+  const yWeights = new Float32Array(bounds.h);
+  for (let localX = 0; localX < bounds.w; localX += 1) {
+    const nx = (bounds.x + localX - region.centerX) / Math.max(1, region.radiusX);
+    xWeights[localX] = Math.exp(-0.5 * nx * nx);
+  }
+  for (let localY = 0; localY < bounds.h; localY += 1) {
+    const ny = (bounds.y + localY - region.centerY) / Math.max(1, region.radiusY);
+    yWeights[localY] = Math.exp(-0.5 * ny * ny);
+  }
+  for (let localY = 0; localY < bounds.h; localY += 1) {
+    const y = bounds.y + localY;
+    for (let localX = 0; localX < bounds.w; localX += 1) {
+      const x = bounds.x + localX;
+      const sourceY = y - offsetY * xWeights[localX] * yWeights[localY];
+      sampleMotionLabRaster(source, x, sourceY, warped.data, (localY * bounds.w + localX) * 4);
+    }
+  }
+  scratchCtx.putImageData(warped, bounds.x, bounds.y);
+  drawMotionLabLayer(ctx, scratch, width, height, transform);
+}
+
 /**
  * B3メッシュ髪揺れのCanvas 2D描画: チェーン角の折れ線オフセットを
  * 縦ストリップに線形補間して適用（31-hair-mesh-b3.js のメッシュ変形と同じ数式）
@@ -228,11 +414,99 @@ export function drawMotionLabChainWarp(
   ctx.restore();
 }
 
+interface MotionLabMeshPoint {
+  x: number;
+  y: number;
+}
+
+/** Canvas 2D上で、元画像の三角形を変形後の三角形へテクスチャ付きで描く。 */
+function drawMotionLabTexturedTriangle(
+  ctx: CanvasRenderingContext2D,
+  image: HTMLImageElement,
+  drawWidth: number,
+  drawHeight: number,
+  source: [MotionLabMeshPoint, MotionLabMeshPoint, MotionLabMeshPoint],
+  destination: [MotionLabMeshPoint, MotionLabMeshPoint, MotionLabMeshPoint],
+) {
+  const [s0, s1, s2] = source;
+  const [d0, d1, d2] = destination;
+  const determinant =
+    s0.x * (s1.y - s2.y) + s1.x * (s2.y - s0.y) + s2.x * (s0.y - s1.y);
+  if (Math.abs(determinant) < 1e-6) return;
+
+  const a =
+    (d0.x * (s1.y - s2.y) + d1.x * (s2.y - s0.y) + d2.x * (s0.y - s1.y)) /
+    determinant;
+  const b =
+    (d0.y * (s1.y - s2.y) + d1.y * (s2.y - s0.y) + d2.y * (s0.y - s1.y)) /
+    determinant;
+  const c =
+    (d0.x * (s2.x - s1.x) + d1.x * (s0.x - s2.x) + d2.x * (s1.x - s0.x)) /
+    determinant;
+  const d =
+    (d0.y * (s2.x - s1.x) + d1.y * (s0.x - s2.x) + d2.y * (s1.x - s0.x)) /
+    determinant;
+  const e =
+    (d0.x * (s1.x * s2.y - s2.x * s1.y) +
+      d1.x * (s2.x * s0.y - s0.x * s2.y) +
+      d2.x * (s0.x * s1.y - s1.x * s0.y)) /
+    determinant;
+  const f =
+    (d0.y * (s1.x * s2.y - s2.x * s1.y) +
+      d1.y * (s2.x * s0.y - s0.x * s2.y) +
+      d2.y * (s0.x * s1.y - s1.x * s0.y)) /
+    determinant;
+
+  // 変形頂点は共有したまま、クリップだけ0.7px広げてAAの継ぎ目を隠す。
+  const center = { x: (d0.x + d1.x + d2.x) / 3, y: (d0.y + d1.y + d2.y) / 3 };
+  const expand = (point: MotionLabMeshPoint): MotionLabMeshPoint => {
+    const vx = point.x - center.x;
+    const vy = point.y - center.y;
+    const length = Math.hypot(vx, vy);
+    const scale = length > 1e-6 ? (length + 0.7) / length : 1;
+    return { x: center.x + vx * scale, y: center.y + vy * scale };
+  };
+  const [clip0, clip1, clip2] = destination.map(expand) as [
+    MotionLabMeshPoint,
+    MotionLabMeshPoint,
+    MotionLabMeshPoint,
+  ];
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(clip0.x, clip0.y);
+  ctx.lineTo(clip1.x, clip1.y);
+  ctx.lineTo(clip2.x, clip2.y);
+  ctx.closePath();
+  ctx.clip();
+  ctx.transform(a, b, c, d, e, f);
+  // 各三角形の周辺だけを転送する。全画像を三角形数だけ再描画しないための軽量化。
+  const displayLeft = Math.max(0, Math.min(s0.x, s1.x, s2.x) - 1);
+  const displayTop = Math.max(0, Math.min(s0.y, s1.y, s2.y) - 1);
+  const displayRight = Math.min(drawWidth, Math.max(s0.x, s1.x, s2.x) + 1);
+  const displayBottom = Math.min(drawHeight, Math.max(s0.y, s1.y, s2.y) + 1);
+  const displayWidth = displayRight - displayLeft;
+  const displayHeight = displayBottom - displayTop;
+  const naturalScaleX = (image.naturalWidth || drawWidth) / drawWidth;
+  const naturalScaleY = (image.naturalHeight || drawHeight) / drawHeight;
+  ctx.drawImage(
+    image,
+    displayLeft * naturalScaleX,
+    displayTop * naturalScaleY,
+    displayWidth * naturalScaleX,
+    displayHeight * naturalScaleY,
+    displayLeft,
+    displayTop,
+    displayWidth,
+    displayHeight,
+  );
+  ctx.restore();
+}
+
 /**
- * 852話式ソフト房ブレンドワープ: 房を x範囲でハード分割せず、
- * 列ブロックごとに「房中心へのガウシアン重み」で複数房チェーンの変位をブレンドする。
- * 隣接ブロックの変位が連続的に変わるため、前髪のように上部が繋がった髪でも裂けない。
- * （Anime2.5DRig index.html の頂点重み L.sw = exp(-((x-S.x)/σ)^2) 正規化の Canvas2D 版）
+ * ソフト房ブレンドワープ: 房を x範囲でハード分割せず、
+ * 共有メッシュ頂点ごとに「房中心へのガウシアン重み」で複数房の変位をブレンドする。
+ * 隣接セルが同じ変形頂点を参照するため、前髪のように上部が繋がった髪でも裂けない。
  */
 export function drawMotionLabStrandBlendWarp(
   ctx: CanvasRenderingContext2D,
@@ -242,91 +516,133 @@ export function drawMotionLabStrandBlendWarp(
   transform: MotionLabLayerTransform,
   options: {
     rootYRatio: number;
-    /** anglesSoft がある場合、根元=angles（stiff）・毛先=anglesSoft を u^1.2 で混合（852話式二重バネ） */
-    strands: Array<{ x: number; angles: ArrayLike<number>; anglesSoft?: ArrayLike<number> }>;
+    /** 各房の検出位置と、硬・柔2本のスカラーばねによる横変位 */
+    strands: Array<{
+      x: number;
+      rootY: number;
+      tipY: number;
+      stiffDx: number;
+      softDx: number;
+    }>;
+    /** 縦方向の目標メッシュ分割数（既存API互換） */
     stripCount?: number;
+    /** 横方向の目標セル幅（既存API互換） */
     blockWidth?: number;
     /** 変位の倍率（揺れ幅スライダー用。1=既定） */
     offsetScale?: number;
+    /** 根元から毛先へ変位を立ち上げる指数。長い後ろ髪は大きめにする。 */
+    tipExponent?: number;
   },
 ) {
   const strands = options.strands;
   if (strands.length === 0) return;
   const pivotX = width * 0.5;
   const pivotY = height * 0.58;
-  const stripCount = options.stripCount ?? 20;
-  const blockWidth = options.blockWidth ?? Math.max(16, Math.round(width / 48));
-  const span = height * (1 - options.rootYRatio);
-  const rowsPerStrand = strands.map(strand => chainFoldOffsets(strand.angles, span));
-  const rowsSoftPerStrand = strands.map(strand =>
-    strand.anglesSoft ? chainFoldOffsets(strand.anglesSoft, span) : null,
-  );
-  const segments = strands[0].angles.length;
-  // σ = 房間隔の中央値 × 0.6（852話実装と同係数）。1房ならブレンド不要で全幅追従。
-  // 下限をブロック幅×2にして、隣接ブロック間の重み変化を必ず滑らかにする（縦縞防止）
+  const requestedRows = options.stripCount ?? 20;
+  const targetCellWidth = options.blockWidth ?? Math.max(16, Math.round(width / 48));
+  const naturalWidth = Math.max(1, image.naturalWidth || width);
+  const naturalHeight = Math.max(1, image.naturalHeight || height);
+  const scaleX = width / naturalWidth;
+  const scaleY = height / naturalHeight;
+  const alpha = alphaBBox(image);
+  // 透明境界の補間ピクセルを切らないよう、実画像bboxを1pxだけ広げる。
+  const sourceLeft = Math.max(0, alpha.x - 1) * scaleX;
+  const sourceTop = Math.max(0, alpha.y - 1) * scaleY;
+  const sourceRight = Math.min(naturalWidth, alpha.x + alpha.w + 1) * scaleX;
+  const sourceBottom = Math.min(naturalHeight, alpha.y + alpha.h + 1) * scaleY;
+  const meshWidth = Math.max(1, sourceRight - sourceLeft);
+  const meshHeight = Math.max(1, sourceBottom - sourceTop);
+  // 三角形クリップは高コストなので、連続性を維持できる範囲で分割数に上限を置く。
+  const columnCount = Math.max(2, Math.min(28, Math.ceil(meshWidth / targetCellWidth)));
+  const rowCount = Math.max(2, Math.min(24, Math.round(requestedRows * (meshHeight / height))));
+  const strandCenters = strands.map(strand => strand.x * scaleX);
+  const strandRoots = strands.map(strand => Math.max(strand.rootY * scaleY, height * options.rootYRatio));
+  const strandTips = strands.map((strand, index) => Math.max(strand.tipY * scaleY, strandRoots[index] + 1));
+  // σ = 房間隔の中央値 × 0.6。1房ならブレンド不要で全幅追従。
   let sigma = width * 0.15;
   if (strands.length > 1) {
-    const gaps = strands.slice(1).map((strand, i) => strand.x - strands[i].x).sort((a, b) => a - b);
-    sigma = Math.max(blockWidth * 2, gaps[gaps.length >> 1] * 0.6);
+    const gaps = strandCenters
+      .slice(1)
+      .map((center, index) => center - strandCenters[index])
+      .sort((a, b) => a - b);
+    sigma = Math.max(meshWidth / columnCount, gaps[gaps.length >> 1] * 0.6);
   }
+
+  const offsetScale = options.offsetScale ?? 1;
+  const tipExponent = options.tipExponent ?? 1.8;
+  const mesh: MotionLabMeshPoint[][] = [];
+  for (let row = 0; row <= rowCount; row += 1) {
+    const sourceY = sourceTop + (meshHeight * row) / rowCount;
+    const meshRow: MotionLabMeshPoint[] = [];
+    for (let column = 0; column <= columnCount; column += 1) {
+      const sourceX = sourceLeft + (meshWidth * column) / columnCount;
+      let totalWeight = 0;
+      let weightedRootY = 0;
+      let weightedTipY = 0;
+      for (let strandIndex = 0; strandIndex < strands.length; strandIndex += 1) {
+        const gaussianX = (sourceX - strandCenters[strandIndex]) / sigma;
+        const weight = Math.exp(-gaussianX * gaussianX);
+        totalWeight += weight;
+        weightedRootY += weight * strandRoots[strandIndex];
+        weightedTipY += weight * strandTips[strandIndex];
+      }
+      const safeWeight = Math.max(1e-6, totalWeight);
+      const rootY = weightedRootY / safeWeight;
+      const tipY = weightedTipY / safeWeight;
+      const tipRatio = clamp((sourceY - rootY) / Math.max(1, tipY - rootY), 0, 1);
+      const softMix = Math.pow(tipRatio, 1.2);
+      let blendedDx = 0;
+      for (let strandIndex = 0; strandIndex < strands.length; strandIndex += 1) {
+        const strand = strands[strandIndex];
+        const gaussianX = (sourceX - strandCenters[strandIndex]) / sigma;
+        const weight = Math.exp(-gaussianX * gaussianX);
+        const strandDx = strand.stiffDx + (strand.softDx - strand.stiffDx) * softMix;
+        blendedDx += weight * strandDx;
+      }
+      const rawDx = (blendedDx / safeWeight) * Math.pow(tipRatio, tipExponent);
+      const dx = rawDx * offsetScale;
+      const dy = Math.abs(rawDx) * offsetScale * 0.12;
+      meshRow.push({ x: -pivotX + sourceX + dx, y: -pivotY + sourceY + dy });
+    }
+    mesh.push(meshRow);
+  }
+
   ctx.save();
   ctx.translate(pivotX + transform.x, pivotY + transform.y);
   ctx.rotate((transform.rotationDeg * Math.PI) / 180);
   if (transform.skewX) ctx.transform(1, 0, transform.skewX, 1, 0, 0);
   ctx.scale(transform.scaleX, transform.scaleY);
-  for (let index = 0; index < stripCount; index += 1) {
-    const sourceY = Math.floor((height * index) / stripCount);
-    const nextY = Math.floor((height * (index + 1)) / stripCount);
-    const stripHeight = Math.max(1, nextY - sourceY);
-    const centerYRatio = (sourceY + stripHeight * 0.5) / height;
-    const tipRatio = clamp((centerYRatio - options.rootYRatio) / Math.max(0.001, 1 - options.rootYRatio), 0, 1);
-    const pos = tipRatio * segments;
-    const lower = Math.min(segments, Math.floor(pos));
-    const upper = Math.min(segments, lower + 1);
-    const frac = pos - lower;
-    // 852話式二重バネ混合: 根元はstiff（素早く追従）、毛先ほどsoft（ふわっと遅れる）
-    const softMix = Math.pow(tipRatio, 1.2);
-    for (let blockX = 0; blockX < width; blockX += blockWidth) {
-      const blockW = Math.min(blockWidth, width - blockX);
-      const centerX = blockX + blockW * 0.5;
-      let totalWeight = 0;
-      let dx = 0;
-      let dy = 0;
-      for (let s = 0; s < strands.length; s += 1) {
-        const t = (centerX - strands[s].x) / sigma;
-        const weight = Math.exp(-t * t);
-        const rows = rowsPerStrand[s];
-        let strandDx = rows[lower].dx + (rows[upper].dx - rows[lower].dx) * frac;
-        let strandDy = rows[lower].dy + (rows[upper].dy - rows[lower].dy) * frac;
-        const rowsSoft = rowsSoftPerStrand[s];
-        if (rowsSoft) {
-          const softDx = rowsSoft[lower].dx + (rowsSoft[upper].dx - rowsSoft[lower].dx) * frac;
-          const softDy = rowsSoft[lower].dy + (rowsSoft[upper].dy - rowsSoft[lower].dy) * frac;
-          strandDx += (softDx - strandDx) * softMix;
-          strandDy += (softDy - strandDy) * softMix;
-        }
-        dx += weight * strandDx;
-        dy += weight * strandDy;
-        totalWeight += weight;
-      }
-      if (totalWeight > 1e-6) {
-        dx = (dx / totalWeight) * (options.offsetScale ?? 1);
-        // 縦変位は控えめに（852話実装は y += |dx|×0.12 程度。フル適用だと毛先が段差状に欠ける）
-        dy = (dy / totalWeight) * (options.offsetScale ?? 1) * 0.35;
-      } else {
-        dx = 0;
-        dy = 0;
-      }
-      ctx.drawImage(
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  for (let row = 0; row < rowCount; row += 1) {
+    const sourceY0 = sourceTop + (meshHeight * row) / rowCount;
+    const sourceY1 = sourceTop + (meshHeight * (row + 1)) / rowCount;
+    for (let column = 0; column < columnCount; column += 1) {
+      const sourceX0 = sourceLeft + (meshWidth * column) / columnCount;
+      const sourceX1 = sourceLeft + (meshWidth * (column + 1)) / columnCount;
+      const sourceTopLeft = { x: sourceX0, y: sourceY0 };
+      const sourceTopRight = { x: sourceX1, y: sourceY0 };
+      const sourceBottomLeft = { x: sourceX0, y: sourceY1 };
+      const sourceBottomRight = { x: sourceX1, y: sourceY1 };
+      const topLeft = mesh[row][column];
+      const topRight = mesh[row][column + 1];
+      const bottomLeft = mesh[row + 1][column];
+      const bottomRight = mesh[row + 1][column + 1];
+      drawMotionLabTexturedTriangle(
+        ctx,
         image,
-        blockX,
-        sourceY,
-        blockW,
-        stripHeight,
-        -pivotX + blockX + dx,
-        -pivotY + sourceY + dy,
-        blockW + 0.5,
-        stripHeight + 1,
+        width,
+        height,
+        [sourceTopLeft, sourceTopRight, sourceBottomRight],
+        [topLeft, topRight, bottomRight],
+      );
+      drawMotionLabTexturedTriangle(
+        ctx,
+        image,
+        width,
+        height,
+        [sourceTopLeft, sourceBottomRight, sourceBottomLeft],
+        [topLeft, bottomRight, bottomLeft],
       );
     }
   }
@@ -334,9 +650,11 @@ export function drawMotionLabStrandBlendWarp(
 }
 
 /**
- * ろてじん式 波揺れワープ（PuruPuruPNGTuber pyokopyokoHairShift 参考）:
+ * PuruPuruPNGTuber `pyokopyokoHairShift` の周期・位相設計を変更・適応。
+ * Upstream: rotejin/PuruPuruPNGTuber@9dc1e735 (Apache-2.0, Copyright 2026 masa)
+ * Modified for PachiPakuGen: Canvas横ストリップ描画、振幅、発話連動、
+ * 前後髪の扱いを変更。詳細は THIRD_PARTY_NOTICES.md を参照。
  * 位相が毛先(u=1)へ向かって進む複数sinの合成 = 髪を波が伝わって見える。
- * 根元(u<rootYRatio)は固定、発話energyでわずかにブースト。
  */
 export function drawMotionLabWaveWarp(
   ctx: CanvasRenderingContext2D,
@@ -414,6 +732,9 @@ export function drawMotionLabGaze(
   transform: MotionLabLayerTransform,
   gazeX: number,
   gazeY: number,
+  alpha = 1,
+  irisScale = 1,
+  wetnessOpacity = 0,
 ) {
   let scratch = runtime.gazeScratch;
   if (!scratch || scratch.width !== width || scratch.height !== height) {
@@ -427,9 +748,182 @@ export function drawMotionLabGaze(
   scratchCtx.clearRect(0, 0, width, height);
   scratchCtx.globalCompositeOperation = "source-over";
   scratchCtx.drawImage(eyewhite, 0, 0, width, height);
+  const regions = motionLabEyeRegions(irides, width, height);
+  const sourceScaleX = irides.naturalWidth / Math.max(1, width);
+  const sourceScaleY = irides.naturalHeight / Math.max(1, height);
+  const safeScale = clamp(
+    irisScale,
+    1 - MOTION_LAB_IRIS_BREATH_MAX_SCALE_DELTA,
+    1 + MOTION_LAB_IRIS_BREATH_MAX_SCALE_DELTA,
+  );
+  const drawIrises = (targetCtx: CanvasRenderingContext2D) => {
+    if (regions.length === 0) {
+      targetCtx.drawImage(irides, gazeX, gazeY, width, height);
+      return;
+    }
+    for (const region of regions) {
+      const padding = 2;
+      const x = Math.max(0, region.x - padding);
+      const y = Math.max(0, region.y - padding);
+      const regionWidth = Math.min(width - x, region.w + padding * 2);
+      const regionHeight = Math.min(height - y, region.h + padding * 2);
+      const drawWidth = regionWidth * safeScale;
+      const drawHeight = regionHeight * safeScale;
+      targetCtx.drawImage(
+        irides,
+        x * sourceScaleX,
+        y * sourceScaleY,
+        regionWidth * sourceScaleX,
+        regionHeight * sourceScaleY,
+        x + gazeX - (drawWidth - regionWidth) * 0.5,
+        y + gazeY - (drawHeight - regionHeight) * 0.5,
+        drawWidth,
+        drawHeight,
+      );
+    }
+  };
   scratchCtx.globalCompositeOperation = "source-atop";
-  scratchCtx.drawImage(irides, gazeX, gazeY, width, height);
+  drawIrises(scratchCtx);
+
+  if (wetnessOpacity > 0 && regions.length > 0) {
+    let wetnessScratch = runtime.eyeWetnessScratch;
+    if (!wetnessScratch || wetnessScratch.width !== width || wetnessScratch.height !== height) {
+      wetnessScratch = document.createElement("canvas");
+      wetnessScratch.width = width;
+      wetnessScratch.height = height;
+      runtime.eyeWetnessScratch = wetnessScratch;
+    }
+    const wetnessCtx = wetnessScratch.getContext("2d");
+    if (wetnessCtx) {
+      wetnessCtx.clearRect(0, 0, width, height);
+      wetnessCtx.globalCompositeOperation = "source-over";
+      wetnessCtx.globalAlpha = clamp(wetnessOpacity, 0, MOTION_LAB_WETNESS_MAX_ALPHA);
+      for (const region of regions) {
+        const geometry = motionLabWetnessGeometry(region);
+        const centerX = geometry.centerX + gazeX;
+        const centerY = geometry.surfaceCenterY + gazeY;
+        const radiusX = geometry.surfaceRadiusX;
+        const radiusY = geometry.surfaceRadiusY;
+        wetnessCtx.save();
+        wetnessCtx.translate(centerX, centerY);
+        wetnessCtx.scale(1, radiusY / radiusX);
+        const gradient = wetnessCtx.createRadialGradient(0, 0, 0, 0, 0, radiusX);
+        gradient.addColorStop(0, "rgba(255,255,255,0.88)");
+        gradient.addColorStop(0.58, "rgba(232,249,255,0.48)");
+        gradient.addColorStop(1, "rgba(255,255,255,0)");
+        wetnessCtx.fillStyle = gradient;
+        wetnessCtx.beginPath();
+        wetnessCtx.arc(0, 0, radiusX, 0, Math.PI * 2);
+        wetnessCtx.fill();
+        wetnessCtx.restore();
+
+        // A narrow, harder lower crescent remains legible after the full
+        // character is scaled down. The soft surface alone collapses to one
+        // translucent pixel in the normal preview size.
+        wetnessCtx.save();
+        wetnessCtx.strokeStyle = "rgba(238,252,255,0.96)";
+        wetnessCtx.lineWidth = geometry.crescentLineWidth;
+        wetnessCtx.lineCap = "round";
+        wetnessCtx.beginPath();
+        wetnessCtx.ellipse(
+          centerX,
+          geometry.crescentCenterY + gazeY,
+          geometry.crescentRadiusX,
+          geometry.crescentRadiusY,
+          0,
+          Math.PI * 0.16,
+          Math.PI * 0.84,
+        );
+        wetnessCtx.stroke();
+        wetnessCtx.restore();
+      }
+      // Mask after drawing so the reflection cannot bleed onto the white of the eye.
+      wetnessCtx.globalAlpha = 1;
+      wetnessCtx.globalCompositeOperation = "destination-in";
+      drawIrises(wetnessCtx);
+      wetnessCtx.globalCompositeOperation = "source-over";
+      scratchCtx.globalCompositeOperation = "source-over";
+      scratchCtx.drawImage(wetnessScratch, 0, 0);
+    }
+  }
   scratchCtx.globalCompositeOperation = "source-over";
+  drawMotionLabLayer(ctx, scratch, width, height, transform, alpha);
+}
+
+/**
+ * 独立した眉素材を左右ごとの中心でわずかに持ち上げる。
+ * 眉が一つの連結領域として検出された場合は、回転させず上下移動だけに退避する。
+ */
+export function drawMotionLabBrows(
+  ctx: CanvasRenderingContext2D,
+  runtime: MotionLabMouthRuntime,
+  eyebrow: HTMLImageElement,
+  width: number,
+  height: number,
+  transform: MotionLabLayerTransform,
+  elapsedMs: number,
+  voice: number,
+  strength: number,
+) {
+  const motion = motionLabBrowMotion(elapsedMs, voice, strength);
+  if (motion.liftPx <= 0.001 && motion.tiltDeg <= 0.001) {
+    drawMotionLabLayer(ctx, eyebrow, width, height, transform);
+    return;
+  }
+  const regions = motionLabEyeRegions(eyebrow, width, height);
+  if (regions.length !== 2) {
+    drawMotionLabLayer(ctx, eyebrow, width, height, {
+      ...transform,
+      y: transform.y - motion.liftPx,
+    });
+    return;
+  }
+
+  let scratch = runtime.browScratch;
+  if (!scratch || scratch.width !== width || scratch.height !== height) {
+    scratch = document.createElement("canvas");
+    scratch.width = width;
+    scratch.height = height;
+    runtime.browScratch = scratch;
+  }
+  const scratchCtx = scratch.getContext("2d");
+  if (!scratchCtx) {
+    drawMotionLabLayer(ctx, eyebrow, width, height, {
+      ...transform,
+      y: transform.y - motion.liftPx,
+    });
+    return;
+  }
+  scratchCtx.clearRect(0, 0, width, height);
+  const sourceScaleX = eyebrow.naturalWidth / Math.max(1, width);
+  const sourceScaleY = eyebrow.naturalHeight / Math.max(1, height);
+  for (let index = 0; index < regions.length; index += 1) {
+    const region = regions[index];
+    const padding = Math.max(2, Math.ceil(region.h * 0.18));
+    const x = Math.max(0, region.x - padding);
+    const y = Math.max(0, region.y - padding);
+    const regionWidth = Math.min(width - x, region.w + padding * 2);
+    const regionHeight = Math.min(height - y, region.h + padding * 2);
+    const centerX = x + regionWidth * 0.5;
+    const centerY = y + regionHeight * 0.5;
+    const side = index === 0 ? "left" : "right";
+    scratchCtx.save();
+    scratchCtx.translate(centerX, centerY - motion.liftPx);
+    // 左右反転した基本角度で内側を上げ、発話中だけ小さな左右差を足す。
+    scratchCtx.rotate((motionLabBrowRotationDeg(side, motion) * Math.PI) / 180);
+    scratchCtx.drawImage(
+      eyebrow,
+      x * sourceScaleX,
+      y * sourceScaleY,
+      regionWidth * sourceScaleX,
+      regionHeight * sourceScaleY,
+      -regionWidth * 0.5,
+      -regionHeight * 0.5,
+      regionWidth,
+      regionHeight,
+    );
+    scratchCtx.restore();
+  }
   drawMotionLabLayer(ctx, scratch, width, height, transform);
 }
 
@@ -471,22 +965,25 @@ export function createMotionLabPhysics(
     chest: { x: 0, v: 0 },
     sways: new Map(),
     earTwitches: new Map(),
-    strandChainsBack: [],
+    strandSpringsBack: [],
     envOpen: 0,
     mouthVel: { v: 0 },
     speaking: false,
     blinkWait: randomizePhase ? 0.5 + Math.random() * 2 : 1.5,
-    blinkT: -1,
+    blinkPhase: "idle",
+    blinkT: 0,
     headTurnT: rand(100),
     nod: { x: 0, v: 0 },
     gaze: { x: 0, y: 0 },
     gazeVelX: { v: 0 },
     gazeVelY: { v: 0 },
-    gazeT: rand(100),
-    highlightT: rand(100),
-    strandChains: [],
-    strandChainsSoft: [],
-    strandChainsBackSoft: [],
+    // The gaze always starts from the centre; only its slow horizontal phase moves.
+    gazeT: 0,
+    highlightT: 0,
+    highlight: { x: 0, y: 0 },
+    highlightVelX: { v: 0 },
+    highlightVelY: { v: 0 },
+    strandSprings: [],
     pyoko: { x: 0, v: 0 },
     glanceWait: randomizePhase ? 1 + Math.random() * 2 : 2,
     glanceHead: 0,
@@ -505,12 +1002,13 @@ export function resetMotionLabRuntime(
   runtime.previousTarget = "closed";
   runtime.transitionStartMs = 0;
   runtime.lastMs = 0;
+  runtime.browVoice = 0;
   runtime.physics = createMotionLabPhysics();
   // 登場撃力（presence.entryBounce）: 表示開始時に髪・肩・胸へ撃力を入れ「呼ばれた感」を出す
   if (entryBounce > 0) {
     runtime.physics.hairChain.omegas[0] += 0.9 * entryBounce;
     runtime.physics.arm.lift.v += MOTION_LAB_ARM_DEFAULTS.lift.bounce * 0.8 * entryBounce;
-    runtime.physics.chest.v += 14 * entryBounce;
+    runtime.physics.chest.v += 4 * entryBounce;
   }
 }
 
@@ -532,7 +1030,16 @@ export function drawMotionLabScene(
   elapsedMs: number,
   settings: MotionLabRenderSettings,
 ) {
-  const target = motionLabTimelineAt(elapsedMs, settings.timeline, settings.timelineDurationMs);
+  const random = settings.random ?? Math.random;
+  const liveInput = settings.liveInput?.() ?? null;
+  const timelineTarget = motionLabTimelineAt(elapsedMs, settings.timeline, settings.timelineDurationMs);
+  const target = liveInput
+    ? {
+      mouth: liveInput.mouth,
+      energy: clamp(liveInput.energy, 0, 1),
+      loopMs: timelineTarget.loopMs,
+    }
+    : timelineTarget;
   const dt = runtime.lastMs > 0 ? clampDt((elapsedMs - runtime.lastMs) / 1000) : 0;
   runtime.lastMs = elapsedMs;
   const ph = runtime.physics;
@@ -546,11 +1053,21 @@ export function drawMotionLabScene(
   const speaking = target.mouth !== "closed";
   const speechStarted = speaking && !ph.speaking;
   ph.speaking = speaking;
+  const blinkFrame = stepMotionLabBlink(
+    ph,
+    dt,
+    settings.blinkEnabled && images.eyeFrames.length > 1,
+    settings.blinkRate,
+    MOTION_LAB_BLINK_DEFAULTS,
+    random,
+  );
 
   // ===== 口の開度: A4エンベロープ（attack/release）→ A1 SmoothDamp追従 =====
   // baselineレーンは attackMs=0/releaseMs=0/shapeSmoothing=0 で矩形駆動（従来相当）になる
   const targetOpenBase = MOTION_LAB_TARGET_OPEN[target.mouth];
-  const targetOpen = targetOpenBase * (1 - settings.restBias * (1 - target.energy));
+  const targetOpen = liveInput
+    ? clamp(liveInput.openness, 0, 1) * targetOpenBase
+    : targetOpenBase * (1 - settings.restBias * (1 - target.energy));
   ph.envOpen = envelopeStep(ph.envOpen, targetOpen, settings.attackMs, settings.releaseMs, dt);
   const smoothTime = settings.shapeSmoothing * 0.15;
   runtime.openY = smoothTime < 0.005
@@ -561,14 +1078,24 @@ export function drawMotionLabScene(
   const height = parts.height;
   const preset = MOTION_LAB_PRESET_FACTORS[settings.preset];
   const voice = target.energy;
+  // 口の段階切替を眉へ直結させず、少し遅れて上がり、ゆっくり戻す。
+  runtime.browVoice ??= 0;
+  runtime.browVoice = envelopeStep(runtime.browVoice, voice, 120, 220, dt);
 
   let bodyTransform: MotionLabLayerTransform;
   let hairFrontTransform: MotionLabLayerTransform;
   let hairBackTransform: MotionLabLayerTransform;
   let hairMeshAngles: ArrayLike<number> | null = null;
-  /** 房ごと髪物理の描画リスト（852話式ソフトブレンド用の房中心線＋stiff/softチェーン角。null=一枚チェーン） */
-  let hairStrandRender: Array<{ x: number; angles: Float32Array; anglesSoft: Float32Array }> | null = null;
-  let hairBackStrandRender: Array<{ x: number; angles: Float32Array; anglesSoft: Float32Array }> | null = null;
+  type HairStrandRender = Array<{
+    x: number;
+    rootY: number;
+    tipY: number;
+    stiffDx: number;
+    softDx: number;
+  }>;
+  /** 房ごと髪物理の描画リスト（検出位置と硬・柔2本のスカラーばね変位）。null=一枚チェーン */
+  let hairStrandRender: HairStrandRender | null = null;
+  let hairBackStrandRender: HairStrandRender | null = null;
 
   if (settings.layerMode === "simple") {
     // 基準レーン: 従来のB0相当（一体揺れ・絶対時刻sin）を維持
@@ -597,7 +1124,7 @@ export function drawMotionLabScene(
     springStep(ph.pyoko, -voice * settings.pyokoBounce, 90, 10, dt);
     const breathY = breath * 3.2 * settings.breathAmplitude * preset.breath;
     const rootY = breathY + ph.pyoko.x;
-    // 852話式: 頭・髪は胸の呼吸に少し遅れて追従する（-0.6位相の遅延呼吸）
+    // 頭・髪は胸の呼吸に少し遅れて追従する（-0.6位相の遅延呼吸）。
     const hairLagY = Math.sin(ph.breathPhase - 0.6) * 3.2 * settings.breathAmplitude * preset.breath + ph.pyoko.x;
     if (dt > 0) {
       ph.rootVX = (rootX - ph.prevRootX) / dt;
@@ -621,57 +1148,54 @@ export function drawMotionLabScene(
       const drive = clamp(-settings.hairDrive * settings.hairMotionStrength * ph.rootVX * 0.05, -0.2, 0.2);
       stepChain(ph.hairChain, drive + wind, settings.hairK, settings.hairC, dt, 0.5);
       hairMeshAngles = ph.hairChain.angles;
-      // 房ごと髪物理（852話式・§8.1 #5）: 毛先輪郭ピークで房中心線を自動検出し、
-      // 房ごとに独立チェーン＋風の位相ずらしで駆動（描画はガウシアン重みのソフトブレンド）。
-      // 房ごとの位相を大きくずらし・風を強めて（×1.6）一枚チェーンとの差を体感しやすくする
-      // 852話式二重バネ: stiff（硬く素早い、根元側）と soft（柔らかく遅い、毛先側）の
-      // 2本のチェーンを同じ駆動で回し、描画時に u^1.2 で混合する
-      const stepStrandChains = (
+      // 毛先輪郭の実ピークごとに、硬・柔2本のスカラーばねを同じ目標へ追従させる。
+      // 描画では検出したrootY/tipYを使い、根元から毛先へ柔らかい側の変位を混ぜる。
+      const stepStrandSprings = (
         image: HTMLImageElement,
-        chains: ChainState[],
-        chainsSoft: ChainState[],
+        springs: MotionLabPhysicsState["strandSprings"],
         driveScale: number,
         phaseSeed: number,
         // 後ろ髪の「大波」化: 剛性を下げてゆっくり大きく、風の時間も遅く
         kScale = 1,
         windTempo = 1,
-      ): Array<{ x: number; angles: Float32Array; anglesSoft: Float32Array }> | null => {
-        const centers = detectHairStrandCenters(image, MOTION_LAB_HAIR_SEGMENTS);
-        if (centers.length <= 1) return null;
-        if (chains.length !== centers.length || chainsSoft.length !== centers.length) {
-          chains.length = 0;
-          chainsSoft.length = 0;
-          for (let i = 0; i < centers.length; i += 1) {
-            chains.push(createChain(MOTION_LAB_HAIR_SEGMENTS));
-            chainsSoft.push(createChain(MOTION_LAB_HAIR_SEGMENTS));
+      ): HairStrandRender | null => {
+        const strands = detectHairStrands(image, MOTION_LAB_HAIR_SEGMENTS);
+        if (strands.length <= 1) return null;
+        if (springs.length !== strands.length) {
+          springs.length = 0;
+          for (let i = 0; i < strands.length; i += 1) {
+            springs.push(createHairStrandSpring(i * 1.37 + phaseSeed));
           }
         }
-        return centers.map((centerX, index) => {
-          const chain = chains[index];
-          const chainSoft = chainsSoft[index];
-          chain.t += dt;
-          chainSoft.t = chain.t;
+        return strands.map((strand, index) => {
+          const spring = springs[index];
           const strandWind =
-            (Math.sin((ph.noiseT * windTempo + index * 1.7 + phaseSeed) * 1.7) * windAmp +
-              noise1d(chain.t * 0.6 * windTempo + index * 29.3 + phaseSeed * 11) * windAmp) * 1.15;
-          const target = (drive + strandWind) * driveScale;
-          // stiff: k×2.2/c×1.4（本家 k70/c9 相当の比率）、soft: k×0.35/c×0.7（毛先のふわ遅れ・減衰は強めに）
-          // 角度クランプ±0.28: 6段累積で過大な折れ（毛先の縦縞・欠け）を防ぐ
-          stepChain(chain, target, settings.hairK * 2.2 * kScale, settings.hairC * 1.4, dt, 0.28);
-          stepChain(chainSoft, target, settings.hairK * 0.35 * kScale, settings.hairC * 0.7, dt, 0.28);
-          return { x: centerX, angles: chain.angles, anglesSoft: chainSoft.angles };
+            (Math.sin(ph.noiseT * windTempo * 1.7 + spring.phase) * windAmp * 1.8 +
+              Math.sin(ph.noiseT * windTempo * 1.9 + spring.phase * 2.3) * windAmp) * 1.15;
+          const span = Math.max(1, strand.tipY - strand.rootY);
+          const target = clamp((drive + strandWind) * driveScale, -0.08, 0.08) * span;
+          const displacement = stepHairStrandSpring(
+            spring,
+            target,
+            dt,
+            settings.hairK * kScale,
+            settings.hairC,
+            span * 0.09,
+          );
+          return { ...strand, ...displacement };
         });
       };
       if (settings.strandsEnabled && images.hair) {
-        hairStrandRender = stepStrandChains(images.hair, ph.strandChains, ph.strandChainsSoft, 1, 0);
+        ph.strandSprings ??= [];
+        hairStrandRender = stepStrandSprings(images.hair, ph.strandSprings, 1, 0);
       }
       // 後ろ髪も房分割対象（振幅は hairBackScale に従う）。
       // 大波特性: 剛性半分（固有振動数が低く、ゆっくり大きくたゆたう）＋風の時間0.55倍
       if (settings.strandsEnabled && images.hairBack) {
-        hairBackStrandRender = stepStrandChains(
+        ph.strandSpringsBack ??= [];
+        hairBackStrandRender = stepStrandSprings(
           images.hairBack,
-          ph.strandChainsBack,
-          ph.strandChainsBackSoft,
+          ph.strandSpringsBack,
           settings.hairBackScale * 1.3,
           5.3,
           0.5,
@@ -726,7 +1250,7 @@ export function drawMotionLabScene(
       hairStrandRender = null;
       hairBackStrandRender = null;
     }
-    // 852話式: 体の回転は全レイヤーへ継承する（本家は最終段で全頂点に体回転を適用）。
+    // 体の回転は最終段で全レイヤーへ継承する。
     // 髪の物理回転に体の傾きを加算 = 体の揺れに髪が必ずついてくる
     hairFrontTransform = {
       ...hairFrontTransform,
@@ -738,25 +1262,29 @@ export function drawMotionLabScene(
     };
   }
 
-  // ===== パララックス首振り（852話氏 Anime2.5DRig由来・§8.3） =====
+  // ===== パララックス首振り（Anime2.5DRigの設計を参考に独自実装） =====
   // 駆動 = ノイズドリフト（headTurn）＋発話開始の頷きバネ（headNod）。
   // 各レイヤーへ depth × SHIFT_MAX の水平シフト＋シアーを適用（縦はシフトのみ）
   let eyeMouthTransform = bodyTransform;
   let parallaxArmDx = 0;
   let parallaxArmDy = 0;
-  // ランダムグランス（852話 auto.rand参考）: 1.4〜4秒ごとに顔向き・視線の目標が
+  // Anime2.5DRig@d4882586 (MIT, Copyright 2026 hakoniwa) の更新間隔を参考に変更・適応。
+  // ランダムグランス: 1.4〜4秒ごとに顔向き・視線の目標が
   // ふっと変わり、SmoothDampで滑らかに移行する（連続ノイズだけより「意図」が出る）
-  if (settings.randomGlance && settings.layerMode !== "simple") {
-    ph.glanceWait -= dt;
-    if (ph.glanceWait <= 0) {
-      ph.glanceWait = 1.4 + Math.random() * 2.6;
-      ph.glanceHeadTarget = (Math.random() * 2 - 1) * 0.45 * settings.glanceStrength;
-      const glanceRange = width * MOTION_LAB_GAZE_DEFAULTS.rangeRatio * 2.2 * settings.glanceStrength;
-      ph.glanceGaze.x = (Math.random() * 2 - 1) * glanceRange;
-      ph.glanceGaze.y = (Math.random() * 2 - 1) * glanceRange * 0.5;
+  if (settings.randomGlance && settings.glanceStrength > 0 && settings.layerMode !== "simple") {
+    // 瞬き準備中は新しい視線目標を作らない。顔向きは維持し、目だけ中央へ戻す。
+    if (!blinkFrame.sequenceActive) {
+      ph.glanceWait -= dt;
+      if (ph.glanceWait <= 0) {
+        ph.glanceWait = 1.4 + random() * 2.6;
+        ph.glanceHeadTarget = (random() * 2 - 1) * 0.45 * settings.glanceStrength;
+      }
     }
     ph.glanceHead = smoothDamp(ph.glanceHead, ph.glanceHeadTarget, ph.glanceHeadVel, 0.5, dt);
   } else {
+    ph.glanceHeadTarget = 0;
+    ph.glanceGaze.x = 0;
+    ph.glanceGaze.y = 0;
     ph.glanceHead = smoothDamp(ph.glanceHead, 0, ph.glanceHeadVel, 0.5, dt);
   }
   if (settings.layerMode !== "simple" && settings.parallaxScale > 0) {
@@ -802,7 +1330,7 @@ export function drawMotionLabScene(
         idleSwing: settings.armMaxAngle * 0.45 * settings.armSwayAmp,
         maxAngle: settings.armMaxAngle,
         liftEnabled: settings.liftEnabled,
-        // 二次追従化（PuruPuru/852話式: 一次バウンスは体1本、肩はそれに遅れて追従）:
+        // 二次追従化: 一次バウンスは体1本、肩はそれに遅れて追従する。
         // 発話バウンス有効時は独自撃力を1/4に抑え、体のY速度カップリングを強めて
         // 「体が弾む→肩が遅れてついてくる」の連動にする
         liftCoupling: MOTION_LAB_ARM_DEFAULTS.lift.coupling * (settings.pyokoBounce > 0 ? 2.8 : 1) * settings.liftStrength,
@@ -816,18 +1344,17 @@ export function drawMotionLabScene(
     );
   }
 
-  // ===== 胸揺れ: 縦バネ1本（低周波・強減衰）=====
-  // 852話式（bustTgt=体の動き由来）に合わせ、独立発振ではなく体のY速度
-  // （発話バウンス・呼吸を含む）への遅延追従=二次揺れとして駆動する。
-  // 発話バウンス無効時のみ、視認用の弱い独自撃力・揺らぎでフォールバック
+  // ===== 胸部追従: 体・衣服の局所ワープを駆動する強減衰バネ =====
+  // 独立発振ではなく、呼吸・発話バウンスを含む体のY速度へ控えめに遅れて追従する。
+  // 発話バウンス無効時だけ、ごく弱い撃力と揺らぎを加える。
   let chestOffsetY = 0;
-  if (images.chest && animateParts && settings.chestMax > 0) {
+  if (animateParts && settings.chestMax > 0) {
     const pyokoActive = settings.pyokoBounce > 0;
-    if (speechStarted) ph.chest.v += pyokoActive ? 14 : 45;
+    if (speechStarted) ph.chest.v += pyokoActive ? 4 : 8;
     const chestNoise = pyokoActive
       ? 0
-      : noise1d(ph.noiseT * 0.8 + 13.7) * settings.chestMax * 0.35;
-    const driveY = clamp(-0.6 * ph.rootVY + chestNoise, -settings.chestMax, settings.chestMax);
+      : noise1d(ph.noiseT * 0.8 + 13.7) * settings.chestMax * 0.08;
+    const driveY = clamp(-0.16 * ph.rootVY + chestNoise, -settings.chestMax, settings.chestMax);
     springStep(ph.chest, driveY, MOTION_LAB_CHEST_DEFAULTS.k, MOTION_LAB_CHEST_DEFAULTS.c, dt);
     ph.chest.x = clamp(ph.chest.x, -settings.chestMax, settings.chestMax);
     chestOffsetY = ph.chest.x;
@@ -857,7 +1384,7 @@ export function drawMotionLabScene(
     let angle = (out?.rigid ?? 0) * (settings.swingScale[part] ?? 1);
     const range = settings.rangesDeg[part] ?? 0;
     if (range > 0) angle = clamp(angle, (-range * Math.PI) / 180, (range * Math.PI) / 180);
-    // 体の傾きを継承（852話式: 体回転は全レイヤーに掛かる）
+    // 体の傾きを腕へ継承する。
     angle += (bodyTransform.rotationDeg * Math.PI) / 180;
     drawMotionLabPivotLayer(ctx, image, width, height, armBaseTransform, pivot, angle, out?.lift ?? 0);
   };
@@ -869,9 +1396,10 @@ export function drawMotionLabScene(
         ? clamp(settings.pivots.hair_back.y / height, 0, 0.9)
         : 0.08;
       drawMotionLabStrandBlendWarp(ctx, images.hairBack, width, height, { ...hairBackTransform, rotationDeg: bodyTransform.rotationDeg }, {
-        rootYRatio: backRootYRatio,
+        rootYRatio: settings.pivots.hair_back ? backRootYRatio : 0,
         strands: hairBackStrandRender,
         offsetScale: settings.swingScale.hair_back ?? 1,
+        tipExponent: 2.1,
       });
     } else if (settings.hairWaveMode && animateParts && settings.hairMotionEnabled) {
       // 波揺れ: 後ろ髪は前髪と位相をずらし、hairBackScale で振幅調整
@@ -894,16 +1422,19 @@ export function drawMotionLabScene(
     }
   };
   const drawBody = () => {
-    drawMotionLabLayer(ctx, images.body, width, height, bodyTransform);
+    drawMotionLabChestWarp(
+      ctx,
+      images.body,
+      images.chest,
+      width,
+      height,
+      bodyTransform,
+      chestOffsetY,
+      runtime,
+    );
   };
-  // 胸: body(0) と arm(1) の間 = 0.5相当（設計書§8.5）
-  const drawChest = () => {
-    if (!images.chest) return;
-    drawMotionLabLayer(ctx, images.chest, width, height, {
-      ...bodyTransform,
-      y: bodyTransform.y + chestOffsetY,
-    });
-  };
+  // 旧layer-order.jsonに残るchestキーを受ける。描画はbodyの局所ワープへ統合済み。
+  const drawChest = () => {};
 
   // 汎用揺れパーツ sway_*: 腕と同系のチェーン物理（ピボット=bbox上端中央）。
   // 獣耳（sway_ear*）は頭に付いているパーツなので、前髪と同じ頭基準の変換
@@ -927,32 +1458,57 @@ export function drawMotionLabScene(
           -MOTION_LAB_SWAY_DEFAULTS.maxAngle,
           MOTION_LAB_SWAY_DEFAULTS.maxAngle,
         );
-        // 獣耳ピコピコ（sway_ear*限定・オプション）: 数秒ごとに縦バネへ撃力を入れて
-        // 上下に「ピコッ」と跳ねさせる。短い間隔の連続ツイッチ（ピコピコ感）を確率で挟む
+        // 獣耳ピコピコ（sway_ear*限定・オプション）。上下・傾き・二連の3方式を
+        // 同じ決定的乱数列で駆動し、同じ設定なら毎回同じ動きを再現する。
         if (settings.earTwitch && isEar) {
+          const earTwitchMode = settings.earTwitchMode ?? "double";
           let twitch = ph.earTwitches.get(name);
           if (!twitch) {
-            twitch = { wait: 2 + Math.random() * 5, spring: { x: 0, v: 0 } };
+            twitch = {
+              wait: motionLabInitialEarTwitchWait(random()),
+              spring: { x: 0, v: 0 },
+              queuedFollowUp: false,
+              mode: earTwitchMode,
+            };
             ph.earTwitches.set(name, twitch);
+          }
+          if (twitch.mode !== earTwitchMode) {
+            twitch.mode = earTwitchMode;
+            twitch.queuedFollowUp = false;
+            twitch.wait = motionLabInitialEarTwitchWait(random());
           }
           twitch.wait -= dt;
           if (twitch.wait <= 0) {
-            twitch.spring.v -= MOTION_LAB_EAR_TWITCH.bounce * settings.earTwitchScale; // 上向きの撃力
-            chainState.omegas[0] += (Math.random() < 0.5 ? 1 : -1) * MOTION_LAB_EAR_TWITCH.rotKick * settings.earTwitchScale;
-            twitch.wait = Math.random() < 0.45
-              ? MOTION_LAB_EAR_TWITCH.doubleMin + Math.random() * MOTION_LAB_EAR_TWITCH.doubleRange
-              : MOTION_LAB_EAR_TWITCH.intervalMin + Math.random() * MOTION_LAB_EAR_TWITCH.intervalRange;
+            const followUp = twitch.queuedFollowUp === true;
+            const impulse = motionLabEarTwitchImpulse(
+              earTwitchMode,
+              settings.earTwitchScale,
+              random() < 0.5 ? -1 : 1,
+              followUp,
+            );
+            twitch.spring.v += impulse.bounceVelocity;
+            chainState.omegas[0] += impulse.rotationVelocity;
+            const queueFollowUp = earTwitchMode === "double" && !followUp;
+            twitch.queuedFollowUp = queueFollowUp;
+            twitch.wait = motionLabNextEarTwitchWait(earTwitchMode, queueFollowUp, random());
           }
           springStep(twitch.spring, 0, MOTION_LAB_EAR_TWITCH.k, MOTION_LAB_EAR_TWITCH.c, dt);
           twitch.spring.x = clamp(twitch.spring.x, -MOTION_LAB_EAR_TWITCH.maxPx, MOTION_LAB_EAR_TWITCH.maxPx);
           twitchOffsetY = twitch.spring.x;
         }
         stepChain(chainState, drive + noise, MOTION_LAB_SWAY_DEFAULTS.k, MOTION_LAB_SWAY_DEFAULTS.c, dt, MOTION_LAB_SWAY_DEFAULTS.maxAngle);
-        // 土台の傾き（耳=頭、その他=体）＋チェーン揺れ（＋耳は縦ピコ）
-        angle = chainAverage(chainState) + (base.rotationDeg * Math.PI) / 180;
+        // 土台の傾きはそのまま継承し、パーツ固有の揺れだけ倍率・可動域を適用する。
+        let dynamicAngle = chainAverage(chainState) * (settings.swingScale[name] ?? 1);
+        const rangeDeg = settings.rangesDeg[name] ?? 0;
+        if (rangeDeg > 0) {
+          const rangeRad = (rangeDeg * Math.PI) / 180;
+          dynamicAngle = clamp(dynamicAngle, -rangeRad, rangeRad);
+        }
+        angle = dynamicAngle + (base.rotationDeg * Math.PI) / 180;
       }
       const bbox = alphaBBox(image);
-      drawMotionLabPivotLayer(ctx, image, width, height, base, { x: bbox.x + bbox.w / 2, y: bbox.y }, angle, twitchOffsetY);
+      const pivot = settings.pivots[name] ?? { x: bbox.x + bbox.w / 2, y: bbox.y };
+      drawMotionLabPivotLayer(ctx, image, width, height, base, pivot, angle, twitchOffsetY);
   };
 
   const swayEntries = Object.entries(images.sways)
@@ -979,72 +1535,127 @@ export function drawMotionLabScene(
     }
   }
 
-  // ===== 視線ドリフト＋瞳クリップ（852話式・§8.4）: eyewhite < irides < highlight < eye連番 =====
+  // ===== 視線ドリフト＋瞳クリップ（§8.4）: eyewhite < irides < highlight < eye連番 =====
   const drawEyeCluster = () => {
-  if (images.eyewhite && images.irides) {
-    let targetX = 0;
-    let targetY = 0;
-    if (animateParts && settings.gazeEnabled) {
-      ph.gazeT += dt * MOTION_LAB_GAZE_DEFAULTS.driftSpeed;
-      // 基本正面＋ごく小さな揺らぎ。発話中は正面へ復帰（話しかけている感・§8.6）
-      if (!speaking) {
-        const range = width * MOTION_LAB_GAZE_DEFAULTS.rangeRatio * settings.gazeStrength;
-        targetX = noise1d(ph.gazeT) * range;
-        targetY = noise1d(ph.gazeT + 53.7) * range * 0.6;
-        // ランダムグランス: たまに視線がふっと別の場所へ（発話中は正面復帰を維持）
-        if (settings.randomGlance) {
-          targetX += ph.glanceGaze.x;
-          targetY += ph.glanceGaze.y;
-        }
-      }
-    }
-    ph.gaze.x = smoothDamp(ph.gaze.x, targetX, ph.gazeVelX, MOTION_LAB_GAZE_DEFAULTS.smoothTime, dt);
-    ph.gaze.y = smoothDamp(ph.gaze.y, targetY, ph.gazeVelY, MOTION_LAB_GAZE_DEFAULTS.smoothTime, dt);
-    drawMotionLabGaze(ctx, runtime, images.eyewhite, images.irides, width, height, eyeMouthTransform, ph.gaze.x, ph.gaze.y);
-  }
-  if (images.highlight) {
-    // ハイライトドリフト（±1〜2px・ろてじん氏の目元演出参考）
-    let highlightX = 0;
-    let highlightY = 0;
-    if (animateParts) {
-      ph.highlightT += dt * MOTION_LAB_HIGHLIGHT_DEFAULTS.speed;
-      highlightX = noise1d(ph.highlightT) * MOTION_LAB_HIGHLIGHT_DEFAULTS.driftPx;
-      highlightY = noise1d(ph.highlightT + 17.3) * MOTION_LAB_HIGHLIGHT_DEFAULTS.driftPx * 0.8;
-    }
-    drawMotionLabLayer(ctx, images.highlight, width, height, {
-      ...eyeMouthTransform,
-      x: eyeMouthTransform.x + highlightX,
-      y: eyeMouthTransform.y + highlightY,
-    });
-  }
+    const drawBrows = () => {
+      if (!images.eyebrow) return;
+      drawMotionLabBrows(
+        ctx,
+        runtime,
+        images.eyebrow,
+        width,
+        height,
+        eyeMouthTransform,
+        elapsedMs,
+        runtime.browVoice,
+        settings.browEnabled ? settings.browStrength : 0,
+      );
+    };
+    // HMRで旧ランタイムが残った場合も、再読込を要求せず新しい状態へ補完する。
+    ph.highlight ??= { x: 0, y: 0 };
+    ph.highlightVelX ??= { v: 0 };
+    ph.highlightVelY ??= { v: 0 };
+    const returningToCenter = blinkFrame.phase !== "idle";
+    if (returningToCenter) ph.gazeT = 0;
+    const centerSmoothTime = Math.max(0.035, MOTION_LAB_BLINK_DEFAULTS.centerMs / 3000);
 
-  // ===== 目: eye連番（frame 0=開き→最終=閉じ）＋自動瞬き（PuruPuru参考） =====
-  if (images.eyeFrames.length > 0) {
-    let blinkValue = 0;
-    if (images.eyeFrames.length > 1 && settings.blinkEnabled) {
-      const blink = MOTION_LAB_BLINK_DEFAULTS;
-      if (ph.blinkT >= 0) {
-        ph.blinkT += dt * 1000;
-        if (ph.blinkT < blink.closeMs) {
-          blinkValue = ph.blinkT / blink.closeMs;
-        } else if (ph.blinkT < blink.closeMs + blink.openMs) {
-          blinkValue = 1 - (ph.blinkT - blink.closeMs) / blink.openMs;
-        } else {
-          ph.blinkT = -1;
-          // blinkRate=頻度倍率（2で間隔半分）
-          ph.blinkWait =
-            (blink.intervalMin + Math.random() * (blink.intervalMax - blink.intervalMin)) /
-            Math.max(0.1, settings.blinkRate);
-        }
-      } else {
-        ph.blinkWait -= dt;
-        if (ph.blinkWait <= 0) ph.blinkT = 0;
-      }
+    let gazeTargetX = 0;
+    let gazeTargetY = 0;
+    const gazeEnabled = animateParts
+      && settings.gazeEnabled
+      && settings.gazeStrength > 0
+      && !!images.irides;
+    if (!returningToCenter && gazeEnabled) {
+      ph.gazeT += dt * (Math.PI * 2 / MOTION_LAB_GAZE_DEFAULTS.periodSeconds);
+      const horizontalGaze = motionLabHorizontalGazeAt(
+        ph.gazeT,
+        motionLabEyeRegions(images.irides!, width, height),
+        settings.gazeStrength,
+      );
+      gazeTargetX = clamp(horizontalGaze.x, -MOTION_LAB_GAZE_DEFAULTS.maxRangePx, MOTION_LAB_GAZE_DEFAULTS.maxRangePx);
+      gazeTargetY = horizontalGaze.y;
     }
-    const eyeIndex = Math.round(clamp(blinkValue, 0, 1) * (images.eyeFrames.length - 1));
-    const eyeFrame = images.eyeFrames[eyeIndex];
-    if (eyeFrame) drawMotionLabLayer(ctx, eyeFrame, width, height, eyeMouthTransform);
-  }
+    const gazeSmoothTime = returningToCenter
+      ? centerSmoothTime
+      : MOTION_LAB_GAZE_DEFAULTS.smoothTime;
+    if (!settings.gazeEnabled || settings.gazeStrength <= 0 || !images.irides) {
+      ph.gazeT = 0;
+      ph.gaze.x = 0;
+      ph.gaze.y = 0;
+      ph.gazeVelX.v = 0;
+      ph.gazeVelY.v = 0;
+    } else {
+      ph.gaze.x = smoothDamp(ph.gaze.x, gazeTargetX, ph.gazeVelX, gazeSmoothTime, dt);
+      ph.gaze.y = smoothDamp(ph.gaze.y, gazeTargetY, ph.gazeVelY, gazeSmoothTime, dt);
+    }
+
+    // A detached highlight must remain attached to the iris. Independent noise
+    // made the eye colour appear to shimmer while returning to the blink frame.
+    ph.highlight.x = ph.gaze.x;
+    ph.highlight.y = ph.gaze.y;
+    ph.highlightVelX.v = 0;
+    ph.highlightVelY.v = 0;
+
+    if (blinkFrame.rifeOwnsEye) {
+      // 閉じ・開き本体では独立レイヤーを完全に止め、補間済みの目だけに描画権を渡す。
+      ph.gaze.x = 0;
+      ph.gaze.y = 0;
+      ph.gazeVelX.v = 0;
+      ph.gazeVelY.v = 0;
+      ph.highlight.x = 0;
+      ph.highlight.y = 0;
+      ph.highlightVelX.v = 0;
+      ph.highlightVelY.v = 0;
+      const eyeIndex = Math.round(clamp(blinkFrame.rifeProgress, 0, 1) * (images.eyeFrames.length - 1));
+      const eyeFrame = images.eyeFrames[eyeIndex] ?? images.eyeFrames[0];
+      if (eyeFrame) drawMotionLabLayer(ctx, eyeFrame, width, height, eyeMouthTransform);
+      drawBrows();
+      return;
+    }
+
+    // 開眼RIFEフレームを常に下地にする。centering終盤では分離目を薄くし、
+    // settlingでは同じ下地の上へ分離目を戻すため、虹彩の色差が瞬時に切り替わらない。
+    const openEyeFrame = images.eyeFrames[0];
+    if (openEyeFrame) drawMotionLabLayer(ctx, openEyeFrame, width, height, eyeMouthTransform);
+    const dynamicEyeAlpha = clamp(blinkFrame.dynamicEyeAlpha, 0, 1);
+    const wetnessOpacity = settings.wetnessEnabled
+      ? motionLabWetnessOpacity(elapsedMs, settings.wetnessStrength)
+      : 0;
+    if (images.eyewhite && images.irides) {
+      const rawIrisScale = settings.irisBreathEnabled
+        ? motionLabIrisBreathScale(elapsedMs, settings.irisBreathStrength)
+        : 1;
+      const irisScale = 1 + (rawIrisScale - 1) * dynamicEyeAlpha;
+      drawMotionLabGaze(
+        ctx,
+        runtime,
+        images.eyewhite,
+        images.irides,
+        width,
+        height,
+        eyeMouthTransform,
+        ph.gaze.x,
+        ph.gaze.y,
+        dynamicEyeAlpha,
+        irisScale,
+        wetnessOpacity,
+      );
+    }
+    if (images.highlight) {
+      drawMotionLabLayer(
+        ctx,
+        images.highlight,
+        width,
+        height,
+        {
+          ...eyeMouthTransform,
+          x: eyeMouthTransform.x + ph.highlight.x,
+          y: eyeMouthTransform.y + ph.highlight.y,
+        },
+        dynamicEyeAlpha,
+      );
+    }
+    drawBrows();
   };
 
   const drawMouth = () => {
@@ -1108,7 +1719,7 @@ export function drawMotionLabScene(
   const drawHair = () => {
   if (images.hair) {
     if (settings.hairWaveMode && animateParts && settings.hairMotionEnabled) {
-      // ろてじん式 波揺れ（進行波・根元固定）。体の傾きは維持して波だけ乗せる
+      // ウェーブ式（進行波・根元固定）。体の傾きは維持して波だけ乗せる。
       drawMotionLabWaveWarp(ctx, images.hair, width, height, { ...hairFrontTransform, rotationDeg: bodyTransform.rotationDeg }, {
         rootYRatio: hairRootYRatio,
         timeMs: elapsedMs,
@@ -1117,9 +1728,9 @@ export function drawMotionLabScene(
         voice,
       });
     } else if (settings.layerMode === "mesh" && hairStrandRender) {
-      // 852話式ソフト房ブレンド: 房中心線へのガウシアン重みで複数チェーンを混合
+      // 房中心線へのガウシアン重みで複数のばね変位を滑らかに混合
       drawMotionLabStrandBlendWarp(ctx, images.hair, width, height, hairFrontTransform, {
-        rootYRatio: hairRootYRatio,
+        rootYRatio: settings.pivots.hair ? hairRootYRatio : 0,
         strands: hairStrandRender,
         offsetScale: settings.swingScale.hair ?? 1,
       });
@@ -1160,11 +1771,13 @@ export function drawMotionLabScene(
         : part === "arm_r" ? images.armR
         : part === "hair" ? images.hair
         : part === "hair_back" ? images.hairBack
-        : null;
+        : images.sways[part] ?? null;
       if (partImage) {
         const bbox = alphaBBox(partImage);
         pivot = part.startsWith("arm_")
           ? { x: bbox.x + bbox.w / 2, y: bbox.y + bbox.h * settings.armPivotRatio }
+          : part in images.sways
+            ? { x: bbox.x + bbox.w / 2, y: bbox.y }
           : { x: width / 2, y: height * (part === "hair_back" ? 0.08 : 0.16) };
       }
     }

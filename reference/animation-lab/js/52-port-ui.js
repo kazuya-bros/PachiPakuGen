@@ -176,7 +176,7 @@
         ], state.hairMode, (v) => {
           state.hairMode = v;
           applyToAllCells('body', HAIR_MODE_TO_BODY[v]);
-        }, 'メッシュ物理はWebGL描画。遅延バネは軽量フォールバック（PuruPuru方式）'));
+        }, 'メッシュ物理はWebGL描画。遅延バネはレイヤー全体を追従させる軽量フォールバック'));
         if (state.hairMode === 'mesh') {
           body.appendChild(sliderRow('柔らかさ（剛性k・低いほど揺れる）', () => P.b3.k, (v) => (P.b3.k = v), 10, 200, 5));
           body.appendChild(sliderRow('収まり（減衰c）', () => P.b3.c, (v) => (P.b3.c = v), 1, 30, 0.5));

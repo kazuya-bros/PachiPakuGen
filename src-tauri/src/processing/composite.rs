@@ -1,65 +1,5 @@
 use image::DynamicImage;
 
-/// Alpha-composite layers bottom to top: body -> part (with alpha) -> hair.
-/// part_rgb is the RIFE interpolation output (RGB) or original part image.
-/// part_alpha is the alpha channel (w*h bytes).
-/// Returns RGBA image.
-pub fn alpha_composite_layers(
-    body: &DynamicImage,
-    part_rgb: &DynamicImage,
-    part_alpha: &[u8],
-    hair: &DynamicImage,
-    width: u32,
-    height: u32,
-) -> DynamicImage {
-    let body_rgba = body.to_rgba8();
-    let part_rgb8 = part_rgb.to_rgb8();
-    let hair_rgba = hair.to_rgba8();
-    let mut result = image::RgbaImage::new(width, height);
-
-    for y in 0..height {
-        for x in 0..width {
-            let idx = (y * width + x) as usize;
-
-            // Start with body pixel
-            let bp = body_rgba.get_pixel(x, y);
-            let mut r = bp[0] as f32;
-            let mut g = bp[1] as f32;
-            let mut b = bp[2] as f32;
-            let mut a = bp[3] as f32;
-
-            // Composite part on top
-            let pp = part_rgb8.get_pixel(x, y);
-            let pa = part_alpha[idx] as f32 / 255.0;
-            r = r * (1.0 - pa) + pp[0] as f32 * pa;
-            g = g * (1.0 - pa) + pp[1] as f32 * pa;
-            b = b * (1.0 - pa) + pp[2] as f32 * pa;
-            a = a * (1.0 - pa) + 255.0 * pa;
-
-            // Composite hair on top
-            let hp = hair_rgba.get_pixel(x, y);
-            let ha = hp[3] as f32 / 255.0;
-            r = r * (1.0 - ha) + hp[0] as f32 * ha;
-            g = g * (1.0 - ha) + hp[1] as f32 * ha;
-            b = b * (1.0 - ha) + hp[2] as f32 * ha;
-            a = a * (1.0 - ha) + 255.0 * ha;
-
-            result.put_pixel(
-                x,
-                y,
-                image::Rgba([
-                    r.clamp(0.0, 255.0) as u8,
-                    g.clamp(0.0, 255.0) as u8,
-                    b.clamp(0.0, 255.0) as u8,
-                    a.clamp(0.0, 255.0) as u8,
-                ]),
-            );
-        }
-    }
-
-    DynamicImage::ImageRgba8(result)
-}
-
 /// Composite a part RGBA layer onto a body RGB image, producing an opaque RGB image.
 /// Transparent pixels in the part layer show the body underneath.
 /// This ensures RIFE never sees black pixels from transparency.
@@ -92,40 +32,6 @@ pub fn premultiply_onto_body(
         }
     }
     DynamicImage::ImageRgb8(result)
-}
-
-/// Extract a transparent part from an opaque RIFE frame using interpolated endpoint alpha.
-pub fn extract_part_with_blended_alpha(
-    rife_output: &DynamicImage,
-    img_a_rgba: &image::RgbaImage,
-    img_b_rgba: &image::RgbaImage,
-    ratio: f32,
-    width: u32,
-    height: u32,
-) -> DynamicImage {
-    let rgb = rife_output.to_rgb8();
-    let mut result = image::RgbaImage::new(width, height);
-
-    for y in 0..height {
-        for x in 0..width {
-            let alpha_a = img_a_rgba.get_pixel(x, y)[3] as f32;
-            let alpha_b = img_b_rgba.get_pixel(x, y)[3] as f32;
-            let alpha_union = alpha_a.max(alpha_b);
-
-            if alpha_union > 0.0 {
-                let alpha_lerp = alpha_a * (1.0 - ratio) + alpha_b * ratio;
-                let alpha = alpha_lerp.max(alpha_union * 0.5).min(alpha_union);
-                let p = rgb.get_pixel(x, y);
-                result.put_pixel(
-                    x,
-                    y,
-                    image::Rgba([p[0], p[1], p[2], alpha.clamp(0.0, 255.0) as u8]),
-                );
-            }
-        }
-    }
-
-    DynamicImage::ImageRgba8(result)
 }
 
 /// Extract a transparent part from an opaque body-composited RIFE frame.

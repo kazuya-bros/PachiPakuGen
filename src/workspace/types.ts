@@ -6,20 +6,10 @@ export interface LayerInfo { name: string; thumbnail: string; bounds: LayerBound
 export interface CategoryPreview { target: string; label: string; preview: string; layer_names: string[]; layers: LayerInfo[]; }
 export interface MappingPreviewResult { categories: CategoryPreview[]; composite_preview: string; }
 export interface RenderCategoryResult { preview: string; }
-export interface ExportCorrectedLayerResult { output_path: string; }
-export interface ImportCorrectionLayerResult { layer_name: string; }
-export interface OriginalImageResult { original_preview: string; mouth_preview: string | null; }
-export interface MouthMaskPreviewResult { mouth_preview: string; }
 export interface CreateBaseResult { output_path: string; composite_preview: string; base_eye_slot: string; base_mouth_slot: string; file_count: number; }
-export interface CreateDiffResult { output_path: string; pair_name: string; frame_count: number; preview: string; previews: string[]; }
 export interface ProgressPayload { current: number; total: number; pair_name: string; }
 export interface LayerPatch { id: string; name: string; sourceLayer: string; maskPng: string; cutSource: boolean; thumbnail?: string; }
-export type InterpPair = { name: string; label: string; closed: { key: string; label: string }; open: { key: string; label: string }; required: boolean };
-export type MouthMaskSetting = { dilate: number; blur: number };
 export type PreviewPan = { x: number; y: number };
-export type DiffPreview = { pairName: string; label: string; frames: string[] };
-export type InterpStep = 1 | 2 | 3 | 4;
-export type BaseStep = 1 | 2 | 3 | 4;
 export type WorkspaceStep = 1 | 2 | 3 | 4 | 5 | 6 | 7;
 export type WorkspaceMouthCornerMode = "source" | "up" | "flat" | "down";
 export type SeeThroughProfile = "low-vram" | "standard";
@@ -109,6 +99,8 @@ export interface WorkspaceGeneratedPartsStatus {
   /** 口角設定導入前のバックエンド応答やHMR中の保持状態では未定義。 */
   staleParts?: string[];
   sizeMismatches: string[];
+  /** 完了後に生成素材の差し替えを検知し、下流工程をSTEP3へ戻した場合にtrue。 */
+  downstreamStale: boolean;
   ready: boolean;
 }
 export interface PartAdjustment {
@@ -208,37 +200,21 @@ export interface PreviewCodexCompositeResult {
   basePreview: string;
   previews: CodexCompositePreviewItem[];
 }
-export interface CodexRifeFramePreviewItem {
-  part: string;
-  frameIndex: number;
-  frameCount: number;
-  preview: string;
-}
-export interface PreviewCodexRifeResult {
-  basePreview: string;
-  previews: CodexRifeFramePreviewItem[];
-}
-export type WorkspacePreviewItem = CodexCompositePreviewItem | CodexRifeFramePreviewItem;
-
-export function isRifePreviewItem(item: WorkspacePreviewItem): item is CodexRifeFramePreviewItem {
-  return "frameIndex" in item;
-}
 
 // 胸切出モードの patchDraftSource センチネル値（特定のPSDレイヤーに紐付かないため）
 export const CHEST_CUT_SENTINEL = "__chest__";
 
-export function workspacePreviewItemKey(item: WorkspacePreviewItem): string {
-  return isRifePreviewItem(item) ? `${item.part}:${item.frameIndex}` : item.part;
+export function workspacePreviewItemKey(item: CodexCompositePreviewItem): string {
+  return item.part;
 }
 
-export function workspacePreviewItemLabel(item: WorkspacePreviewItem): string {
-  return isRifePreviewItem(item) ? `${item.part} ${item.frameIndex}/${item.frameCount}` : item.part;
+export function workspacePreviewItemLabel(item: CodexCompositePreviewItem): string {
+  return item.part;
 }
 
-// Step5でパーツ個別調整できる対象。
-// eyes-open は素体の目そのもの（平常時の目＝他フレームと共通）なので調整対象外。
-// 実際に位置がズレうるのはCodex生成→分解した閉じ目・口の差分だけ
+// Step5でパーツ個別調整できる対象。平常時のeyes-openも口パク全体の基準になるため調整可能。
 export const WORKSPACE_ADJUST_PART_KEYS = [
+  "eyes-open",
   "eyes-closed",
   "mouth-closed",
   "mouth-a",
@@ -291,41 +267,3 @@ export interface LoadCodexExpressionJobResult {
   rifeOutput: GenerateCodexRifeOutputResult | null;
   resumeStep: number;
 }
-
-// Each RIFE pair: closed PSD -> open PSD (open = base)
-export const EYE_PAIRS = [
-  { name: "eye", label: "まばたき(目)",
-    closed: { key: "eye_closed", label: "閉じる" },
-    open: { key: "eye_open", label: "開く" },
-    required: true },
-];
-
-export const MOUTH_PAIRS_SINGLE = [
-  { name: "mouth", label: "口パク",
-    closed: { key: "mouth_closed", label: "閉じる" },
-    open: { key: "mouth_open", label: "開く" },
-    required: true },
-];
-
-export const MOUTH_PAIRS_VOWELS = [
-  { name: "mouth_a", label: "口パク(あ)",
-    closed: { key: "mouth_a_closed", label: "閉じる" },
-    open: { key: "mouth_a_open", label: "開く" },
-    required: false },
-  { name: "mouth_i", label: "口パク(い)",
-    closed: { key: "mouth_i_closed", label: "閉じる" },
-    open: { key: "mouth_i_open", label: "開く" },
-    required: false },
-  { name: "mouth_u", label: "口パク(う)",
-    closed: { key: "mouth_u_closed", label: "閉じる" },
-    open: { key: "mouth_u_open", label: "開く" },
-    required: false },
-  { name: "mouth_e", label: "口パク(え)",
-    closed: { key: "mouth_e_closed", label: "閉じる" },
-    open: { key: "mouth_e_open", label: "開く" },
-    required: false },
-  { name: "mouth_o", label: "口パク(お)",
-    closed: { key: "mouth_o_closed", label: "閉じる" },
-    open: { key: "mouth_o_open", label: "開く" },
-    required: false },
-];

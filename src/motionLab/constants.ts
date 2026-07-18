@@ -1,11 +1,13 @@
 import type {
   MotionLabEffectKey,
+  MotionLabEngineFamily,
   MotionLabMouthKey,
   MotionLabPreset,
   MotionLabReviewKey,
   MotionLabTemplate,
   MotionLabTimelineEvent,
 } from "./types";
+export { MOTION_LAB_EAR_TWITCH } from "./earTwitch";
 
 export const MOTION_LAB_MOUTH_KEYS: MotionLabMouthKey[] = ["closed", "a", "i", "u", "e", "o"];
 export const MOTION_LAB_VOWEL_KEYS: MotionLabMouthKey[] = ["a", "i", "u", "e", "o"];
@@ -93,85 +95,127 @@ export const MOTION_LAB_PRESET_FACTORS: Record<MotionLabPreset, { breath: number
 export const MOTION_LAB_EFFECT_DEFS: Array<{ key: MotionLabEffectKey; label: string; hint: string }> = [
   { key: "breath", label: "呼吸", hint: "体がゆっくり上下する（3.6秒周期）。頭・髪は少し遅れて追従" },
   { key: "bodySway", label: "体の揺れ", hint: "左右のアイドル揺れ＋わずかな傾き" },
-  { key: "pyoko", label: "発話バウンス", hint: "話すたびに体がぴょこんと弾む（PuruPuru式）" },
+  { key: "pyoko", label: "発話バウンス", hint: "話すたびに体がぴょこんと弾む" },
   { key: "hairMotion", label: "髪の揺れ", hint: "前髪・後ろ髪のバネ/波/房の揺れ全般" },
   { key: "hairBack", label: "後ろ髪の揺れ", hint: "後ろ髪だけの揺れ（髪の揺れON時に有効）" },
-  { key: "parallax", label: "首振りパララックス", hint: "レイヤー深度差で顔がゆっくり左右を向く（852話式）" },
-  { key: "glance", label: "ランダムグランス", hint: "たまに顔向き・視線がふっと変わる（852話式）" },
-  { key: "gaze", label: "視線ドリフト", hint: "瞳がわずかに泳ぎ、発話で正面に戻る（要eyewhite/irides素材）" },
-  { key: "blink", label: "自動まばたき", hint: "2〜10秒間隔で瞬き（PuruPuru参考）" },
+  { key: "parallax", label: "首振りパララックス", hint: "レイヤー深度差で顔がゆっくり左右を向く" },
+  { key: "glance", label: "ランダム首振り", hint: "たまに顔向きだけがふっと変わる。瞳の位置は動かしません" },
+  { key: "gaze", label: "視線の横揺れ", hint: "100%までは控えめ、最大300%では4.8pxまで左右へ揺れます。縦・ランダム移動はせず、瞬き直前に正面へ戻ります（要eyewhite/irides素材）" },
+  { key: "irisBreath", label: "瞳の呼吸", hint: "中間値は控えめに保ち、最大では左右の虹彩全体を各中心で±4%伸縮します。瞳孔だけの変形ではありません（要irides素材）" },
+  { key: "wetness", label: "目のうるみ", hint: "虹彩の下側へ淡い水面と細い三日月反射を加えます。最大では縮小表示でも分かる強さになります（要irides素材）" },
+  { key: "brow", label: "眉の微動", hint: "待機中はごく小さく、発話中は少し持ち上げながら左右の角度をずらして自然に反応させます（要eyebrow素材）" },
+  { key: "blink", label: "自動まばたき", hint: "2〜10秒間隔で自然に瞬きする" },
   { key: "arm", label: "腕揺れ", hint: "腕の振り子スイング（要arm素材）" },
   { key: "lift", label: "肩の弾み", hint: "体の弾みに少し遅れて肩がぽよん（発話バウンスの二次揺れ・要arm素材）" },
-  { key: "chest", label: "胸揺れ", hint: "体の弾み・呼吸に遅れて追従する二次揺れ（要chest素材）" },
-  { key: "earTwitch", label: "獣耳ピコピコ", hint: "たまに耳が上下にピコッと跳ねる（要sway_ear素材）" },
+  { key: "chest", label: "胸部追従", hint: "体・衣服の胸周辺を、呼吸と体の弾みに遅れてやわらかく変形する" },
+  { key: "earTwitch", label: "獣耳ピコピコ", hint: "獣耳をときどきピコッと動かします。動き方と付け根の位置は詳細調整で設定します（要sway_ear素材）" },
 ];
 
 export const MOTION_LAB_EFFECT_DEFAULTS: Record<MotionLabEffectKey, boolean> = {
   breath: true, bodySway: true, pyoko: true, hairMotion: true, hairBack: true,
   parallax: true, glance: true, gaze: true, blink: true, arm: true, lift: true,
-  chest: true, earTwitch: false,
+  irisBreath: false, wetness: false, brow: true, chest: false, earTwitch: false,
 };
 
 /** ソロ時に一緒にONにする依存エフェクト（単体では画面に現れないもの） */
 export const MOTION_LAB_EFFECT_SOLO_DEPS: Partial<Record<MotionLabEffectKey, MotionLabEffectKey[]>> = {
   hairBack: ["hairMotion"],
-  glance: ["parallax", "gaze"],
+  glance: ["parallax"],
 };
 
 
 export const MOTION_LAB_TEMPLATES: Record<string, MotionLabTemplate> = {
-  // === 852話式（バネ・チェーンリグ）===
-  // 配信画面の隅に置く「静かに生きてる」アバター向け。動きは小さく上品に
+  // === スプリング式: 自然な追従（小 / 大） ===
   calm: {
     label: "おちつき",
-    description: "小さく上品な待機。呼吸と遅延追従が主役、後ろ髪は控えめ",
-    engine: "hachigoni",
+    description: "呼吸と首振りに髪が小さく遅れてついてくる、控えめな自然追従",
+    engine: "springRig",
     preset: "calm", layerMode: "spring", hairEngine: "spring", hairWaveStrength: 1,
-    hairK: 80, hairC: 10, hairWind: 0.006, hairDrive: 0.02, hairBackScale: 0.35,
-    breath: 0.85, bodySway: 0.7, pyokoBounce: 1.5, parallax: 0.5, randomGlance: true,
-    strands: false, armSwayAmp: 0.6, armMaxAngle: 0.08, chestMax: 3, earTwitch: true,
+    hairK: 84, hairC: 11, hairWind: 0.004, hairDrive: 0.018, hairBackScale: 0.35,
+    breath: 0.85, bodySway: 0.7, pyokoBounce: 1.4, parallax: 0.5, randomGlance: true,
+    strands: false, armSwayAmp: 0.6, armMaxAngle: 0.075, chestMax: 2.5, earTwitch: true,
   },
-  // 推奨バランス。mesh＋房分割で髪の質感を出しつつ、体の動きは自然な範囲
   standard: {
-    label: "標準",
-    description: "推奨バランス。mesh＋房分割の髪質感と自然な体の動き",
-    engine: "hachigoni",
+    label: "しなやか",
+    description: "体と首の動きに髪・腕・胸が大きめに追従する、存在感のある自然追従",
+    engine: "springRig",
     preset: "normal", layerMode: "mesh", hairEngine: "spring", hairWaveStrength: 1,
-    hairK: 70, hairC: 7, hairWind: 0.012, hairDrive: 0.03, hairBackScale: 0.5,
-    breath: 1, bodySway: 1, pyokoBounce: 3, parallax: 1, randomGlance: true,
-    strands: true, armSwayAmp: 1, armMaxAngle: 0.12, chestMax: 5, earTwitch: true,
+    hairK: 72, hairC: 9, hairWind: 0.006, hairDrive: 0.034, hairBackScale: 0.48,
+    breath: 1, bodySway: 0.95, pyokoBounce: 2.4, parallax: 0.85, randomGlance: true,
+    strands: true, armSwayAmp: 0.95, armMaxAngle: 0.11, chestMax: 4, earTwitch: true,
   },
-  // 髪を見せるための「風のある日」。房分割＋強め風、体は控えめ
-  breeze: {
+  // === スプリング式: 風のなびき（小 / 大） ===
+  softBreeze: {
     label: "そよかぜ",
-    description: "髪見せ用。房分割＋強め風で毛先がそよぐ、体は控えめ",
-    engine: "hachigoni",
-    preset: "normal", layerMode: "mesh", hairEngine: "spring", hairWaveStrength: 1,
-    hairK: 55, hairC: 5, hairWind: 0.03, hairDrive: 0.08, hairBackScale: 0.6,
-    breath: 0.95, bodySway: 0.9, pyokoBounce: 2, parallax: 0.8, randomGlance: true,
-    strands: true, armSwayAmp: 0.9, armMaxAngle: 0.1, chestMax: 4, earTwitch: true,
+    description: "体は控えめのまま、毛先と後ろ髪だけを小さく継続してなびかせる",
+    engine: "springRig",
+    preset: "calm", layerMode: "mesh", hairEngine: "spring", hairWaveStrength: 1,
+    hairK: 72, hairC: 9, hairWind: 0.008, hairDrive: 0.025, hairBackScale: 0.42,
+    breath: 0.82, bodySway: 0.65, pyokoBounce: 1.2, parallax: 0.5, randomGlance: true,
+    strands: true, armSwayAmp: 0.55, armMaxAngle: 0.07, chestMax: 2.5, earTwitch: true,
   },
-  // === ろてじん式（波揺れ・ぷるぷる）===
-  // ゆったりした波が髪をたゆたわせる。体は静かめ
+  breeze: {
+    label: "なびき",
+    description: "房分けした髪と後ろ髪を風で大きくなびかせる、髪を目立たせたい動き",
+    engine: "springRig",
+    preset: "normal", layerMode: "mesh", hairEngine: "spring", hairWaveStrength: 1,
+    hairK: 70, hairC: 9, hairWind: 0.012, hairDrive: 0.035, hairBackScale: 0.45,
+    breath: 0.9, bodySway: 0.8, pyokoBounce: 1.6, parallax: 0.7, randomGlance: true,
+    strands: true, armSwayAmp: 0.75, armMaxAngle: 0.09, chestMax: 3.5, earTwitch: true,
+  },
+  // === ウェーブ式: ゆったり揺れ（小 / 大） ===
   yurari: {
     label: "ゆらり",
-    description: "ゆったりした波が髪全体をたゆたわせる。体は静かめ",
-    engine: "rotejin",
+    description: "髪全体へ小さく長い波を流す、体の揺れを控えたゆったり動作",
+    engine: "wave",
     preset: "calm", layerMode: "spring", hairEngine: "wave", hairWaveStrength: 0.8,
-    hairK: 70, hairC: 8, hairWind: 0.01, hairDrive: 0.03, hairBackScale: 0.55,
-    breath: 0.9, bodySway: 0.75, pyokoBounce: 2, parallax: 0.6, randomGlance: true,
-    strands: false, armSwayAmp: 0.7, armMaxAngle: 0.08, chestMax: 3, earTwitch: true,
+    hairK: 72, hairC: 9, hairWind: 0.006, hairDrive: 0.025, hairBackScale: 0.5,
+    breath: 0.88, bodySway: 0.7, pyokoBounce: 1.6, parallax: 0.55, randomGlance: true,
+    strands: false, armSwayAmp: 0.6, armMaxAngle: 0.075, chestMax: 2.5, earTwitch: true,
   },
-  // PNGTuberらしい元気な弾み。波揺れ＋強めの発話バウンス
+  yurayura: {
+    label: "ゆらゆら",
+    description: "髪と体をゆっくり大きく揺らし、静かな会話中にも動きを見せる",
+    engine: "wave",
+    preset: "normal", layerMode: "spring", hairEngine: "wave", hairWaveStrength: 0.95,
+    hairK: 68, hairC: 8, hairWind: 0.008, hairDrive: 0.04, hairBackScale: 0.62,
+    breath: 0.95, bodySway: 1, pyokoBounce: 2.2, parallax: 0.8, randomGlance: true,
+    strands: false, armSwayAmp: 0.9, armMaxAngle: 0.11, chestMax: 3.8, earTwitch: true,
+  },
+  // === ウェーブ式: 発話の弾み（小 / 大） ===
+  pyokori: {
+    label: "ぴょこり",
+    description: "発話に合わせて体と髪を小さく弾ませる、落ち着いた話し方にも合う動き",
+    engine: "wave",
+    preset: "normal", layerMode: "mesh", hairEngine: "wave", hairWaveStrength: 0.6,
+    hairK: 68, hairC: 8, hairWind: 0.008, hairDrive: 0.03, hairBackScale: 0.4,
+    breath: 0.85, bodySway: 0.75, pyokoBounce: 2.6, parallax: 0.65, randomGlance: true,
+    strands: false, armSwayAmp: 0.75, armMaxAngle: 0.09, chestMax: 3.2, earTwitch: true,
+  },
   purupuru: {
     label: "ぷるぷる",
-    description: "PNGTuber風の元気な弾み。波揺れ＋強め発話バウンス＋大きめ腕振り",
-    engine: "rotejin",
-    preset: "lively", layerMode: "mesh", hairEngine: "wave", hairWaveStrength: 1.15,
-    hairK: 60, hairC: 6, hairWind: 0.015, hairDrive: 0.05, hairBackScale: 0.45,
-    breath: 1.1, bodySway: 1.15, pyokoBounce: 5.5, parallax: 1.15, randomGlance: true,
-    strands: false, armSwayAmp: 1.7, armMaxAngle: 0.2, chestMax: 6.5, earTwitch: true,
+    description: "発話ごとに体・髪・腕を大きく弾ませる、元気で目立つ動き",
+    engine: "wave",
+    preset: "lively", layerMode: "mesh", hairEngine: "wave", hairWaveStrength: 0.72,
+    hairK: 64, hairC: 8, hairWind: 0.01, hairDrive: 0.04, hairBackScale: 0.5,
+    breath: 0.85, bodySway: 0.78, pyokoBounce: 4.2, parallax: 0.9, randomGlance: true,
+    strands: false, armSwayAmp: 1.2, armMaxAngle: 0.135, chestMax: 4.8, earTwitch: true,
   },
+};
+
+/** 方式ごとのテンプレート配置。行=動きの性格、列=動きの大きさ。 */
+export const MOTION_LAB_TEMPLATE_LAYOUT: Record<
+  MotionLabEngineFamily,
+  Array<{ label: string; small: string; large: string }>
+> = {
+  springRig: [
+    { label: "自然な追従", small: "calm", large: "standard" },
+    { label: "風のなびき", small: "softBreeze", large: "breeze" },
+  ],
+  wave: [
+    { label: "ゆったり揺れ", small: "yurari", large: "yurayura" },
+    { label: "発話の弾み", small: "pyokori", large: "purupuru" },
+  ],
 };
 
 // ===== 検証済み物理パラメータ既定値（docs/animation-lab-tech.md §3.4/§4.5/§8.5） =====
@@ -186,24 +230,25 @@ export const MOTION_LAB_ARM_DEFAULTS = {
   maxAngle: 0.12,
   lift: { coupling: 0.08, bounce: 26, max: 6 },
 };
-export const MOTION_LAB_CHEST_DEFAULTS = { k: 28, c: 6, max: 6 };
+export const MOTION_LAB_CHEST_DEFAULTS = { k: 45, c: 12, max: 3.5 };
 // 自動瞬き（ろてじん氏 PuruPuruPNGTuber参考。animation-lab NS.P.blink と同値）
-export const MOTION_LAB_BLINK_DEFAULTS = { closeMs: 90, openMs: 130, intervalMin: 2, intervalMax: 10 };
+export const MOTION_LAB_BLINK_DEFAULTS = {
+  centerMs: 190,
+  closeMs: 90,
+  openMs: 130,
+  settleMs: 140,
+  intervalMin: 2,
+  intervalMax: 10,
+};
 // パララックス首振り（852話氏 Anime2.5DRig由来・設計書§8.3）
 // shiftRatio ≈ キャンバス幅の2.5% / shear最大0.06 / 駆動=ノイズドリフト＋発話頷きバネ
 export const MOTION_LAB_PARALLAX_DEFAULTS = { shiftRatio: 0.045, shearMax: 0.08, driftSpeed: 0.35 };
 export const MOTION_LAB_NOD_DEFAULTS = { k: 120, c: 12, impulse: 34, maxPx: 8 };
-// 視線ドリフト（852話氏由来＋SpriTalk特性§8.6: 基本正面・発話開始で正面復帰）
-export const MOTION_LAB_GAZE_DEFAULTS = { rangeRatio: 0.008, driftSpeed: 0.1, smoothTime: 0.25 };
+// 視線の横揺れ（基本正面・瞬き直前に正面復帰）
+export const MOTION_LAB_GAZE_DEFAULTS = { periodSeconds: 11.5, smoothTime: 0.42, maxRangePx: 4.8 };
 // ハイライトドリフト（ろてじん氏の目元演出参考・§8.1 #6: ±1〜2px）
-export const MOTION_LAB_HIGHLIGHT_DEFAULTS = { driftPx: 1.5, speed: 0.35 };
+export const MOTION_LAB_HIGHLIGHT_DEFAULTS = { driftPx: 0, speed: 0 };
 export const MOTION_LAB_SWAY_DEFAULTS = { segments: 3, k: 60, c: 6, noise: 0.008, maxAngle: 0.35 };
-// 獣耳ピコピコ: 数秒間隔の縦バネ撃力（上下に「ピコッ」と跳ねる）＋確率で短い連続ツイッチ。
-// bounce=縦撃力(px/s)、k/c=速く少し弾む縦バネ、rotKick=ごく僅かな回転（有機感用、rad/s）
-export const MOTION_LAB_EAR_TWITCH = {
-  bounce: 110, k: 260, c: 13, maxPx: 9, rotKick: 1.2,
-  intervalMin: 3, intervalRange: 6, doubleMin: 0.12, doubleRange: 0.12,
-};
 // 固定z順（layer-order.json が無い場合の既定描画順、背面→前面）
 export const MOTION_LAB_DEFAULT_DRAW_ORDER: readonly string[] = [
   "hair_back", "body", "chest", "arm_l", "arm_r", "sways", "eye", "mouth", "hair",

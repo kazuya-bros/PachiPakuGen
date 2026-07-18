@@ -1,4 +1,5 @@
 use crate::commands::parts::{arm_overlay_parent, is_arm_overlay_part_name};
+use crate::commands::workspace::WorkspaceProject;
 use crate::error::AppError;
 use crate::processing::image_utils;
 use image::DynamicImage;
@@ -40,6 +41,8 @@ pub struct MotionLabPartsResult {
     pub sways: HashMap<String, String>,
     /// 腕と同じ変形へ追従し、layer-order.json上では独立したz位置を持つ切り出し片。
     pub linked_parts: HashMap<String, MotionLabLinkedPartResult>,
+    /// 独立した眉素材。Noneなら旧形式の目フレームが眉を保持する。
+    pub eyebrow: Option<String>,
     /// 視線ドリフト用（§8.4）: 白目=クリップ領域、虹彩=ドリフト対象
     pub eyewhite: Option<String>,
     pub irides: Option<String>,
@@ -109,6 +112,15 @@ pub async fn load_motion_lab_manifest(
 }
 
 #[tauri::command]
+pub async fn load_spritalk_motion_profile(
+    source_dir: String,
+) -> Result<SpritalkMotionProfileResult, AppError> {
+    tauri::async_runtime::spawn_blocking(move || load_spritalk_motion_profile_inner(&source_dir))
+        .await
+        .map_err(|error| AppError::General(format!("Task join error: {error}")))?
+}
+
+#[tauri::command]
 pub async fn save_spritalk_motion_profile(
     request: SaveSpritalkMotionProfileRequest,
 ) -> Result<SpritalkMotionProfileResult, AppError> {
@@ -127,6 +139,7 @@ fn load_motion_lab_parts_inner(dir: &str) -> Result<MotionLabPartsResult, AppErr
             root.display()
         )));
     }
+    ensure_workspace_parts_are_current(&root)?;
 
     let body_path = root.join("body.png");
     if !body_path.is_file() {
@@ -149,10 +162,19 @@ fn load_motion_lab_parts_inner(dir: &str) -> Result<MotionLabPartsResult, AppErr
     let chest = read_optional_image_aliases(&root, &["chest.png"])?;
     let sways = read_sway_images(&root)?;
     let linked_parts = read_linked_arm_images(&root)?;
+    let eyebrow_image =
+        open_optional_image_aliases(&root, &["eyebrow.png", "eyebrows.png", "brow.png"])?;
+    let eyebrow = eyebrow_image.as_ref().map(image_utils::image_to_base64_png);
+    let eyebrow_cleanup_mask = eyebrow_image
+        .as_ref()
+        .map(|image| image_utils::eyebrow_cleanup_mask(image, width, height));
     let eyewhite = read_optional_image_aliases(&root, &["eyewhite.png", "eye_white.png"])?;
     let irides = read_optional_image_aliases(&root, &["irides.png", "iris.png"])?;
     let highlight = read_optional_image_aliases(&root, &["highlight.png", "eye_highlight.png"])?;
-    let eye_frames = read_frame_source(&root, "eye")?;
+    // 旧出力の目フレームには眉が焼き込まれている場合がある。独立眉があるときは
+    // 読み込み時だけその領域を抜き、動かす眉と固定眉が二重にならないようにする。
+    let eye_frames =
+        read_frame_source_with_alpha_mask(&root, "eye", eyebrow_cleanup_mask.as_ref())?;
 
     let mut mouths = HashMap::new();
     let mut missing = Vec::new();
@@ -194,9 +216,13 @@ fn load_motion_lab_parts_inner(dir: &str) -> Result<MotionLabPartsResult, AppErr
     if closed_frames.is_empty() {
         if let Some(frame) = first_vowel_frame {
             closed_frames.push(frame);
-            warnings.push(
-                "mouth_closed がないため、母音フォルダの先頭フレームを閉口として使います".into(),
-            );
+            // PachiPakuGenのRIFE出力では、各母音フォルダの先頭が閉じ口になる。
+            // この形式では専用mouth_closedが無いのが正常なので警告しない。
+            if !is_codex_rife_output(&root) {
+                warnings.push(
+                    "閉じ口素材がないため、母音フォルダの先頭フレームを閉じ口として使います".into(),
+                );
+            }
         } else {
             missing.push("mouth_closed".into());
         }
@@ -217,6 +243,7 @@ fn load_motion_lab_parts_inner(dir: &str) -> Result<MotionLabPartsResult, AppErr
         chest,
         sways,
         linked_parts,
+        eyebrow,
         eyewhite,
         irides,
         highlight,
@@ -226,6 +253,44 @@ fn load_motion_lab_parts_inner(dir: &str) -> Result<MotionLabPartsResult, AppErr
         missing,
         warnings,
     })
+}
+
+/// 任意の素材フォルダは従来どおり読み込めるが、現行ワークスペース配下の
+/// `04_spritalk_parts`はproject.jsonのSTEP7到達を有効性マーカーとして扱う。
+/// STEP4/5再編集後に残った旧画像をライブ表示へ誤って読み込ませない。
+fn ensure_workspace_parts_are_current(root: &Path) -> Result<(), AppError> {
+    if root.file_name().and_then(|name| name.to_str()) != Some("04_spritalk_parts") {
+        return Ok(());
+    }
+    let Some(workspace_root) = root.parent() else {
+        return Ok(());
+    };
+    let project_path = workspace_root.join("project.json");
+    if !project_path.is_file() {
+        return Ok(());
+    }
+    let project: WorkspaceProject = serde_json::from_slice(&fs::read(&project_path)?)
+        .map_err(|error| AppError::General(format!("project.json解析失敗: {error}")))?;
+    if project.current_step < 7 {
+        return Err(AppError::General(
+            "この作業フォルダは再編集後のフレーム生成が未完了です。STEP6でRIFE補完を再実行してください"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_codex_rife_output(root: &Path) -> bool {
+    fs::read(root.join("manifest.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|manifest| {
+            manifest
+                .get("mode")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .is_some_and(|mode| mode == "codex-rife-output")
 }
 
 /// layer-order.json（{"drawOrder": ["hair_back", ...]}）を読む。無ければ空
@@ -371,6 +436,25 @@ fn load_motion_lab_manifest_inner(source_dir: &str) -> Result<MotionLabManifestR
     })
 }
 
+fn load_spritalk_motion_profile_inner(
+    source_dir: &str,
+) -> Result<SpritalkMotionProfileResult, AppError> {
+    let root = validate_motion_lab_source_dir(source_dir)?;
+    let path = root.join("spritalk-motion-profile.json");
+    if !path.is_file() {
+        return Err(AppError::General(format!(
+            "spritalk-motion-profile.json が見つかりません: {}",
+            path.display()
+        )));
+    }
+    let profile = serde_json::from_slice::<Value>(&fs::read(&path)?)
+        .map_err(|error| AppError::General(format!("SpriTalk motion profile読込失敗: {error}")))?;
+    Ok(SpritalkMotionProfileResult {
+        path: path.to_string_lossy().into_owned(),
+        profile,
+    })
+}
+
 fn save_spritalk_motion_profile_inner(
     source_dir: &str,
     profile: Value,
@@ -379,8 +463,9 @@ fn save_spritalk_motion_profile_inner(
     let path = root.join("spritalk-motion-profile.json");
     fs::write(
         &path,
-        serde_json::to_vec_pretty(&profile)
-            .map_err(|error| AppError::General(format!("SpriTalk motion profile作成失敗: {error}")))?,
+        serde_json::to_vec_pretty(&profile).map_err(|error| {
+            AppError::General(format!("SpriTalk motion profile作成失敗: {error}"))
+        })?,
     )?;
     Ok(SpritalkMotionProfileResult {
         path: path.to_string_lossy().into_owned(),
@@ -407,6 +492,19 @@ fn read_optional_image(path: &Path) -> Result<Option<String>, AppError> {
     Ok(Some(image_utils::image_to_base64_png(&image)))
 }
 
+fn open_optional_image_aliases(
+    root: &Path,
+    names: &[&str],
+) -> Result<Option<DynamicImage>, AppError> {
+    for name in names {
+        let path = root.join(name);
+        if path.is_file() {
+            return Ok(Some(open_image(&path)?));
+        }
+    }
+    Ok(None)
+}
+
 fn read_optional_image_aliases(root: &Path, names: &[&str]) -> Result<Option<String>, AppError> {
     for name in names {
         let image = read_optional_image(&root.join(name))?;
@@ -418,14 +516,26 @@ fn read_optional_image_aliases(root: &Path, names: &[&str]) -> Result<Option<Str
 }
 
 fn read_frame_source(root: &Path, name: &str) -> Result<Vec<String>, AppError> {
+    read_frame_source_with_alpha_mask(root, name, None)
+}
+
+fn read_frame_source_with_alpha_mask(
+    root: &Path,
+    name: &str,
+    alpha_mask: Option<&DynamicImage>,
+) -> Result<Vec<String>, AppError> {
     let dir = root.join(name);
     if dir.is_dir() {
-        return read_frame_dir(&dir);
+        return read_frame_dir_with_alpha_mask(&dir, alpha_mask);
     }
 
     let file = root.join(format!("{name}.png"));
     if file.is_file() {
-        return Ok(vec![image_utils::image_to_base64_png(&open_image(&file)?)]);
+        let image = open_image(&file)?;
+        let image = alpha_mask
+            .map(|mask| erase_alpha_with_mask(&image, mask))
+            .unwrap_or(image);
+        return Ok(vec![image_utils::image_to_base64_png(&image)]);
     }
 
     Ok(Vec::new())
@@ -441,7 +551,10 @@ fn read_frame_source_aliases(root: &Path, names: &[&str]) -> Result<Vec<String>,
     Ok(Vec::new())
 }
 
-fn read_frame_dir(dir: &Path) -> Result<Vec<String>, AppError> {
+fn read_frame_dir_with_alpha_mask(
+    dir: &Path,
+    alpha_mask: Option<&DynamicImage>,
+) -> Result<Vec<String>, AppError> {
     let mut files = fs::read_dir(dir)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -462,8 +575,18 @@ fn read_frame_dir(dir: &Path) -> Result<Vec<String>, AppError> {
 
     files
         .iter()
-        .map(|path| Ok(image_utils::image_to_base64_png(&open_image(path)?)))
+        .map(|path| {
+            let image = open_image(path)?;
+            let image = alpha_mask
+                .map(|mask| erase_alpha_with_mask(&image, mask))
+                .unwrap_or(image);
+            Ok(image_utils::image_to_base64_png(&image))
+        })
         .collect()
+}
+
+fn erase_alpha_with_mask(image: &DynamicImage, mask: &DynamicImage) -> DynamicImage {
+    image_utils::subtract_alpha_mask(image, mask)
 }
 
 fn open_image(path: &Path) -> Result<DynamicImage, AppError> {
@@ -478,6 +601,7 @@ fn open_image(path: &Path) -> Result<DynamicImage, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use image::{Rgba, RgbaImage};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -512,8 +636,44 @@ mod tests {
         assert!(result
             .warnings
             .iter()
-            .any(|warning| warning.contains("mouth_closed")));
+            .any(|warning| warning.contains("閉じ口素材")));
         assert!(result.linked_parts.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_motion_lab_parts_accepts_native_closed_frame_without_warning() {
+        let root = std::env::temp_dir().join(format!(
+            "pachipakugen_motion_lab_native_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(root.join("mouth_a")).unwrap();
+        fs::write(
+            root.join("manifest.json"),
+            br#"{"mode":"codex-rife-output"}"#,
+        )
+        .unwrap();
+        RgbaImage::from_pixel(4, 4, Rgba([10, 20, 30, 255]))
+            .save(root.join("body.png"))
+            .unwrap();
+        RgbaImage::from_pixel(4, 4, Rgba([0, 0, 0, 0]))
+            .save(root.join("mouth_a").join("001.png"))
+            .unwrap();
+
+        let result = load_motion_lab_parts_inner(&root.to_string_lossy()).unwrap();
+
+        assert!(result
+            .mouths
+            .get("closed")
+            .is_some_and(|frames| frames.len() == 1));
+        assert!(!result
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("閉じ口素材")));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -600,6 +760,9 @@ mod tests {
         RgbaImage::from_pixel(4, 4, Rgba([250, 250, 250, 255]))
             .save(root.join("eyewhite.png"))
             .unwrap();
+        RgbaImage::from_pixel(4, 4, Rgba([35, 20, 15, 255]))
+            .save(root.join("eyebrow.png"))
+            .unwrap();
         RgbaImage::from_pixel(4, 4, Rgba([90, 60, 20, 255]))
             .save(root.join("irides.png"))
             .unwrap();
@@ -635,8 +798,51 @@ mod tests {
             Some("arm_r")
         );
         assert!(result.eyewhite.is_some());
+        assert!(result.eyebrow.is_some());
         assert!(result.irides.is_some());
         assert!(result.highlight.is_some());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_motion_lab_parts_removes_legacy_brow_from_eye_frames() {
+        let root = std::env::temp_dir().join(format!(
+            "pachipakugen_motion_lab_brow_cleanup_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(root.join("eye")).unwrap();
+        RgbaImage::from_pixel(2, 1, Rgba([10, 20, 30, 255]))
+            .save(root.join("body.png"))
+            .unwrap();
+        let mut eye = RgbaImage::from_pixel(2, 1, Rgba([80, 90, 100, 255]));
+        eye.put_pixel(1, 0, Rgba([50, 25, 15, 255]));
+        eye.save(root.join("eye").join("001.png")).unwrap();
+        let mut eyebrow = RgbaImage::new(2, 1);
+        eyebrow.put_pixel(1, 0, Rgba([35, 20, 15, 255]));
+        eyebrow.save(root.join("eyebrow.png")).unwrap();
+
+        let result = load_motion_lab_parts_inner(&root.to_string_lossy()).unwrap();
+        let encoded = result.eye_frames[0]
+            .strip_prefix("data:image/png;base64,")
+            .unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .unwrap();
+        let cleaned = image::load_from_memory(&bytes).unwrap().to_rgba8();
+
+        assert_eq!(cleaned.get_pixel(0, 0)[3], 255);
+        assert_eq!(cleaned.get_pixel(1, 0)[3], 0);
+        assert_eq!(
+            image::open(root.join("eye").join("001.png"))
+                .unwrap()
+                .to_rgba8()
+                .get_pixel(1, 0)[3],
+            255
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -744,6 +950,8 @@ mod tests {
             .expect("save profile");
         let saved_path = PathBuf::from(saved.path);
         let saved_json = serde_json::from_slice::<Value>(&fs::read(&saved_path).unwrap()).unwrap();
+        let loaded =
+            load_spritalk_motion_profile_inner(&root.to_string_lossy()).expect("load profile");
 
         assert_eq!(
             saved_path.file_name().and_then(|name| name.to_str()),
@@ -751,6 +959,70 @@ mod tests {
         );
         assert_eq!(saved.profile, profile);
         assert_eq!(saved_json, profile);
+        assert_eq!(loaded.profile, profile);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn spritalk_motion_profile_rejects_missing_or_invalid_json() {
+        let root = std::env::temp_dir().join(format!(
+            "pachipakugen_motion_profile_invalid_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&root).unwrap();
+
+        assert!(load_spritalk_motion_profile_inner(&root.to_string_lossy()).is_err());
+        fs::write(root.join("spritalk-motion-profile.json"), b"{not-json").unwrap();
+        assert!(load_spritalk_motion_profile_inner(&root.to_string_lossy()).is_err());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn live_parts_reject_stale_workspace_output_until_step7() {
+        let root = std::env::temp_dir().join(format!(
+            "pachipakugen_stale_live_parts_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let parts_dir = root.join("04_spritalk_parts");
+        fs::create_dir_all(&parts_dir).unwrap();
+        DynamicImage::new_rgba8(2, 2)
+            .save(parts_dir.join("body.png"))
+            .unwrap();
+
+        let write_project = |current_step| {
+            fs::write(
+                root.join("project.json"),
+                serde_json::to_vec_pretty(&WorkspaceProject {
+                    version: 1,
+                    created_at: 1,
+                    updated_at: 2,
+                    current_step,
+                    source_image_path: None,
+                    reference_image_path: None,
+                    codex_prompt: None,
+                    mouth_corner: Default::default(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        };
+
+        write_project(6);
+        let error = load_motion_lab_parts_inner(&parts_dir.to_string_lossy())
+            .err()
+            .expect("STEP7未到達なら旧ライブ素材を拒否する");
+        assert!(format!("{error}").contains("RIFE補完を再実行"));
+
+        write_project(7);
+        assert!(load_motion_lab_parts_inner(&parts_dir.to_string_lossy()).is_ok());
 
         let _ = fs::remove_dir_all(root);
     }

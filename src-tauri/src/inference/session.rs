@@ -63,12 +63,17 @@ pub fn resolve_model_path(app: &AppHandle, filename: &str) -> Result<PathBuf, Ap
         return Ok(local_path);
     }
 
-    // Fallback: src-tauri/models/ (for development)
-    let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("models")
-        .join(filename);
-    if dev_path.exists() {
-        return Ok(dev_path);
+    // Fallback: src-tauri/models/ (development builds only). Keeping this
+    // branch out of release builds also prevents a build-machine path from
+    // being embedded in the distributed executable.
+    #[cfg(debug_assertions)]
+    {
+        let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("models")
+            .join(filename);
+        if dev_path.exists() {
+            return Ok(dev_path);
+        }
     }
 
     Err(AppError::General(format!(

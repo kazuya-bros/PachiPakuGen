@@ -1,6 +1,7 @@
 import { useReducer } from "react";
 import type {
   MotionLabEffectKey,
+  MotionLabEarTwitchMode,
   MotionLabEngineFamily,
   MotionLabLayerMode,
   MotionLabManifest,
@@ -59,9 +60,13 @@ export interface MotionLabSettings {
   hairMotionStrength: number;
   glanceStrength: number;
   gazeStrength: number;
+  irisBreathStrength: number;
+  wetnessStrength: number;
+  browStrength: number;
   blinkRate: number;
   liftStrength: number;
   earTwitchScale: number;
+  earTwitchMode: MotionLabEarTwitchMode;
   templateName: string | null;
   hairEngine: "spring" | "wave";
   hairWaveStrength: number;
@@ -99,13 +104,17 @@ export const MOTION_LAB_DEFAULT_SETTINGS: MotionLabSettings = {
   chestMax: MOTION_LAB_CHEST_DEFAULTS.max,
   hairBackScale: 0.6,
   pyokoBounce: 3,
-  engineFamily: "hachigoni",
+  engineFamily: "springRig",
   hairMotionStrength: 1,
   glanceStrength: 1,
   gazeStrength: 1,
+  irisBreathStrength: 0.5,
+  wetnessStrength: 0.5,
+  browStrength: 0.6,
   blinkRate: 1,
   liftStrength: 1,
   earTwitchScale: 1,
+  earTwitchMode: "double",
   templateName: null,
   hairEngine: "spring",
   hairWaveStrength: 1,
@@ -140,6 +149,9 @@ function applyTemplate(state: MotionLabSettings, key: string): MotionLabSettings
     hairMotionStrength: 1,
     glanceStrength: 1,
     gazeStrength: 1,
+    irisBreathStrength: 0.5,
+    wetnessStrength: 0.5,
+    browStrength: 0.6,
     blinkRate: 1,
     liftStrength: 1,
     earTwitchScale: 1,
@@ -171,8 +183,30 @@ function applyTemplate(state: MotionLabSettings, key: string): MotionLabSettings
   };
 }
 
+/** 現行の機能名へ正規化する。旧版が保存した個人名ベースの値は読み込み時だけ受け付ける。 */
+export function normalizeMotionLabEngineFamily(value: unknown): MotionLabEngineFamily | null {
+  if (value === "wave" || value === "rotejin") return "wave";
+  if (value === "springRig" || value === "hachigoni") return "springRig";
+  return null;
+}
+
 function applyManifest(state: MotionLabSettings, manifest: MotionLabManifest): MotionLabSettings {
-  const next = { ...state, effects: { ...state.effects } };
+  // New eye effects must not leak from the previously opened workspace when a
+  // legacy manifest has no fields for them.
+  const next = {
+    ...state,
+    templateName: null,
+    intensity: 1,
+    irisBreathStrength: MOTION_LAB_DEFAULT_SETTINGS.irisBreathStrength,
+    wetnessStrength: MOTION_LAB_DEFAULT_SETTINGS.wetnessStrength,
+    browStrength: MOTION_LAB_DEFAULT_SETTINGS.browStrength,
+    effects: {
+      ...state.effects,
+      irisBreath: MOTION_LAB_EFFECT_DEFAULTS.irisBreath,
+      wetness: MOTION_LAB_EFFECT_DEFAULTS.wetness,
+      brow: MOTION_LAB_EFFECT_DEFAULTS.brow,
+    },
+  };
   const lip = manifest.methods?.lipTimelineSmoother;
   if (lip) {
     next.method = lip.method ? validMotionLabMethod(lip.method) : lip.enabled === false ? "baseline" : "smooth";
@@ -206,15 +240,26 @@ function applyManifest(state: MotionLabSettings, manifest: MotionLabManifest): M
     if (typeof physics.chestMax === "number") next.chestMax = clamp(physics.chestMax, 0, 8);
     if (typeof physics.hairBackScale === "number") next.hairBackScale = clamp(physics.hairBackScale, 0, 1.5);
     if (typeof physics.earTwitch === "boolean") next.effects.earTwitch = physics.earTwitch;
+    if (physics.earTwitchMode === "bounce" || physics.earTwitchMode === "tilt" || physics.earTwitchMode === "double") {
+      next.earTwitchMode = physics.earTwitchMode;
+    }
     if (physics.hairEngine === "spring" || physics.hairEngine === "wave") next.hairEngine = physics.hairEngine;
     if (typeof physics.pyokoBounce === "number") next.pyokoBounce = clamp(physics.pyokoBounce, 0, 12);
     if (typeof physics.randomGlance === "boolean") next.effects.glance = physics.randomGlance;
-    if (physics.engineFamily === "rotejin" || physics.engineFamily === "hachigoni") {
-      next.engineFamily = physics.engineFamily;
+    const engineFamily = normalizeMotionLabEngineFamily(physics.engineFamily);
+    if (engineFamily) {
+      next.engineFamily = engineFamily;
+      // 初期のマニフェストは方式だけを保存していたため、個別指定が無ければ髪方式も補完する。
+      if (physics.hairEngine !== "spring" && physics.hairEngine !== "wave") {
+        next.hairEngine = engineFamily === "wave" ? "wave" : "spring";
+      }
     }
     if (typeof physics.hairMotionStrength === "number") next.hairMotionStrength = clamp(physics.hairMotionStrength, 0, 2);
     if (typeof physics.glanceStrength === "number") next.glanceStrength = clamp(physics.glanceStrength, 0, 2);
-    if (typeof physics.gazeStrength === "number") next.gazeStrength = clamp(physics.gazeStrength, 0, 2);
+    if (typeof physics.gazeStrength === "number") next.gazeStrength = clamp(physics.gazeStrength, 0, 3);
+    if (typeof physics.irisBreathStrength === "number") next.irisBreathStrength = clamp(physics.irisBreathStrength, 0, 1);
+    if (typeof physics.wetnessStrength === "number") next.wetnessStrength = clamp(physics.wetnessStrength, 0, 1);
+    if (typeof physics.browStrength === "number") next.browStrength = clamp(physics.browStrength, 0, 1.5);
     if (typeof physics.blinkRate === "number") next.blinkRate = clamp(physics.blinkRate, 0.3, 2.5);
     if (typeof physics.liftStrength === "number") next.liftStrength = clamp(physics.liftStrength, 0, 2);
     if (typeof physics.earTwitchScale === "number") next.earTwitchScale = clamp(physics.earTwitchScale, 0, 2);
@@ -275,15 +320,15 @@ export function motionLabSettingsReducer(
     case "allEffects":
       return {
         ...state,
-        effects: action.value
-          ? { ...MOTION_LAB_EFFECT_DEFAULTS, earTwitch: state.effects.earTwitch }
-          : (Object.fromEntries(MOTION_LAB_EFFECT_DEFS.map(def => [def.key, false])) as Record<MotionLabEffectKey, boolean>),
+        effects: Object.fromEntries(
+          MOTION_LAB_EFFECT_DEFS.map(def => [def.key, action.value]),
+        ) as Record<MotionLabEffectKey, boolean>,
       };
     case "applyEngineFamily":
       return {
         ...state,
         engineFamily: action.family,
-        hairEngine: action.family === "rotejin" ? "wave" : "spring",
+        hairEngine: action.family === "wave" ? "wave" : "spring",
         templateName:
           state.templateName && MOTION_LAB_TEMPLATES[state.templateName]?.engine === action.family
             ? state.templateName
@@ -292,17 +337,20 @@ export function motionLabSettingsReducer(
     case "applyTemplate":
       return applyTemplate(state, action.key);
     case "applyIntensity": {
-      const scale = action.value;
+      const scale = clamp(Number.isFinite(action.value) ? action.value : 1, 0.5, 1.5);
+      const template = state.templateName ? MOTION_LAB_TEMPLATES[state.templateName] : null;
       return {
         ...state,
         intensity: scale,
-        breathAmplitude: scale,
-        bodySwayAmplitude: scale,
-        hairWind: Number((MOTION_LAB_HAIR_DEFAULTS.wind * scale).toFixed(4)),
-        hairDrive: Number((MOTION_LAB_HAIR_DEFAULTS.drive * scale).toFixed(3)),
-        armMaxAngle: clamp(Number((MOTION_LAB_ARM_DEFAULTS.maxAngle * scale).toFixed(3)), 0, 0.3),
-        chestMax: clamp(Number((MOTION_LAB_CHEST_DEFAULTS.max * scale).toFixed(1)), 0, 8),
-        parallaxScale: clamp(scale, 0, 1.5),
+        breathAmplitude: clamp(Number(((template?.breath ?? 1) * scale).toFixed(3)), 0, 1.6),
+        bodySwayAmplitude: clamp(Number(((template?.bodySway ?? 1) * scale).toFixed(3)), 0, 1.8),
+        hairWind: clamp(Number(((template?.hairWind ?? MOTION_LAB_HAIR_DEFAULTS.wind) * scale).toFixed(4)), 0, 0.06),
+        hairDrive: clamp(Number(((template?.hairDrive ?? MOTION_LAB_HAIR_DEFAULTS.drive) * scale).toFixed(3)), 0, 0.2),
+        hairWaveStrength: clamp(Number(((template?.hairWaveStrength ?? 1) * scale).toFixed(3)), 0, 2),
+        pyokoBounce: clamp(Number(((template?.pyokoBounce ?? 3) * scale).toFixed(2)), 0, 7),
+        armMaxAngle: clamp(Number(((template?.armMaxAngle ?? MOTION_LAB_ARM_DEFAULTS.maxAngle) * scale).toFixed(3)), 0, 0.3),
+        chestMax: clamp(Number(((template?.chestMax ?? MOTION_LAB_CHEST_DEFAULTS.max) * scale).toFixed(1)), 0, 8),
+        parallaxScale: clamp(Number(((template?.parallax ?? 1) * scale).toFixed(3)), 0, 1.5),
       };
     }
     case "applyManifest":
@@ -326,6 +374,7 @@ export function toRenderSettings(
     pivotEditPart: string | null;
     timeline?: MotionLabTimelineEvent[];
     timelineDurationMs?: number;
+    liveInput?: MotionLabRenderSettings["liveInput"];
   },
 ): MotionLabRenderSettings {
   const fx = settings.effects;
@@ -356,14 +405,21 @@ export function toRenderSettings(
     hairWaveMode: settings.hairEngine === "wave",
     hairWaveStrength: settings.hairWaveStrength,
     earTwitch: fx.earTwitch,
+    earTwitchMode: settings.earTwitchMode,
     pyokoBounce: fx.pyoko ? settings.pyokoBounce : 0,
     randomGlance: fx.glance,
     hairMotionEnabled: fx.hairMotion,
     gazeEnabled: fx.gaze,
+    irisBreathEnabled: fx.irisBreath,
+    wetnessEnabled: fx.wetness,
+    browEnabled: fx.brow,
     blinkEnabled: fx.blink,
     hairMotionStrength: settings.hairMotionStrength,
     glanceStrength: settings.glanceStrength,
     gazeStrength: settings.gazeStrength,
+    irisBreathStrength: settings.irisBreathStrength,
+    wetnessStrength: settings.wetnessStrength,
+    browStrength: settings.browStrength,
     blinkRate: settings.blinkRate,
     liftStrength: settings.liftStrength,
     earTwitchScale: settings.earTwitchScale,
@@ -376,5 +432,6 @@ export function toRenderSettings(
     armBehindBody: settings.armBehindBody,
     timeline: extras.timeline,
     timelineDurationMs: extras.timelineDurationMs,
+    liveInput: extras.liveInput,
   };
 }

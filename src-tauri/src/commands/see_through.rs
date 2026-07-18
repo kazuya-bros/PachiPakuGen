@@ -229,11 +229,46 @@ pub fn set_see_through_gpu(app: AppHandle, gpu_index: Option<u32>) -> Result<(),
 #[tauri::command]
 pub async fn load_expression_source_preview(path: String) -> Result<String, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
-        let image = image::open(path)?;
+        let path = PathBuf::from(path);
+        let image = image::open(&path)?;
+        let image = remove_baked_eyebrow_from_expression_preview(&path, image);
         Ok(image_utils::image_to_base64_png(&image))
     })
     .await
     .map_err(|error| AppError::General(format!("元画像プレビューの読み込みに失敗: {error}")))?
+}
+
+/// STEP5の直接編集は元の差分PNGを読むため、旧案件の目画像に焼き込まれた眉を
+/// 独立したeyebrow.pngのアルファで除去する。眉は編集キャンバスの土台側で一枚だけ描く。
+fn remove_baked_eyebrow_from_expression_preview(
+    path: &Path,
+    image: image::DynamicImage,
+) -> image::DynamicImage {
+    let is_eye_part = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| {
+            let lower = stem.to_ascii_lowercase();
+            lower.starts_with("eyes-") || lower.starts_with("eyes_")
+        })
+        .unwrap_or(false);
+    if !is_eye_part {
+        return image;
+    }
+    let Some(parent) = path.parent() else {
+        return image;
+    };
+    let eyebrow_path = parent
+        .ancestors()
+        .take(2)
+        .map(|root| root.join("base_parts").join("eyebrow.png"))
+        .find(|candidate| candidate.is_file());
+    let Some(mask) = eyebrow_path.and_then(|candidate| image::open(candidate).ok()) else {
+        return image;
+    };
+
+    let cleanup_mask = image_utils::eyebrow_cleanup_mask(&mask, image.width(), image.height());
+    image_utils::subtract_alpha_mask(&image, &cleanup_mask)
 }
 
 #[tauri::command]
@@ -1918,7 +1953,52 @@ fn apply_runtime_compatibility_patches(
     } else {
         apply_quantized_cpu_offload_compatibility_patch(repo)?;
     }
+    apply_scheduler_source_compatibility_patch(repo)?;
     Ok(())
+}
+
+/// 上流のscheduler fallbackはライセンス表記のない外部モデルrepoを参照する。
+/// See-Through本体のApache-2.0モデルに同一設定が含まれ、モデル事前取得でも
+/// 固定revisionを検証しているため、fallbackもその配布元へ統一する。
+fn apply_scheduler_source_compatibility_patch(repo: &Path) -> Result<(), AppError> {
+    let path = repo.join("common/modules/layerdiffuse/diffusers_kdiffusion_sdxl.py");
+    let original = fs::read_to_string(&path).map_err(|error| {
+        AppError::General(format!(
+            "See-Through scheduler設定の読み込みに失敗しました: {} ({error})",
+            path.display()
+        ))
+    })?;
+    let normalized = original.replace("\r\n", "\n");
+    let patched = patch_scheduler_model_source(&normalized)?;
+    if patched != original {
+        fs::write(&path, patched).map_err(|error| {
+            AppError::General(format!(
+                "See-Through scheduler設定の保存に失敗しました: {} ({error})",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn patch_scheduler_model_source(source: &str) -> Result<String, AppError> {
+    const BEFORE: &str = "        model_id = \"frankjoshua/juggernautXL_version6Rundiffusion\"";
+    const AFTER: &str = "        # PachiPakuGen: use the Apache-2.0 See-Through scheduler already downloaded.\n        model_id = \"layerdifforg/seethroughv0.0.2_layerdiff3d\"";
+    const LOAD_ANCHOR: &str = "scheduler_configs[scheduler_config_name][0].from_pretrained(\n                model_id, subfolder=\"scheduler\",";
+
+    let normalized = source.replace("\r\n", "\n");
+    let before_count = normalized.matches(BEFORE).count();
+    let after_count = normalized.matches(AFTER).count();
+    if after_count == 1 && before_count == 0 && normalized.contains(LOAD_ANCHOR) {
+        return Ok(normalized);
+    }
+    if before_count != 1 || after_count != 0 || !normalized.contains(LOAD_ANCHOR) {
+        return Err(AppError::General(
+            "See-Through schedulerの取得元を検証済みモデルへ変更できません。公式スクリプトの構造が変更されています"
+                .into(),
+        ));
+    }
+    Ok(normalized.replacen(BEFORE, AFTER, 1))
 }
 
 /// 本家quantized版ではNF4 MarigoldだけCPU offload設定を参照せず、常にCUDAへ
@@ -2313,6 +2393,11 @@ fn validate_standard_pipeline_cleanup(source: &str) -> Result<(), AppError> {
 }
 
 fn patch_bf16_loading(source: &str) -> Result<String, AppError> {
+    const MODIFICATION_MARKER: &str = "# PachiPakuGen modification notice:";
+    const NOTICE_ANCHOR: &str = "import os\n";
+    let modification_notice = format!(
+        "{MODIFICATION_MARKER}\n# This file was modified from See-Through@{SEE_THROUGH_COMMIT}.\n# Changes add Windows BF16 model-loading compatibility and safe group-offload exclusions.\n"
+    );
     let replacements = [
         (
             "TransparentVAE.from_pretrained(pretrained, subfolder='trans_vae')",
@@ -2356,6 +2441,26 @@ fn patch_bf16_loading(source: &str) -> Result<String, AppError> {
                     "See-Through互換設定を適用できません。公式スクリプトの構造が変更または部分適用されています: {before}"
                 )));
             }
+        }
+    }
+
+    match (
+        patched.matches(&modification_notice).count(),
+        patched.matches(MODIFICATION_MARKER).count(),
+    ) {
+        (1, 1) => {}
+        (0, 0) if patched.matches(NOTICE_ANCHOR).count() == 1 => {
+            patched = patched.replacen(
+                NOTICE_ANCHOR,
+                &format!("{modification_notice}{NOTICE_ANCHOR}"),
+                1,
+            );
+        }
+        _ => {
+            return Err(AppError::General(
+                "See-Through互換設定の変更通知を安全に追加できません。公式スクリプトの構造が変更または部分適用されています"
+                    .into(),
+            ));
         }
     }
     Ok(patched)
@@ -2851,8 +2956,22 @@ for srcp in imglist:
     #[test]
     fn incomplete_download_for_other_profile_does_not_block_selected_profile() {
         let root = model_test_root("other-profile-incomplete");
-        let requirements = model_repository_requirements("standard").unwrap();
-        let standard_repo = &requirements[0].repo_id;
+        let standard_requirements = model_repository_requirements("standard").unwrap();
+        let selected_requirements = model_repository_requirements("low-vram").unwrap();
+        // The official scheduler repository is intentionally shared by both
+        // profiles. Pick a repository that is genuinely standard-only so the
+        // fixture continues to exercise cross-profile isolation when the
+        // requirements list changes.
+        let standard_repo = standard_requirements
+            .iter()
+            .find(|standard| {
+                selected_requirements
+                    .iter()
+                    .all(|selected| selected.repo_id != standard.repo_id)
+            })
+            .expect("standard profile must have a repository not used by low-vram")
+            .repo_id
+            .as_str();
         let incomplete = root
             .join("huggingface/hub")
             .join(model_cache_directory_name(standard_repo))
@@ -2945,19 +3064,29 @@ for srcp in imglist:
 
     #[test]
     fn authoritative_model_requirements_have_expected_files_and_sizes() {
-        for profile in ["low-vram", "standard"] {
-            let requirements = model_repository_requirements(profile).unwrap();
-            assert_eq!(requirements.len(), 3);
-            assert_eq!(
-                requirements
-                    .iter()
-                    .map(|repo| repo.files.len())
-                    .sum::<usize>(),
-                33
-            );
-            assert_eq!(expected_model_file_map(&requirements).unwrap().len(), 36);
-        }
+        let low_vram = model_repository_requirements("low-vram").unwrap();
+        assert_eq!(low_vram.len(), 3);
+        assert_eq!(
+            low_vram.iter().map(|repo| repo.files.len()).sum::<usize>(),
+            33
+        );
+        assert_eq!(expected_model_file_map(&low_vram).unwrap().len(), 36);
+        assert!(low_vram.iter().any(|repo| {
+            repo.repo_id == "layerdifforg/seethroughv0.0.2_layerdiff3d"
+                && repo.files.len() == 1
+                && repo.files[0].path == "scheduler/scheduler_config.json"
+        }));
+
         let standard = model_repository_requirements("standard").unwrap();
+        assert_eq!(standard.len(), 2);
+        assert_eq!(
+            standard.iter().map(|repo| repo.files.len()).sum::<usize>(),
+            32
+        );
+        assert_eq!(expected_model_file_map(&standard).unwrap().len(), 34);
+        assert!(standard
+            .iter()
+            .all(|repo| !repo.repo_id.contains("juggernaut")));
         let unet = standard[0]
             .files
             .iter()
@@ -3008,6 +3137,7 @@ for srcp in imglist:
     #[test]
     fn bf16_loading_patch_is_idempotent() {
         let source = "\
+import os
 TransparentVAE.from_pretrained(pretrained, subfolder='trans_vae')
 UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet')
 UNetFrameConditionModel.from_pretrained(unet_ckpt)
@@ -3020,11 +3150,83 @@ marigold_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)";
         assert!(patched.contains("torch_dtype=torch.bfloat16"));
         assert!(patched.contains("exclude_modules=['text_encoder', 'text_encoder_2']"));
         assert!(patched.contains("exclude_modules=['text_encoder']"));
+        assert!(patched.starts_with("# PachiPakuGen modification notice:\n"));
+        assert!(patched.contains("This file was modified from See-Through@e4cb250"));
+        assert!(patched.contains("Windows BF16 model-loading compatibility"));
+        assert_eq!(
+            patched
+                .matches("# PachiPakuGen modification notice:")
+                .count(),
+            1
+        );
         assert_eq!(patch_bf16_loading(&patched).unwrap(), patched);
 
         let mixed =
             format!("{patched}\nTransparentVAE.from_pretrained(pretrained, subfolder='trans_vae')");
         assert!(patch_bf16_loading(&mixed).is_err());
+    }
+
+    #[test]
+    fn bf16_loading_patch_adds_notice_to_previously_patched_runtime() {
+        let source = "\
+import os
+TransparentVAE.from_pretrained(pretrained, subfolder='trans_vae', torch_dtype=torch.bfloat16)
+UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet', torch_dtype=torch.bfloat16)
+UNetFrameConditionModel.from_pretrained(unet_ckpt, torch_dtype=torch.bfloat16)
+scheduler=None, torch_dtype=torch.bfloat16
+        )
+MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet, torch_dtype=torch.bfloat16)
+layerdiff_pipeline.enable_group_offload(
+                'cuda', num_blocks_per_group=1,
+                exclude_modules=['text_encoder', 'text_encoder_2'])
+marigold_pipeline.enable_group_offload(
+                'cuda', num_blocks_per_group=1,
+                exclude_modules=['text_encoder'])";
+
+        let patched = patch_bf16_loading(source).unwrap();
+        assert!(patched.starts_with("# PachiPakuGen modification notice:\n"));
+        assert_eq!(
+            patched
+                .matches("# PachiPakuGen modification notice:")
+                .count(),
+            1
+        );
+        assert_eq!(patch_bf16_loading(&patched).unwrap(), patched);
+    }
+
+    #[test]
+    fn bf16_loading_patch_fails_closed_without_notice_anchor() {
+        let source = "\
+import sys
+TransparentVAE.from_pretrained(pretrained, subfolder='trans_vae')
+UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet')
+UNetFrameConditionModel.from_pretrained(unet_ckpt)
+scheduler=None
+        )
+MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet)
+layerdiff_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)
+marigold_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)";
+
+        let error = patch_bf16_loading(source).unwrap_err();
+        assert!(error.to_string().contains("変更通知を安全に追加できません"));
+    }
+
+    #[test]
+    fn bf16_loading_patch_rejects_partial_modification_notice() {
+        let source = "\
+# PachiPakuGen modification notice:
+import os
+TransparentVAE.from_pretrained(pretrained, subfolder='trans_vae')
+UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet')
+UNetFrameConditionModel.from_pretrained(unet_ckpt)
+scheduler=None
+        )
+MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet)
+layerdiff_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)
+marigold_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)";
+
+        let error = patch_bf16_loading(source).unwrap_err();
+        assert!(error.to_string().contains("変更通知を安全に追加できません"));
     }
 
     #[test]
@@ -3085,7 +3287,7 @@ marigold_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)";
         fs::create_dir_all(layerdiff_module.parent().unwrap()).unwrap();
         fs::write(
             &layerdiff_module,
-            "        device = self.text_encoder.device\n    ):\n\n        device = self.unet.device\n        dtype = self.unet.dtype\n                    group_index=group_index\n                )[0]\n",
+            "        model_id = \"frankjoshua/juggernautXL_version6Rundiffusion\"\n            scheduler = scheduler_configs[scheduler_config_name][0].from_pretrained(\n                model_id, subfolder=\"scheduler\",\n        device = self.text_encoder.device\n    ):\n\n        device = self.unet.device\n        dtype = self.unet.dtype\n                    group_index=group_index\n                )[0]\n",
         )
         .unwrap();
         let marigold_module = repo.join("common/modules/marigold/marigold_depth_pipeline.py");
@@ -3108,6 +3310,11 @@ marigold_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)";
         assert!(fs::read_to_string(layerdiff_module)
             .unwrap()
             .contains("device = self._execution_device"));
+        assert!(fs::read_to_string(
+            repo.join("common/modules/layerdiffuse/diffusers_kdiffusion_sdxl.py")
+        )
+        .unwrap()
+        .contains("layerdifforg/seethroughv0.0.2_layerdiff3d"));
         assert!(fs::read_to_string(marigold_module)
             .unwrap()
             .contains("input_ids.to(self._execution_device)"));
@@ -3422,6 +3629,34 @@ apply_marigold(source)
         assert!(message.contains("ネイティブアクセス違反"));
         assert!(message.contains("終了コード: -1073741819"));
         assert!(!message.contains("モデル読込時のメモリ不足"));
+    }
+
+    #[test]
+    fn expression_source_preview_removes_legacy_baked_eyebrow() {
+        let root = std::env::temp_dir().join(format!(
+            "pachipakugen-expression-preview-eyebrow-{}",
+            unix_timestamp_millis()
+        ));
+        let extracted_dir = root.join("original_extracted_parts");
+        let base_dir = root.join("base_parts");
+        fs::create_dir_all(&extracted_dir).unwrap();
+        fs::create_dir_all(&base_dir).unwrap();
+
+        let path = extracted_dir.join("eyes-closed.png");
+        let mut eye = image::RgbaImage::from_pixel(2, 1, image::Rgba([20, 30, 40, 255]));
+        eye.put_pixel(1, 0, image::Rgba([60, 30, 15, 255]));
+        eye.save(&path).unwrap();
+        let mut eyebrow = image::RgbaImage::new(2, 1);
+        eyebrow.put_pixel(1, 0, image::Rgba([10, 10, 10, 255]));
+        eyebrow.save(base_dir.join("eyebrow.png")).unwrap();
+
+        let cleaned =
+            remove_baked_eyebrow_from_expression_preview(&path, image::open(&path).unwrap())
+                .to_rgba8();
+
+        assert_eq!(cleaned.get_pixel(0, 0)[3], 255);
+        assert_eq!(cleaned.get_pixel(1, 0)[3], 0);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

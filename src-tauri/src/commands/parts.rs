@@ -1,8 +1,4 @@
 use crate::error::AppError;
-use crate::inference::neck_extract;
-use crate::inference::rife::rife_interpolate;
-use crate::inference::session::{create_session, resolve_model_path};
-use crate::processing::composite::{extract_part_with_blended_alpha, premultiply_onto_body};
 use crate::processing::image_utils;
 use crate::state::AppState;
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -12,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Cursor;
 use std::path::Path;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 // ── Layer mapping constants ──────────────────────────────────────────
 
@@ -83,7 +79,10 @@ fn arm_overlay_part_name(parent: &str, patch_id: &str) -> String {
             }
         })
         .collect();
-    format!("{parent}_overlay_{}", if suffix.is_empty() { "patch" } else { &suffix })
+    format!(
+        "{parent}_overlay_{}",
+        if suffix.is_empty() { "patch" } else { &suffix }
+    )
 }
 
 // ── Types ────────────────────────────────────────────────────────────
@@ -118,15 +117,6 @@ pub struct ProgressPayload {
     pub current: u32,
     pub total: u32,
     pub pair_name: String,
-}
-
-#[derive(Serialize)]
-pub struct CreateDiffResult {
-    pub output_path: String,
-    pub pair_name: String,
-    pub frame_count: u32,
-    pub preview: String,
-    pub previews: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -173,33 +163,6 @@ pub struct RenderCategoryResult {
     pub preview: String,
 }
 
-#[derive(Serialize)]
-pub struct ExportCorrectedLayerResult {
-    pub output_path: String,
-}
-
-#[derive(Serialize)]
-pub struct ImportCorrectionLayerResult {
-    pub layer_name: String,
-}
-
-#[derive(Serialize)]
-pub struct OriginalImageResult {
-    pub original_preview: String,
-    pub mouth_preview: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct MouthMaskPreviewResult {
-    pub mouth_preview: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Sam3SelectResult {
-    pub mask_png: String,
-}
-
 // ── Commands ─────────────────────────────────────────────────────────
 
 /// Load a See-Through output (PSD file or folder of PNGs) into the current slot.
@@ -223,8 +186,8 @@ pub async fn create_base(
     hair_layer_order: Vec<String>, // user's custom hair layer order (top=front)
     hair_back_layer_order: Vec<String>, // user's custom hair_back layer order (top=front)
     output_path: String,
-    // 胸を切出（オプション）: 切出ツールで塗ったマスクPNG。塗った範囲を body から
-    // 除去し chest として独立出力する（See-Throughにchestレイヤーが無いための手動抽出導線）
+    // 胸部範囲ガイド（オプション）: ユーザーがbody上で塗ったマスクPNG。
+    // bodyは保持し、互換用chest.pngとMotion Labの局所ワープ位置決めに使う。
     chest_mask_png: Option<String>,
 ) -> Result<CreateBaseResult, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
@@ -240,32 +203,6 @@ pub async fn create_base(
             hair_back_layer_order,
             output_path,
             chest_mask_png,
-        )
-    })
-    .await
-    .map_err(|e| AppError::General(format!("Task join error: {}", e)))?
-}
-
-/// Create a diff: load PSD → extract eye or mouth → RIFE interpolate with base → export folder.
-#[tauri::command]
-pub async fn create_diff(
-    app: AppHandle,
-    path: String,
-    diff_type: String, // "eye" or "mouth"
-    slot_name: String, // e.g. "eye_closed", "mouth_a", "mouth_i", etc.
-    frame_count: u32,
-    output_path: String,
-    original_image_path: String, // 元画像パス（mouth SAM3マスク適用用）
-) -> Result<CreateDiffResult, AppError> {
-    tauri::async_runtime::spawn_blocking(move || {
-        create_diff_inner(
-            app,
-            path,
-            diff_type,
-            slot_name,
-            frame_count,
-            output_path,
-            original_image_path,
         )
     })
     .await
@@ -324,7 +261,7 @@ pub async fn render_category(
     .map_err(|e| AppError::General(format!("Task join error: {}", e)))?
 }
 
-/// Get all loaded PSD layers for See-Through correction mode.
+/// Get all loaded PSD layers for the unified STEP 4 editor.
 #[tauri::command]
 pub async fn get_all_layers_preview(app: AppHandle) -> Result<MappingPreviewResult, AppError> {
     tauri::async_runtime::spawn_blocking(move || get_all_layers_preview_inner(app))
@@ -332,256 +269,7 @@ pub async fn get_all_layers_preview(app: AppHandle) -> Result<MappingPreviewResu
         .map_err(|e| AppError::General(format!("Task join error: {}", e)))?
 }
 
-/// Add an external PNG/JPEG/WebP as a correction layer.
-#[tauri::command]
-pub async fn import_correction_layer(
-    app: AppHandle,
-    path: String,
-    layer_name: String,
-) -> Result<ImportCorrectionLayerResult, AppError> {
-    tauri::async_runtime::spawn_blocking(move || {
-        import_correction_layer_inner(app, path, layer_name)
-    })
-    .await
-    .map_err(|e| AppError::General(format!("Task join error: {}", e)))?
-}
-
-/// Segment a region from a click point using SAM3 (切出ツールのクリック選択モード).
-/// `image_data_url` is the currently-displayed composite preview (what the user
-/// clicked on); `points` are pixel coordinates on that same image.
-#[tauri::command]
-pub async fn sam3_select_region(
-    image_data_url: String,
-    points: Vec<(f64, f64)>,
-) -> Result<Sam3SelectResult, AppError> {
-    tauri::async_runtime::spawn_blocking(move || sam3_select_region_inner(&image_data_url, &points))
-        .await
-        .map_err(|e| AppError::General(format!("Task join error: {}", e)))?
-}
-
-/// Export arbitrary corrected layer composition to an exact PNG path.
-#[tauri::command]
-pub async fn export_corrected_layer(
-    app: AppHandle,
-    output_path: String,
-    enabled_layers: Vec<String>,
-    layer_patches: Vec<LayerPatch>,
-    layer_opacities: HashMap<String, f32>,
-) -> Result<ExportCorrectedLayerResult, AppError> {
-    tauri::async_runtime::spawn_blocking(move || {
-        export_corrected_layer_inner(
-            app,
-            output_path,
-            enabled_layers,
-            layer_patches,
-            layer_opacities,
-        )
-    })
-    .await
-    .map_err(|e| AppError::General(format!("Task join error: {}", e)))?
-}
-
-/// Load original image and extract mouth mask via SAM3. Caches the result.
-#[tauri::command]
-pub async fn load_original_image(
-    app: AppHandle,
-    path: String,
-    mouth_mask_dilate_radius: Option<i32>,
-    mouth_mask_blur_radius: Option<i32>,
-) -> Result<OriginalImageResult, AppError> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        let original = image::open(&path)?;
-        let w = *state.canvas_width.lock().unwrap();
-        let h = *state.canvas_height.lock().unwrap();
-        let original = if w > 0 && h > 0 && (original.width() != w || original.height() != h) {
-            fit_image_to_canvas(&original, w, h)
-        } else {
-            original
-        };
-        // Cache original image for later use (mouth extraction applies mask to this)
-        *state.cached_original.lock().unwrap() = Some(original.clone());
-        state.cached_mouth_originals.lock().unwrap().insert(path.clone(), original.clone());
-
-        let sam3_ckpt = neck_extract::find_sam3_checkpoint();
-        let radius = mouth_mask_dilate_radius.unwrap_or(15).clamp(0, 64);
-        let blur = mouth_mask_blur_radius.unwrap_or(0).clamp(0, 32);
-        let mut mouth_preview = None;
-
-        // Extract and cache mouth mask from original image
-        // (original image has clear mouth features even when closed, unlike PSD composite)
-        match neck_extract::extract_mouth_raw_mask(&original, sam3_ckpt.as_deref()) {
-            Ok(raw_mask) => {
-                eprintln!(
-                    "[PachiPakuGen] Raw mouth mask cached from original image via SAM3 (dilate radius={}, blur radius={})",
-                    radius, blur
-                );
-                let mask = neck_extract::adjust_mask(&raw_mask, original.width(), original.height(), radius, blur);
-                let masked = neck_extract::apply_mask_to_image(&original, &mask, original.width(), original.height());
-                mouth_preview = Some(mouth_preview_to_base64(&masked, &mask, original.width(), original.height()));
-                state.cached_mouth_raw_masks.lock().unwrap().insert(path.clone(), raw_mask.clone());
-                *state.cached_mouth_raw_mask.lock().unwrap() = Some(raw_mask);
-                *state.cached_mouth_mask.lock().unwrap() = Some(mask);
-            }
-            Err(e) => {
-                eprintln!("[PachiPakuGen] SAM3 mouth from original failed: {}", e);
-            }
-        }
-
-        Ok(OriginalImageResult {
-            original_preview: image_utils::image_to_base64_png(&original),
-            mouth_preview,
-        })
-    })
-    .await
-    .map_err(|e| AppError::General(format!("Task join error: {}", e)))?
-}
-
-#[tauri::command]
-pub async fn update_mouth_mask_preview(
-    app: AppHandle,
-    path: String,
-    mouth_mask_dilate_radius: i32,
-    mouth_mask_blur_radius: i32,
-) -> Result<MouthMaskPreviewResult, AppError> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let state = app.state::<AppState>();
-        let original = state
-            .cached_mouth_originals
-            .lock()
-            .unwrap()
-            .get(&path)
-            .cloned()
-            .ok_or_else(|| {
-                AppError::General(
-                    "元画像が読み込まれていません。先に口マスク確認を実行してください".into(),
-                )
-            })?;
-        let raw_mask = state
-            .cached_mouth_raw_masks
-            .lock()
-            .unwrap()
-            .get(&path)
-            .cloned()
-            .ok_or_else(|| {
-                AppError::General(
-                    "SAM3口マスクがまだ作成されていません。先に口マスク確認を実行してください"
-                        .into(),
-                )
-            })?;
-        let mask = neck_extract::adjust_mask(
-            &raw_mask,
-            original.width(),
-            original.height(),
-            mouth_mask_dilate_radius,
-            mouth_mask_blur_radius,
-        );
-        let masked = neck_extract::apply_mask_to_image(
-            &original,
-            &mask,
-            original.width(),
-            original.height(),
-        );
-        let preview = mouth_preview_to_base64(&masked, &mask, original.width(), original.height());
-        *state.cached_original.lock().unwrap() = Some(original);
-        *state.cached_mouth_raw_mask.lock().unwrap() = Some(raw_mask);
-        *state.cached_mouth_mask.lock().unwrap() = Some(mask);
-        Ok(MouthMaskPreviewResult {
-            mouth_preview: preview,
-        })
-    })
-    .await
-    .map_err(|e| AppError::General(format!("Task join error: {}", e)))?
-}
-
 // ── Implementation ───────────────────────────────────────────────────
-
-fn mouth_preview_to_base64(masked: &DynamicImage, mask: &[u8], width: u32, height: u32) -> String {
-    let mut min_x = width;
-    let mut min_y = height;
-    let mut max_x = 0u32;
-    let mut max_y = 0u32;
-    let mut found = false;
-
-    for y in 0..height {
-        for x in 0..width {
-            if mask[(y * width + x) as usize] > 8 {
-                min_x = min_x.min(x);
-                min_y = min_y.min(y);
-                max_x = max_x.max(x);
-                max_y = max_y.max(y);
-                found = true;
-            }
-        }
-    }
-
-    if !found {
-        return image_utils::image_to_base64_png(masked);
-    }
-
-    let pad_x = (width / 12).max(48);
-    let pad_y = (height / 12).max(48);
-    let x0 = min_x.saturating_sub(pad_x);
-    let y0 = min_y.saturating_sub(pad_y);
-    let x1 = (max_x + pad_x).min(width.saturating_sub(1));
-    let y1 = (max_y + pad_y).min(height.saturating_sub(1));
-    let crop_w = (x1 - x0 + 1).max(1);
-    let crop_h = (y1 - y0 + 1).max(1);
-    let crop = masked.crop_imm(x0, y0, crop_w, crop_h);
-    image_utils::image_to_base64_png(&crop)
-}
-
-fn part_previews_to_base64(frames: &[DynamicImage]) -> Vec<String> {
-    if frames.is_empty() {
-        return Vec::new();
-    }
-
-    let width = frames[0].width();
-    let height = frames[0].height();
-    let mut min_x = width;
-    let mut min_y = height;
-    let mut max_x = 0u32;
-    let mut max_y = 0u32;
-    let mut found = false;
-
-    for frame in frames {
-        let rgba = frame.to_rgba8();
-        for y in 0..height {
-            for x in 0..width {
-                if rgba.get_pixel(x, y)[3] > 8 {
-                    min_x = min_x.min(x);
-                    min_y = min_y.min(y);
-                    max_x = max_x.max(x);
-                    max_y = max_y.max(y);
-                    found = true;
-                }
-            }
-        }
-    }
-
-    if !found {
-        return frames
-            .iter()
-            .map(image_utils::image_to_base64_png)
-            .collect();
-    }
-
-    let part_w = max_x - min_x + 1;
-    let part_h = max_y - min_y + 1;
-    let pad_x = (part_w / 2).max(24);
-    let pad_y = (part_h / 2).max(24);
-    let x0 = min_x.saturating_sub(pad_x);
-    let y0 = min_y.saturating_sub(pad_y);
-    let x1 = (max_x + pad_x).min(width.saturating_sub(1));
-    let y1 = (max_y + pad_y).min(height.saturating_sub(1));
-    frames
-        .iter()
-        .map(|frame| {
-            let crop = frame.crop_imm(x0, y0, x1 - x0 + 1, y1 - y0 + 1);
-            image_utils::image_to_base64_png(&crop)
-        })
-        .collect()
-}
 
 fn fit_image_to_canvas(image: &DynamicImage, target_w: u32, target_h: u32) -> DynamicImage {
     let src_w = image.width();
@@ -785,6 +473,28 @@ fn create_base_inner(
     // image is available.
     let reconstructed_eye =
         merge_eye_layers_for_base(current, &full_mapping, &source_layer_order, w, h);
+    // Motion Labの開眼時に虹彩だけを動かせるよう、統合前の白目・虹彩も保持する。
+    // 睫毛・眉は従来どおりeye_open/RIFEフレーム側を下地として使う。
+    let eyewhite = merge_layers_for_names(
+        current,
+        &depth_maps,
+        &["eyewhite"],
+        &source_layer_order,
+        w,
+        h,
+    );
+    let irides =
+        merge_layers_for_names(current, &depth_maps, &["irides"], &source_layer_order, w, h);
+    // Keep eyebrows independent from the open/closed eye frames. This avoids
+    // a baked brow ghost when Motion Lab applies a small brow transform.
+    let eyebrow = merge_layers_for_names(
+        current,
+        &depth_maps,
+        &["eyebrow"],
+        &source_layer_order,
+        w,
+        h,
+    );
     let exact_original = if !original_image_path.is_empty() {
         let original = image::open(&original_image_path)
             .map_err(|e| AppError::General(format!("Base eye image load failed: {}", e)))?;
@@ -827,33 +537,16 @@ fn create_base_inner(
         (None, reconstructed) => reconstructed,
     };
 
-    // mouth: use cached SAM3 mask applied to THIS base's original image
-    // (SAM3 mask was detected from open original, but pixels come from base's own original)
-    let mouth = {
-        let cached_mask = state.cached_mouth_mask.lock().unwrap().clone();
-        if let (Some(mask), true) = (cached_mask, !original_image_path.is_empty()) {
-            let base_orig = image::open(&original_image_path)
-                .map_err(|e| AppError::General(format!("Base元画像の読み込み失敗: {}", e)))?;
-            let base_orig = if base_orig.width() != w || base_orig.height() != h {
-                fit_image_to_canvas(&base_orig, w, h)
-            } else {
-                base_orig
-            };
-            eprintln!("[PachiPakuGen] Base mouth: SAM3 mask applied to base's original image");
-            Some(neck_extract::apply_mask_to_image(&base_orig, &mask, w, h))
-        } else {
-            eprintln!("[PachiPakuGen] No cached mouth mask/original, using PSD mouth layer");
-            merge_layers_for_target(
-                current,
-                &depth_maps,
-                &full_mapping,
-                "mouth",
-                &source_layer_order,
-                w,
-                h,
-            )
-        }
-    };
+    // v0.4ではSee-Throughの口レイヤーを正本とする。
+    let mouth = merge_layers_for_target(
+        current,
+        &depth_maps,
+        &full_mapping,
+        "mouth",
+        &source_layer_order,
+        w,
+        h,
+    );
 
     let mut parts: HashMap<String, DynamicImage> = HashMap::new();
     let mut file_count = 0u32;
@@ -1081,8 +774,8 @@ fn create_base_inner(
             }
         }
 
-        // 胸を切出（オプション・852話式: See-Throughにchestレイヤーが無いため手動抽出）。
-        // 塗った範囲を body から除去し、chest として独立出力する
+        // 胸部範囲ガイド（オプション）。bodyは保持し、旧SpriTalk素材との互換用に
+        // 同じ画素をchest.pngへ複製する。Motion Labでは重ね描きせず局所ワープ範囲に使う。
         body_img = cut_chest_from_body(body_img, chest_mask_png.as_deref(), &mut parts, w, h)?;
 
         parts.insert("body".to_string(), body_img);
@@ -1246,6 +939,15 @@ fn create_base_inner(
     if let Some(img) = eye {
         parts.insert(base_eye_slot.clone(), img);
     }
+    if let Some(img) = eyewhite {
+        parts.insert("eyewhite".to_string(), img);
+    }
+    if let Some(img) = irides {
+        parts.insert("irides".to_string(), img);
+    }
+    if let Some(img) = eyebrow {
+        parts.insert("eyebrow".to_string(), img);
+    }
     if let Some(img) = mouth {
         parts.insert(base_mouth_slot.clone(), img);
     }
@@ -1270,246 +972,6 @@ fn create_base_inner(
         base_eye_slot,
         base_mouth_slot,
         file_count,
-    })
-}
-
-fn create_diff_inner(
-    app: AppHandle,
-    path: String,
-    diff_type: String,
-    slot_name: String,
-    frame_count: u32,
-    output_path: String,
-    original_image_path: String,
-) -> Result<CreateDiffResult, AppError> {
-    if frame_count < 2 || frame_count > 30 {
-        return Err(AppError::General(
-            "フレーム数は2〜30の範囲で指定してください".into(),
-        ));
-    }
-
-    let state = app.state::<AppState>();
-
-    // Load the diff PSD
-    let p = Path::new(&path);
-    if !p.is_file() {
-        return Err(AppError::General(format!(
-            "ファイルが見つかりません: {}",
-            path
-        )));
-    }
-    let (layers, source_layer_order) = load_layers_from_psd(&path)?;
-
-    let mapping = state.layer_mapping.lock().unwrap().clone();
-    if mapping.is_empty() {
-        return Err(AppError::General("先に素体を作成してください".into()));
-    }
-
-    let w = *state.canvas_width.lock().unwrap();
-    let h = *state.canvas_height.lock().unwrap();
-
-    // Resize layers
-    let mut resized: HashMap<String, DynamicImage> = HashMap::new();
-    for (name, img) in &layers {
-        let img = if img.width() != w || img.height() != h {
-            img.resize_exact(w, h, image::imageops::FilterType::Lanczos3)
-        } else {
-            img.clone()
-        };
-        resized.insert(name.clone(), img);
-    }
-
-    let depth_maps = load_depth_maps_for_psd(&path, &resized, w, h);
-
-    // Extract the target (eye or mouth) from the diff PSD
-    let target = match diff_type.as_str() {
-        "eye" => "eye",
-        "mouth" => "mouth",
-        _ => return Err(AppError::General(format!("不正なdiff_type: {}", diff_type))),
-    };
-
-    // Extract target from diff PSD. See-Through semantic layers are the primary
-    // source for both eyes and mouths; masks are only a fallback when layer
-    // classification fails.
-    let diff_merged = if target == "mouth" {
-        if let Some(merged) = merge_layers_for_target(
-            &resized,
-            &depth_maps,
-            &mapping,
-            target,
-            &source_layer_order,
-            w,
-            h,
-        ) {
-            eprintln!("[PachiPakuGen] Diff mouth: using See-Through mouth layers");
-            merged
-        } else {
-            let cached_mask = state.cached_mouth_mask.lock().unwrap().clone();
-            if let (Some(mask), true) = (cached_mask, !original_image_path.is_empty()) {
-                let diff_orig = image::open(&original_image_path)
-                    .map_err(|e| AppError::General(format!("Diff元画像の読み込み失敗: {}", e)))?;
-                let diff_orig = if diff_orig.width() != w || diff_orig.height() != h {
-                    fit_image_to_canvas(&diff_orig, w, h)
-                } else {
-                    diff_orig
-                };
-                eprintln!("[PachiPakuGen] Diff mouth: See-Through mouth layer missing; fallback to SAM3 gate");
-                neck_extract::apply_mask_to_image(&diff_orig, &mask, w, h)
-            } else {
-                return Err(AppError::General(
-                    "mouthレイヤーが見つかりません。See-Through分類を補正するか、口マスクを作成してください"
-                        .into(),
-                ));
-            }
-        }
-    } else {
-        // Eye: PSD layers directly
-        merge_layers_for_target(
-            &resized,
-            &depth_maps,
-            &mapping,
-            target,
-            &source_layer_order,
-            w,
-            h,
-        )
-        .ok_or_else(|| AppError::General(format!("{}に対応するレイヤーが見つかりません", target)))?
-    };
-
-    let diff_merged = if target == "eye" && !original_image_path.is_empty() {
-        let original = image::open(&original_image_path)
-            .map_err(|e| AppError::General(format!("Diff eye image load failed: {}", e)))?;
-        let original = if original.width() != w || original.height() != h {
-            fit_image_to_canvas(&original, w, h)
-        } else {
-            original
-        };
-        extract_original_target_pixels(
-            &original,
-            &diff_merged,
-            &resized,
-            &depth_maps,
-            &mapping,
-            "eye",
-            Some("hair"),
-            w,
-            h,
-        )
-        .unwrap_or(diff_merged)
-    } else {
-        diff_merged
-    };
-
-    // Get base frame from stored parts
-    let parts = state.parts.lock().unwrap();
-    let base_key = if diff_type == "eye" {
-        // Find which eye slot is the base (eye_open or eye_closed)
-        parts
-            .keys()
-            .find(|k| k.starts_with("eye_"))
-            .cloned()
-            .ok_or_else(|| AppError::General("素体のeyeが見つかりません".into()))?
-    } else {
-        parts
-            .keys()
-            .find(|k| k.starts_with("mouth_") || *k == "mouth_closed")
-            .cloned()
-            .ok_or_else(|| AppError::General("素体のmouthが見つかりません".into()))?
-    };
-
-    let base_frame = parts
-        .get(&base_key)
-        .ok_or_else(|| {
-            AppError::General(format!("ベースフレーム '{}' が見つかりません", base_key))
-        })?
-        .clone();
-
-    let body = parts
-        .get("body")
-        .ok_or_else(|| AppError::General("素体のbodyが見つかりません".into()))?
-        .clone();
-    let body_rgb = body.to_rgb8();
-    drop(parts);
-
-    // Initialize RIFE session if needed
-    {
-        let mut session = state.rife_session.lock().unwrap();
-        if session.is_none() {
-            let model_path = resolve_model_path(&app, "rife.onnx")?;
-            *session = Some(create_session(&model_path)?);
-        }
-    }
-
-    // RIFE interpolation: base_frame ↔ diff_merged
-    let img_a_rgba = base_frame.to_rgba8();
-    let img_b_rgba = diff_merged.to_rgba8();
-
-    // Premultiply onto body (body already excludes neck in interp mode)
-    let rife_a = premultiply_onto_body(&body_rgb, &img_a_rgba, w, h);
-    let rife_b = premultiply_onto_body(&body_rgb, &img_b_rgba, w, h);
-
-    let ratios: Vec<f32> = (0..frame_count)
-        .map(|i| i as f32 / (frame_count - 1) as f32)
-        .collect();
-
-    let mut session_guard = state.rife_session.lock().unwrap();
-    let session = session_guard.as_mut().unwrap();
-
-    let mut frames = Vec::new();
-    let pair_name = slot_name.clone();
-
-    for (step, &ratio) in ratios.iter().enumerate() {
-        let _ = app.emit(
-            "generation-progress",
-            ProgressPayload {
-                current: (step + 1) as u32,
-                total: frame_count,
-                pair_name: pair_name.clone(),
-            },
-        );
-
-        let part_frame = if step == 0 {
-            DynamicImage::ImageRgba8(img_a_rgba.clone())
-        } else if step + 1 == frame_count as usize {
-            DynamicImage::ImageRgba8(img_b_rgba.clone())
-        } else {
-            let interpolated = rife_interpolate(session, &rife_a, &rife_b, ratio)?;
-            extract_part_with_blended_alpha(&interpolated, &img_a_rgba, &img_b_rgba, ratio, w, h)
-        };
-        frames.push(part_frame);
-    }
-    drop(session_guard);
-
-    // Export frames in SpriTalk order:
-    // - eye: open -> closed
-    // - mouth: closed -> open
-    if diff_type == "eye" {
-        frames.reverse();
-    }
-    let out_dir = Path::new(&output_path).join(&pair_name);
-    fs::create_dir_all(&out_dir)?;
-
-    for (i, frame) in frames.iter().enumerate() {
-        let filename = format!("{:03}.png", i + 1);
-        frame.save(out_dir.join(&filename))?;
-    }
-
-    let previews = part_previews_to_base64(&frames);
-    let preview = previews.last().cloned().unwrap_or_default();
-
-    eprintln!(
-        "[PachiPakuGen] Diff created: {} ({} frames) → {}",
-        pair_name,
-        frame_count,
-        out_dir.display()
-    );
-
-    Ok(CreateDiffResult {
-        output_path: out_dir.to_string_lossy().into_owned(),
-        pair_name,
-        frame_count,
-        preview,
-        previews,
     })
 }
 
@@ -1624,7 +1086,15 @@ pub(crate) fn get_mapping_preview_inner(
 
     // Full composite preview
     let mut composite_parts: HashMap<String, DynamicImage> = HashMap::new();
-    for target in &["body", "eye", "mouth", "hair", "hair_back", "arm_l", "arm_r"] {
+    for target in &[
+        "body",
+        "eye",
+        "mouth",
+        "hair",
+        "hair_back",
+        "arm_l",
+        "arm_r",
+    ] {
         if let Some(mut img) = merge_layers_for_target(
             current,
             &depth_maps,
@@ -1757,111 +1227,13 @@ fn get_all_layers_preview_inner(app: AppHandle) -> Result<MappingPreviewResult, 
     Ok(MappingPreviewResult {
         categories: vec![CategoryPreview {
             target: "free".to_string(),
-            label: "See-Through補正".to_string(),
+            label: "全レイヤー".to_string(),
             preview: composite_preview.clone(),
             layer_names,
             layers,
         }],
         composite_preview,
     })
-}
-
-fn import_correction_layer_inner(
-    app: AppHandle,
-    path: String,
-    layer_name: String,
-) -> Result<ImportCorrectionLayerResult, AppError> {
-    let normalized_name = layer_name.trim().to_lowercase().replace(' ', "_");
-    if normalized_name.is_empty() {
-        return Err(AppError::General("追加レイヤー名が空です".into()));
-    }
-
-    let state = app.state::<AppState>();
-    let w = *state.canvas_width.lock().unwrap();
-    let h = *state.canvas_height.lock().unwrap();
-    if w == 0 || h == 0 {
-        return Err(AppError::General("先にPSDを読み込んでください".into()));
-    }
-
-    let img = image::open(&path)
-        .map_err(|e| AppError::General(format!("追加レイヤー画像の読み込み失敗: {}", e)))?;
-    let img = if img.width() != w || img.height() != h {
-        img.resize_exact(w, h, image::imageops::FilterType::Lanczos3)
-    } else {
-        img
-    };
-
-    let mut slot_layers = state.slot_layers.lock().unwrap();
-    let current = slot_layers
-        .get_mut("current")
-        .ok_or_else(|| AppError::General("PSDが読み込まれていません".into()))?;
-
-    let mut final_name = normalized_name.clone();
-    if current.contains_key(final_name.as_str()) {
-        let mut idx = 1;
-        loop {
-            let candidate = format!("{}_{}", normalized_name, idx);
-            if !current.contains_key(candidate.as_str()) {
-                final_name = candidate;
-                break;
-            }
-            idx += 1;
-        }
-    }
-    current.insert(final_name.clone(), img);
-    state
-        .slot_layer_order
-        .lock()
-        .unwrap()
-        .push(final_name.clone());
-    eprintln!(
-        "[PachiPakuGen] Imported correction layer '{}' from {}",
-        final_name, path
-    );
-
-    Ok(ImportCorrectionLayerResult {
-        layer_name: final_name,
-    })
-}
-
-fn export_corrected_layer_inner(
-    app: AppHandle,
-    output_path: String,
-    enabled_layers: Vec<String>,
-    layer_patches: Vec<LayerPatch>,
-    layer_opacities: HashMap<String, f32>,
-) -> Result<ExportCorrectedLayerResult, AppError> {
-    if enabled_layers.is_empty() {
-        return Err(AppError::General("出力するレイヤーがありません".into()));
-    }
-
-    let state = app.state::<AppState>();
-    let slot_layers = state.slot_layers.lock().unwrap();
-    let current = slot_layers
-        .get("current")
-        .ok_or_else(|| AppError::General("PSDが読み込まれていません".into()))?;
-    let w = *state.canvas_width.lock().unwrap();
-    let h = *state.canvas_height.lock().unwrap();
-    let depth_maps = state.slot_depth_maps.lock().unwrap().clone();
-
-    let active_patches = active_patches_for_order(&layer_patches, &enabled_layers);
-    let patch_masks = prepare_patch_masks(&active_patches, w, h)?;
-    let render_layers = collect_ordered_render_layers(
-        current,
-        &enabled_layers,
-        &active_patches,
-        &patch_masks,
-        Some(&layer_opacities),
-    );
-    let result_img = compose_depth_gated_layers(render_layers, &depth_maps, w, h).to_rgba8();
-
-    let out_path = Path::new(&output_path);
-    if let Some(parent) = out_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    DynamicImage::ImageRgba8(result_img).save(out_path)?;
-
-    Ok(ExportCorrectedLayerResult { output_path })
 }
 
 fn normalize_layer_name(name: &str) -> &str {
@@ -2279,7 +1651,7 @@ fn merge_eye_layers_for_base(
 ) -> Option<DynamicImage> {
     let mut result = RgbaImage::new(width, height);
     let mut found = false;
-    for target_name in ["eyewhite", "irides", "eyelash", "eyebrow"] {
+    for target_name in ["eyewhite", "irides", "eyelash"] {
         let mut matching_layers: Vec<_> = slot_layers
             .iter()
             .filter(|(layer_name, _)| normalize_layer_name(layer_name) == target_name)
@@ -2492,14 +1864,7 @@ fn preferred_body_anchor_depth(
     patches: &[LayerPatch],
     mapping: &HashMap<String, String>,
 ) -> Option<f64> {
-    const BODY_ANCHORS: &[&str] = &[
-        "topwear",
-        "bottomwear",
-        "neckwear",
-        "face",
-        "neck",
-        "nose",
-    ];
+    const BODY_ANCHORS: &[&str] = &["topwear", "bottomwear", "neckwear", "face", "neck", "nose"];
     for anchor in BODY_ANCHORS {
         let mut sum = 0usize;
         let mut count = 0usize;
@@ -2583,13 +1948,8 @@ fn build_linked_arm_parts(
         .cloned()
         .collect();
     main_order.reverse();
-    let main_layers = collect_ordered_render_layers(
-        current,
-        &main_order,
-        &active_patches,
-        &patch_masks,
-        None,
-    );
+    let main_layers =
+        collect_ordered_render_layers(current, &main_order, &active_patches, &patch_masks, None);
     if !main_layers.is_empty() {
         result.insert(
             arm_target.to_string(),
@@ -3070,29 +2430,10 @@ fn alpha_composite_onto(
     }
 }
 
-fn sam3_select_region_inner(
-    image_data_url: &str,
-    points: &[(f64, f64)],
-) -> Result<Sam3SelectResult, AppError> {
-    let image = decode_data_url_image(image_data_url)?;
-    let checkpoint = neck_extract::find_sam3_checkpoint();
-    let mask = neck_extract::extract_mask_with_sam3_point(&image, points, checkpoint.as_deref())?;
-    let (width, height) = (image.width(), image.height());
-    // ブラシと同じ表示色(233,69,96)でRGBAマスクを作り、パッチマスクcanvasへ
-    // そのまま合成できる形にする（アルファ=SAM3マスク値）
-    let mut rgba = RgbaImage::new(width, height);
-    for (index, pixel) in rgba.pixels_mut().enumerate() {
-        let value = mask.get(index).copied().unwrap_or(0);
-        *pixel = image::Rgba([233, 69, 96, value]);
-    }
-    Ok(Sam3SelectResult {
-        mask_png: image_utils::image_to_base64_png(&DynamicImage::ImageRgba8(rgba)),
-    })
-}
-
-/// 胸を切出（852話式・コピー方式）。塗ったマスク範囲を body から chest として複製する。
-/// body からは**抜かない** — 胸の背後に体が残るため、揺れても穴が空かず自然に見える
-/// （852話 Anime2.5DRig と同方式）。マスク無しなら body をそのまま返す
+/// 胸部範囲ガイドを互換用chest.pngとして複製する。
+/// bodyからは抜かない。Motion Labはこの画像を描画レイヤーではなく局所ワープの
+/// 位置ガイドとして扱い、旧SpriTalk素材ローダーには従来どおりchest.pngを渡せる。
+/// マスク無しならbodyをそのまま返す。
 fn cut_chest_from_body(
     body: DynamicImage,
     chest_mask_png: Option<&str>,
@@ -3108,18 +2449,6 @@ fn cut_chest_from_body(
     let chest_rgba = apply_mask_to_rgba(&body_rgba, &mask, false);
     parts.insert("chest".to_string(), DynamicImage::ImageRgba8(chest_rgba));
     Ok(body)
-}
-
-fn decode_data_url_image(data_uri: &str) -> Result<DynamicImage, AppError> {
-    let encoded = data_uri
-        .split_once(',')
-        .map(|(_, data)| data)
-        .unwrap_or(data_uri);
-    let bytes = STANDARD
-        .decode(encoded)
-        .map_err(|e| AppError::General(format!("画像のデコードに失敗: {}", e)))?;
-    image::load_from_memory(&bytes)
-        .map_err(|e| AppError::General(format!("画像の読み込みに失敗: {}", e)))
 }
 
 fn decode_mask_png(data_uri: &str, width: u32, height: u32) -> Result<image::GrayImage, AppError> {
@@ -3249,10 +2578,7 @@ fn compose_parts_preview(
         .copied()
         .filter(|key| key.starts_with("sway_"))
         .collect();
-    let mut eye_keys: Vec<&String> = parts
-        .keys()
-        .filter(|key| key.starts_with("eye_"))
-        .collect();
+    let mut eye_keys: Vec<&String> = parts.keys().filter(|key| key.starts_with("eye_")).collect();
     eye_keys.sort();
     let mut mouth_keys: Vec<&String> = parts
         .keys()
@@ -3266,6 +2592,9 @@ fn compose_parts_preview(
                 if let Some(image) = eye_keys.first().and_then(|key| parts.get(*key)) {
                     alpha_composite_onto(&mut result, &image.to_rgba8(), width, height);
                 }
+                if let Some(image) = parts.get("eyebrow") {
+                    alpha_composite_onto(&mut result, &image.to_rgba8(), width, height);
+                }
             }
             "mouth" => {
                 if let Some(image) = mouth_keys.first().and_then(|key| parts.get(*key)) {
@@ -3276,8 +2605,7 @@ fn compose_parts_preview(
                 let mut sway_keys: Vec<&String> = parts
                     .keys()
                     .filter(|key| {
-                        key.starts_with("sway_")
-                            && !explicitly_ordered_sways.contains(key.as_str())
+                        key.starts_with("sway_") && !explicitly_ordered_sways.contains(key.as_str())
                     })
                     .collect();
                 sway_keys.sort();
@@ -3331,7 +2659,14 @@ mod tests {
         assert_eq!(
             order,
             vec![
-                "arm_r", "arm_l", "hair_back", "body", "chest", "eye", "mouth", "hair"
+                "arm_r",
+                "arm_l",
+                "hair_back",
+                "body",
+                "chest",
+                "eye",
+                "mouth",
+                "hair"
             ]
         );
     }
@@ -3492,10 +2827,7 @@ mod tests {
         )
         .unwrap();
         let parent = parts.get("arm_l").unwrap().to_rgba8();
-        let overlay = parts
-            .get("arm_l_overlay_finger_patch")
-            .unwrap()
-            .to_rgba8();
+        let overlay = parts.get("arm_l_overlay_finger_patch").unwrap().to_rgba8();
 
         assert_eq!(parent.get_pixel(0, 0)[3], 255);
         assert_eq!(parent.get_pixel(1, 0)[3], 0);
@@ -3801,5 +3133,24 @@ mod tests {
         assert_eq!(exact_eye.get_pixel(0, 0).0, [10, 200, 240, 255]);
         assert_eq!(exact_eye.get_pixel(1, 0)[3], 0);
         assert_eq!(exact_eye.get_pixel(2, 0).0, [10, 200, 240, 255]);
+    }
+
+    #[test]
+    fn base_eye_merge_keeps_eyebrows_independent() {
+        let mut eye = RgbaImage::new(3, 1);
+        eye.put_pixel(0, 0, image::Rgba([10, 200, 240, 255]));
+        let mut eyebrow = RgbaImage::new(3, 1);
+        eyebrow.put_pixel(2, 0, image::Rgba([30, 20, 15, 255]));
+        let layers = HashMap::from([
+            ("eyewhite-l".to_string(), DynamicImage::ImageRgba8(eye)),
+            ("eyebrow-r".to_string(), DynamicImage::ImageRgba8(eyebrow)),
+        ]);
+
+        let merged = merge_eye_layers_for_base(&layers, &HashMap::new(), &[], 3, 1)
+            .unwrap()
+            .to_rgba8();
+
+        assert_eq!(merged.get_pixel(0, 0).0, [10, 200, 240, 255]);
+        assert_eq!(merged.get_pixel(2, 0)[3], 0);
     }
 }

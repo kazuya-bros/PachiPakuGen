@@ -32,16 +32,6 @@ pub struct AppState {
     // Cached original image (resized to canvas dimensions)
     pub cached_original: Mutex<Option<DynamicImage>>,
 
-    // Cached SAM3 mouth mask (grayscale, from base PSD, reused for all diffs)
-    pub cached_mouth_mask: Mutex<Option<Vec<u8>>>,
-
-    // Raw SAM3 mouth mask before UI dilation/blur adjustments.
-    pub cached_mouth_raw_mask: Mutex<Option<Vec<u8>>>,
-
-    // Per-original cache so UI adjustments do not rerun SAM3 for vowel previews.
-    pub cached_mouth_originals: Mutex<HashMap<String, DynamicImage>>,
-    pub cached_mouth_raw_masks: Mutex<HashMap<String, Vec<u8>>>,
-
     // PID of the currently running See-Through setup or inference process.
     pub see_through_pid: Mutex<Option<u32>>,
 
@@ -73,10 +63,6 @@ impl Default for AppState {
             canvas_width: Mutex::new(0),
             canvas_height: Mutex::new(0),
             cached_original: Mutex::new(None),
-            cached_mouth_mask: Mutex::new(None),
-            cached_mouth_raw_mask: Mutex::new(None),
-            cached_mouth_originals: Mutex::new(HashMap::new()),
-            cached_mouth_raw_masks: Mutex::new(HashMap::new()),
             see_through_pid: Mutex::new(None),
             see_through_runtime_lock: Mutex::new(()),
             see_through_model_download_pid: Mutex::new(None),

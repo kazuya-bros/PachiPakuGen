@@ -1,6 +1,7 @@
 use crate::error::AppError;
-use image::GenericImageView;
+use image::{DynamicImage, GenericImageView};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -70,7 +71,7 @@ pub struct PrepareWorkspaceCodexRequest {
     pub mouth_size: String,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceGeneratedPartsStatus {
     pub request_path: String,
@@ -81,6 +82,31 @@ pub struct WorkspaceGeneratedPartsStatus {
     pub stale_parts: Vec<String>,
     pub size_mismatches: Vec<String>,
     pub ready: bool,
+    /// STEP3で記録した生成画像の視覚内容と現在の7枚が異なる。
+    /// 完了済みワークスペースでは同時にproject.jsonをSTEP3へ戻す。
+    pub downstream_stale: bool,
+}
+
+/// PNGの圧縮方法やファイル時刻ではなく、表示されるRGBA画素と寸法だけを比較する。
+/// 暗号用途ではなくローカル作業ファイルの変更検知用なので、依存を増やさない
+/// 決定的なFNV-1a 64-bitを使う。
+pub(crate) fn visual_image_fingerprint(image: &DynamicImage) -> String {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let rgba = image.to_rgba8();
+    let mut hash = OFFSET_BASIS;
+    for byte in image
+        .width()
+        .to_le_bytes()
+        .into_iter()
+        .chain(image.height().to_le_bytes())
+        .chain(rgba.as_raw().iter().copied())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("rgba8-fnv1a64:{hash:016x}")
 }
 
 #[tauri::command]
@@ -128,6 +154,21 @@ pub async fn update_expression_workspace_step(
 ) -> Result<ExpressionWorkspaceResult, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
         update_expression_workspace_step_inner(&work_path, current_step)
+    })
+    .await
+    .map_err(|error| AppError::General(format!("Task join error: {error}")))?
+}
+
+/// STEP4/5の再編集で、保存済みの下流成果物を明示的に無効化するための巻き戻し。
+/// 通常進行の`update_expression_workspace_step`は前進専用のまま維持し、閲覧目的で
+/// 前の画面へ移動しただけではproject.jsonの到達済みチェックポイントを戻さない。
+#[tauri::command]
+pub async fn regress_expression_workspace_step(
+    work_path: String,
+    current_step: u32,
+) -> Result<ExpressionWorkspaceResult, AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        regress_expression_workspace_step_inner(&work_path, current_step)
     })
     .await
     .map_err(|error| AppError::General(format!("Task join error: {error}")))?
@@ -191,20 +232,38 @@ fn prepare_workspace_codex_request_inner(
     let source_copy = codex_dir.join("source.png");
     let source_image = image::open(&source)?;
     let (source_width, source_height) = (source_image.width(), source_image.height());
-    source_image.save(&source_copy)?;
-
-    let reference_copy = request
+    let reference_source = request
         .reference_image_path
         .as_deref()
         .filter(|path| !path.trim().is_empty())
-        .map(PathBuf::from)
-        .filter(|path| path.is_file())
+        .map(PathBuf::from);
+    let reference_image = reference_source
+        .as_ref()
         .map(|path| {
-            let dest = codex_dir.join("reference.png");
-            image::open(path)?.save(&dest)?;
-            Ok::<PathBuf, AppError>(dest)
+            if !path.is_file() {
+                return Err(AppError::General(format!(
+                    "参照画像が見つかりません: {}",
+                    path.display()
+                )));
+            }
+            image::open(path).map_err(AppError::from)
         })
         .transpose()?;
+    // 完了済み案件で入力や作成ガイドを更新する場合、最初のファイル書込より前に
+    // STEP2へ戻して旧分解・RIFE成果物をfail-safeで無効化する。
+    invalidate_workspace_before_edit(&root, 2)?;
+    source_image.save(&source_copy)?;
+
+    let reference_dest = codex_dir.join("reference.png");
+    let reference_copy = if let Some(image) = reference_image {
+        image.save(&reference_dest)?;
+        Some(reference_dest)
+    } else {
+        if reference_dest.is_file() {
+            fs::remove_file(&reference_dest)?;
+        }
+        None
+    };
 
     let expected_parts: Vec<String> = WORKSPACE_TARGETS
         .iter()
@@ -271,6 +330,7 @@ fn inspect_workspace_generated_parts_inner(
     let mut missing_parts = Vec::new();
     let mut stale_parts = Vec::new();
     let mut size_mismatches = Vec::new();
+    let mut current_fingerprints = BTreeMap::new();
 
     for part in &expected_parts {
         let path = generated_dir.join(format!("{part}.png"));
@@ -290,8 +350,11 @@ fn inspect_workspace_generated_parts_inner(
         }
         present_parts.push(part.clone());
         match image::open(&path) {
-            Ok(image) if image.dimensions() == source.dimensions() => {}
+            Ok(image) if image.dimensions() == source.dimensions() => {
+                current_fingerprints.insert(part.clone(), visual_image_fingerprint(&image));
+            }
             Ok(image) => {
+                current_fingerprints.insert(part.clone(), visual_image_fingerprint(&image));
                 // 同アスペクト比なら抽出時に自動リサイズするため受け入れる
                 let source_aspect = source.width() as f64 / source.height() as f64;
                 let part_aspect = image.width() as f64 / image.height() as f64;
@@ -311,8 +374,21 @@ fn inspect_workspace_generated_parts_inner(
     }
 
     let ready = missing_parts.is_empty() && stale_parts.is_empty() && size_mismatches.is_empty();
+    let fingerprints_changed = ready
+        && read_extracted_generated_part_fingerprints(&root).is_none_or(|previous| {
+            expected_parts
+                .iter()
+                .any(|part| previous.get(part) != current_fingerprints.get(part))
+        });
+    let downstream_stale = project.current_step > 3 && fingerprints_changed;
     if ready {
-        update_project_step(&root, 3)?;
+        if downstream_stale {
+            // 完了済み案件の生成7枚が差し替わった、または旧manifestで同一性を
+            // 証明できない場合は、残存する抽出/RIFEを現行成果物として扱わない。
+            regress_project_step(&root, 3)?;
+        } else {
+            update_project_step(&root, 3)?;
+        }
     }
 
     Ok(WorkspaceGeneratedPartsStatus {
@@ -328,7 +404,22 @@ fn inspect_workspace_generated_parts_inner(
         missing_parts,
         stale_parts,
         size_mismatches,
+        downstream_stale,
     })
+}
+
+fn read_extracted_generated_part_fingerprints(root: &Path) -> Option<BTreeMap<String, String>> {
+    let manifest_path = root
+        .join(SEE_THROUGH_DIR)
+        .join("extracted_parts")
+        .join("manifest.json");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(manifest_path).ok()?).ok()?;
+    let fingerprints = manifest.get("generatedPartFingerprints")?.as_object()?;
+    fingerprints
+        .iter()
+        .map(|(part, value)| Some((part.clone(), value.as_str()?.to_string())))
+        .collect()
 }
 
 fn update_expression_workspace_step_inner(
@@ -342,11 +433,52 @@ fn update_expression_workspace_step_inner(
     workspace_result(root, project)
 }
 
+fn regress_expression_workspace_step_inner(
+    work_path: &str,
+    current_step: u32,
+) -> Result<ExpressionWorkspaceResult, AppError> {
+    let root = PathBuf::from(work_path);
+    ensure_workspace_dirs(&root)?;
+    regress_project_step(&root, current_step)?;
+    let project = read_project(&root.join(PROJECT_FILE))?;
+    workspace_result(root, project)
+}
+
 fn update_project_step(root: &Path, current_step: u32) -> Result<(), AppError> {
     let mut project = read_or_create_project(root)?;
     project.current_step = project.current_step.max(current_step.clamp(1, 7));
     project.updated_at = unix_time();
     write_project(&root.join(PROJECT_FILE), &project)
+}
+
+fn regress_project_step(root: &Path, current_step: u32) -> Result<(), AppError> {
+    let mut project = read_project(&root.join(PROJECT_FILE))?;
+    project.current_step = project.current_step.min(current_step.clamp(1, 7));
+    project.updated_at = unix_time();
+    write_project(&root.join(PROJECT_FILE), &project)
+}
+
+/// 現行ワークスペースの下流成果物を、画像を書き換える前にfail-safeで無効化する。
+/// `project.json`を持たない旧単体ジョブは従来どおり処理できるよう何もしない。
+/// ファイルが存在するのに壊れている場合は、古い成果物を有効なまま上書きしないよう
+/// 読み取りエラーをそのまま返す。
+pub(crate) fn invalidate_workspace_before_edit(
+    root: &Path,
+    checkpoint: u32,
+) -> Result<(), AppError> {
+    if !root.join(PROJECT_FILE).is_file() {
+        return Ok(());
+    }
+    regress_project_step(root, checkpoint)
+}
+
+/// 画像更新をすべて完了したあとだけ、現行ワークスペースを次工程へ進める。
+/// 旧単体ジョブには`project.json`がないため従来互換のnoopとする。
+pub(crate) fn complete_workspace_edit(root: &Path, next_step: u32) -> Result<(), AppError> {
+    if !root.join(PROJECT_FILE).is_file() {
+        return Ok(());
+    }
+    update_project_step(root, next_step)
 }
 
 fn ensure_workspace_dirs(root: &Path) -> Result<(), AppError> {
@@ -636,6 +768,87 @@ mod tests {
     }
 
     #[test]
+    fn preparing_request_removes_stale_reference_and_regresses_completed_workspace() {
+        let root = unique_temp_dir("pachipakugen_workspace_reference_cleanup");
+        let source = root.join("input.png");
+        let reference = root.join("reference-input.png");
+        fs::create_dir_all(&root).unwrap();
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([1, 2, 3, 255]))
+            .save(&source)
+            .unwrap();
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([4, 5, 6, 255]))
+            .save(&reference)
+            .unwrap();
+        create_expression_workspace_inner(&root.to_string_lossy()).unwrap();
+
+        let request = |reference_image_path| PrepareWorkspaceCodexRequest {
+            work_path: root.to_string_lossy().into_owned(),
+            source_image_path: source.to_string_lossy().into_owned(),
+            reference_image_path,
+            prompt: String::new(),
+            mouth_corner: WorkspaceMouthCornerMode::Flat,
+            mouth_size: "normal".into(),
+        };
+        prepare_workspace_codex_request_inner(request(Some(
+            reference.to_string_lossy().into_owned(),
+        )))
+        .unwrap();
+        let copied_reference = root.join(CODEX_REQUEST_DIR).join("reference.png");
+        assert!(copied_reference.is_file());
+
+        update_expression_workspace_step_inner(&root.to_string_lossy(), 7).unwrap();
+        prepare_workspace_codex_request_inner(request(None)).unwrap();
+        assert!(!copied_reference.exists());
+        assert_eq!(
+            read_project(&root.join(PROJECT_FILE)).unwrap().current_step,
+            2
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalid_reference_fails_before_files_or_checkpoint_change() {
+        let root = unique_temp_dir("pachipakugen_workspace_reference_preflight");
+        let source = root.join("input.png");
+        fs::create_dir_all(&root).unwrap();
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([1, 2, 3, 255]))
+            .save(&source)
+            .unwrap();
+        create_expression_workspace_inner(&root.to_string_lossy()).unwrap();
+        prepare_workspace_codex_request_inner(PrepareWorkspaceCodexRequest {
+            work_path: root.to_string_lossy().into_owned(),
+            source_image_path: source.to_string_lossy().into_owned(),
+            reference_image_path: None,
+            prompt: String::new(),
+            mouth_corner: WorkspaceMouthCornerMode::Flat,
+            mouth_size: "normal".into(),
+        })
+        .unwrap();
+        update_expression_workspace_step_inner(&root.to_string_lossy(), 7).unwrap();
+        let copied_source = root.join(CODEX_REQUEST_DIR).join("source.png");
+        let original_copy = fs::read(&copied_source).unwrap();
+
+        let error = prepare_workspace_codex_request_inner(PrepareWorkspaceCodexRequest {
+            work_path: root.to_string_lossy().into_owned(),
+            source_image_path: source.to_string_lossy().into_owned(),
+            reference_image_path: Some(root.join("missing.png").to_string_lossy().into_owned()),
+            prompt: "changed".into(),
+            mouth_corner: WorkspaceMouthCornerMode::Up,
+            mouth_size: "normal".into(),
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("参照画像が見つかりません"));
+        assert_eq!(
+            read_project(&root.join(PROJECT_FILE)).unwrap().current_step,
+            7
+        );
+        assert_eq!(fs::read(copied_source).unwrap(), original_copy);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn updating_request_marks_older_generated_parts_as_stale() {
         let root = unique_temp_dir("pachipakugen_workspace_stale_parts");
         let source = root.join("input.png");
@@ -793,6 +1006,167 @@ mod tests {
         assert_eq!(updated.project.current_step, 7);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn regress_workspace_step_is_explicit_and_never_advances() {
+        let root = unique_temp_dir("pachipakugen_workspace_regress_step");
+        create_expression_workspace_inner(&root.to_string_lossy()).unwrap();
+
+        let advanced = update_expression_workspace_step_inner(&root.to_string_lossy(), 7).unwrap();
+        assert_eq!(advanced.project.current_step, 7);
+
+        let regressed =
+            regress_expression_workspace_step_inner(&root.to_string_lossy(), 5).unwrap();
+        assert_eq!(regressed.project.current_step, 5);
+
+        // 巻き戻し専用経路を誤って大きい値で呼んでも工程を進めない。
+        let unchanged =
+            regress_expression_workspace_step_inner(&root.to_string_lossy(), 7).unwrap();
+        assert_eq!(unchanged.project.current_step, 5);
+
+        // 通常進行は従来どおり前進専用。
+        let advanced = update_expression_workspace_step_inner(&root.to_string_lossy(), 6).unwrap();
+        assert_eq!(advanced.project.current_step, 6);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn invalidation_is_fail_safe_for_workspaces_and_noop_for_legacy_jobs() {
+        let root = unique_temp_dir("pachipakugen_workspace_invalidate_before_edit");
+        create_expression_workspace_inner(&root.to_string_lossy()).unwrap();
+        update_expression_workspace_step_inner(&root.to_string_lossy(), 7).unwrap();
+
+        invalidate_workspace_before_edit(&root, 4).unwrap();
+        assert_eq!(
+            read_project(&root.join(PROJECT_FILE)).unwrap().current_step,
+            4
+        );
+        complete_workspace_edit(&root, 5).unwrap();
+        assert_eq!(
+            read_project(&root.join(PROJECT_FILE)).unwrap().current_step,
+            5
+        );
+        invalidate_workspace_before_edit(&root, 6).unwrap();
+        assert_eq!(
+            read_project(&root.join(PROJECT_FILE)).unwrap().current_step,
+            5
+        );
+
+        let legacy = unique_temp_dir("pachipakugen_legacy_job_invalidate_noop");
+        fs::create_dir_all(&legacy).unwrap();
+        invalidate_workspace_before_edit(&legacy, 4).unwrap();
+        complete_workspace_edit(&legacy, 5).unwrap();
+        assert!(!legacy.join(PROJECT_FILE).exists());
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(legacy);
+    }
+
+    #[test]
+    fn inspecting_changed_generated_pixels_regresses_completed_workspace() {
+        let root = workspace_with_generated_fingerprint_manifest(
+            "pachipakugen_workspace_generated_fingerprint_change",
+        );
+
+        let unchanged = inspect_workspace_generated_parts_inner(&root.to_string_lossy()).unwrap();
+        assert!(unchanged.ready);
+        assert!(!unchanged.downstream_stale);
+        assert_eq!(
+            read_project(&root.join(PROJECT_FILE)).unwrap().current_step,
+            7
+        );
+
+        // ファイルサイズやmtimeではなく画素差で検出できることを確認する。
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([240, 10, 20, 255]))
+            .save(root.join(GENERATED_PARTS_DIR).join("mouth-a.png"))
+            .unwrap();
+        let changed = inspect_workspace_generated_parts_inner(&root.to_string_lossy()).unwrap();
+        assert!(changed.ready);
+        assert!(changed.downstream_stale);
+        assert_eq!(
+            read_project(&root.join(PROJECT_FILE)).unwrap().current_step,
+            3
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inspecting_legacy_extraction_manifest_regresses_completed_workspace() {
+        let root = workspace_with_generated_fingerprint_manifest(
+            "pachipakugen_workspace_legacy_extraction_manifest",
+        );
+        fs::write(
+            root.join(SEE_THROUGH_DIR)
+                .join("extracted_parts")
+                .join("manifest.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "formatVersion": 2,
+                "alignment": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let status = inspect_workspace_generated_parts_inner(&root.to_string_lossy()).unwrap();
+        assert!(status.ready);
+        assert!(status.downstream_stale);
+        assert_eq!(
+            read_project(&root.join(PROJECT_FILE)).unwrap().current_step,
+            3
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn workspace_with_generated_fingerprint_manifest(prefix: &str) -> PathBuf {
+        let root = unique_temp_dir(prefix);
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("input.png");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([1, 2, 3, 255]))
+            .save(&source)
+            .unwrap();
+        create_expression_workspace_inner(&root.to_string_lossy()).unwrap();
+        prepare_workspace_codex_request_inner(PrepareWorkspaceCodexRequest {
+            work_path: root.to_string_lossy().into_owned(),
+            source_image_path: source.to_string_lossy().into_owned(),
+            reference_image_path: None,
+            prompt: String::new(),
+            mouth_corner: WorkspaceMouthCornerMode::Flat,
+            mouth_size: "normal".into(),
+        })
+        .unwrap();
+
+        let mut fingerprints = serde_json::Map::new();
+        for (index, part) in WORKSPACE_TARGETS.iter().enumerate() {
+            let image = DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                8,
+                8,
+                image::Rgba([index as u8 + 10, 20, 30, 255]),
+            ));
+            image
+                .save(root.join(GENERATED_PARTS_DIR).join(format!("{part}.png")))
+                .unwrap();
+            fingerprints.insert(
+                part.to_string(),
+                serde_json::json!(visual_image_fingerprint(&image)),
+            );
+        }
+        let extracted_dir = root.join(SEE_THROUGH_DIR).join("extracted_parts");
+        fs::create_dir_all(&extracted_dir).unwrap();
+        fs::write(
+            extracted_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "formatVersion": 3,
+                "generatedPartFingerprints": fingerprints,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        update_expression_workspace_step_inner(&root.to_string_lossy(), 7).unwrap();
+        root
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {

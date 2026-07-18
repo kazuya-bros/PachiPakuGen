@@ -312,126 +312,194 @@ export function alphaBBox(image: HTMLImageElement): AlphaBBox {
   return box;
 }
 
-// ===== 房ごと髪物理（B3強化。852話氏 Anime2.5DRig rigger.js の毛先輪郭ピーク検出を参考） =====
+// ===== 房ごと髪物理 =====
 
 export interface HairStrand {
-  /** 房のx範囲（画像座標px） */
-  x0: number;
-  x1: number;
+  /** 毛先輪郭のピーク位置（画像座標px） */
+  x: number;
+  /** ピーク列にある最上端・最下端の不透明画素（画像座標px） */
+  rootY: number;
+  tipY: number;
 }
 
-const strandCache = new WeakMap<HTMLImageElement, HairStrand[]>();
-const strandCenterCache = new WeakMap<HTMLImageElement, number[]>();
+export interface HairStrandSpringState {
+  stiff: SpringState;
+  soft: SpringState;
+  phase: number;
+}
+
+export interface HairStrandSpringOutput {
+  stiffDx: number;
+  softDx: number;
+}
+
+const strandCache = new WeakMap<HTMLImageElement, Map<number, HairStrand[]>>();
+
+export function createHairStrandSpring(phase = 0): HairStrandSpringState {
+  return {
+    stiff: { x: 0, v: 0 },
+    soft: { x: 0, v: 0 },
+    phase,
+  };
+}
 
 /**
- * 852話式の房中心線検出: 毛先輪郭（各列の最下端不透明y）の局所ピーク列を返す。
- * x範囲での分割（ハードスライス）ではなく、描画側でガウシアン重みブレンドに使う。
+ * Anime2.5DRigの房単位の二重バネを変更・適応。
+ * Upstream: 852wa/Anime2.5DRig@d4882586 (MIT, Copyright 2026 hakoniwa)
+ * Modified for PachiPakuGen: 透過PNG入力、変位制限、Canvas描画へ適合。
+ * 1房を硬いバネと柔らかいバネの2本で追従させる。
+ */
+export function stepHairStrandSpring(
+  state: HairStrandSpringState,
+  target: number,
+  dt: number,
+  stiffK = 70,
+  stiffC = 9,
+  maxDisplacement = Number.POSITIVE_INFINITY,
+): HairStrandSpringOutput {
+  const safeK = Math.max(0.001, stiffK);
+  const safeC = Math.max(0, stiffC);
+  const safeLimit = Number.isFinite(maxDisplacement)
+    ? Math.max(0, maxDisplacement)
+    : Number.POSITIVE_INFINITY;
+  springStep(state.stiff, target, safeK, safeC, dt);
+  springStep(state.soft, target, safeK * (16 / 70), safeC * (1.3 / 9), dt);
+  return {
+    stiffDx: clamp(-(state.stiff.x - target) * 2.2, -safeLimit, safeLimit),
+    softDx: clamp(-(state.soft.x - target) * 3, -safeLimit, safeLimit),
+  };
+}
+
+/**
+ * 毛先輪郭（各列の最下端不透明y）の局所ピーク列を返す。
+ * 谷で区切った領域の中央ではなく、実際の輪郭ピークxを房中心として使う。
  * 検出できない場合は空配列（=一枚チェーンへフォールバック）。
  */
 export function detectHairStrandCenters(image: HTMLImageElement, maxStrands = 6): number[] {
-  const cached = strandCenterCache.get(image);
-  if (cached) return cached;
   const strands = detectHairStrands(image, maxStrands);
-  const bbox = alphaBBox(image);
-  // detectHairStrands はピーク間の谷で区切った範囲を返すので、各範囲の中心を房中心とみなす。
-  // 1房（=分割不能）のときは空を返してフォールバックさせる
-  const centers = strands.length > 1 && bbox.w >= 16
-    ? strands.map(strand => (strand.x0 + strand.x1) / 2)
-    : [];
-  strandCenterCache.set(image, centers);
-  return centers;
+  return strands.length > 1 ? strands.map(strand => strand.x) : [];
 }
 
 /**
- * 髪画像の下端輪郭（各列で最も下の不透明ピクセル）の局所ピークから房を検出する。
- * ピーク=毛先が最も下へ伸びる列、境界=隣接ピーク間の谷。最大 maxStrands 房。
- * 検出できない場合は画像全幅の1房を返す（従来のB3一枚チェーンと等価）。
+ * Anime2.5DRig `detectStrands` をTypeScriptへ変更・適応。
+ * Upstream: 852wa/Anime2.5DRig@d4882586 (MIT, Copyright 2026 hakoniwa)
+ * Modified for PachiPakuGen: alpha配列入力、キャッシュ、描画側との接続を変更。
+ * 輪郭を41pxで平滑化し、突出量と最小距離でピークを絞る。
  */
+export function detectHairStrandsFromAlpha(
+  alpha: ArrayLike<number>,
+  width: number,
+  height: number,
+  maxStrands = 6,
+): HairStrand[] {
+  if (width < 16 || height < 1 || maxStrands < 1 || alpha.length < width * height) return [];
+
+  const top = new Int32Array(width).fill(-1);
+  const bottom = new Float32Array(width);
+  let minX = width;
+  let maxX = -1;
+  for (let x = 0; x < width; x += 1) {
+    for (let y = 0; y < height; y += 1) {
+      if (alpha[y * width + x] > 16) {
+        top[x] = y;
+        break;
+      }
+    }
+    if (top[x] < 0) continue;
+    for (let y = height - 1; y >= 0; y -= 1) {
+      if (alpha[y * width + x] > 16) {
+        bottom[x] = y;
+        break;
+      }
+    }
+    minX = Math.min(minX, x);
+    maxX = Math.max(maxX, x);
+  }
+  if (maxX < 0) return [];
+
+  // 固定幅のbox smooth。端も同じ41で割ることで輪郭外を0として扱う。
+  const kernelSize = 41;
+  const halfKernel = 20;
+  const prefix = new Float32Array(width + 1);
+  for (let x = 0; x < width; x += 1) prefix[x + 1] = prefix[x] + bottom[x];
+  const smoothed = new Float32Array(width);
+  for (let x = 0; x < width; x += 1) {
+    const from = Math.max(0, x - halfKernel);
+    const to = Math.min(width - 1, x + halfKernel);
+    smoothed[x] = (prefix[to + 1] - prefix[from]) / kernelSize;
+  }
+
+  const minSeparation = Math.max(30, Math.round((maxX - minX + 1) / (maxStrands * 1.6)));
+  const candidates: Array<{ x: number; prominence: number }> = [];
+  for (let x = 1; x < width - 1; x += 1) {
+    if (!(smoothed[x] > smoothed[x - 1] && smoothed[x] >= smoothed[x + 1])) continue;
+    let leftMin = smoothed[x];
+    let rightMin = smoothed[x];
+    for (let j = x - 1; j >= 0; j -= 1) {
+      if (smoothed[j] > smoothed[x]) break;
+      leftMin = Math.min(leftMin, smoothed[j]);
+    }
+    for (let j = x + 1; j < width; j += 1) {
+      if (smoothed[j] > smoothed[x]) break;
+      rightMin = Math.min(rightMin, smoothed[j]);
+    }
+    const prominence = smoothed[x] - Math.max(leftMin, rightMin);
+    if (prominence >= 10 && top[x] >= 0) candidates.push({ x, prominence });
+  }
+
+  candidates.sort((a, b) => b.prominence - a.prominence);
+  const selected: number[] = [];
+  for (const candidate of candidates) {
+    if (selected.every(x => Math.abs(x - candidate.x) >= minSeparation)) selected.push(candidate.x);
+    if (selected.length >= maxStrands) break;
+  }
+
+  // 輪郭が滑らかでピークが足りない画像にも房物理を適用できるよう、内容のある列で補完する。
+  const margin = Math.min(30, Math.max(0, Math.floor((maxX - minX) / 4)));
+  for (let guard = 0; selected.length < maxStrands && guard < 50; guard += 1) {
+    let best = -1;
+    let bestDistance = -1;
+    for (let sample = 0; sample < 40; sample += 1) {
+      const start = minX + margin;
+      const end = maxX - margin;
+      const x = Math.round(start + ((end - start) * sample) / 39);
+      if (x < 0 || x >= width || top[x] < 0 || selected.includes(x)) continue;
+      const distance = selected.length === 0
+        ? Number.MAX_SAFE_INTEGER - sample
+        : Math.min(...selected.map(existing => Math.abs(x - existing)));
+      if (distance > bestDistance) {
+        bestDistance = distance;
+        best = x;
+      }
+    }
+    if (best < 0) break;
+    selected.push(best);
+  }
+
+  selected.sort((a, b) => a - b);
+  return selected
+    .filter(x => top[x] >= 0)
+    .map(x => ({ x, rootY: top[x], tipY: bottom[x] }));
+}
+
 export function detectHairStrands(image: HTMLImageElement, maxStrands = 6): HairStrand[] {
-  const cached = strandCache.get(image);
+  const limit = Math.max(1, Math.floor(maxStrands));
+  const cachedByLimit = strandCache.get(image);
+  const cached = cachedByLimit?.get(limit);
   if (cached) return cached;
 
-  const bbox = alphaBBox(image);
-  const whole: HairStrand[] = [{ x0: bbox.x, x1: bbox.x + bbox.w - 1 }];
   const canvas = document.createElement("canvas");
   canvas.width = image.naturalWidth;
   canvas.height = image.naturalHeight;
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  if (!ctx || bbox.w < 16) {
-    strandCache.set(image, whole);
-    return whole;
-  }
+  if (!ctx || canvas.width < 16 || canvas.height < 1) return [];
   ctx.drawImage(image, 0, 0);
-  const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-
-  // 各列の毛先深さ（最下端の不透明y）。不透明ピクセルの無い列は -1
-  const depth = new Float32Array(bbox.w).fill(-1);
-  for (let ix = 0; ix < bbox.w; ix += 1) {
-    const x = bbox.x + ix;
-    for (let y = bbox.y + bbox.h - 1; y >= bbox.y; y -= 1) {
-      if (data[(y * canvas.width + x) * 4 + 3] > 8) {
-        depth[ix] = y;
-        break;
-      }
-    }
-  }
-
-  // 平滑化（箱型フィルタ）で輪郭ノイズを除去
-  const radius = Math.max(2, Math.round(bbox.w / 64));
-  const smoothed = new Float32Array(bbox.w);
-  for (let ix = 0; ix < bbox.w; ix += 1) {
-    let sum = 0;
-    let count = 0;
-    for (let k = -radius; k <= radius; k += 1) {
-      const j = ix + k;
-      if (j >= 0 && j < bbox.w && depth[j] >= 0) {
-        sum += depth[j];
-        count += 1;
-      }
-    }
-    smoothed[ix] = count > 0 ? sum / count : -1;
-  }
-
-  // 局所ピーク検出（毛先が下= y値が大きい方向の極大）。最小間隔 = 幅/12
-  const minSeparation = Math.max(4, Math.round(bbox.w / 12));
-  const peaks: number[] = [];
-  for (let ix = 1; ix < bbox.w - 1; ix += 1) {
-    if (smoothed[ix] < 0) continue;
-    if (smoothed[ix] >= smoothed[ix - 1] && smoothed[ix] > smoothed[ix + 1]) {
-      if (peaks.length > 0 && ix - peaks[peaks.length - 1] < minSeparation) {
-        // 近すぎるピークは深い方を残す
-        if (smoothed[ix] > smoothed[peaks[peaks.length - 1]]) peaks[peaks.length - 1] = ix;
-      } else {
-        peaks.push(ix);
-      }
-    }
-  }
-  // 深い順に maxStrands 個へ絞り、位置順へ戻す
-  peaks.sort((a, b) => smoothed[b] - smoothed[a]);
-  const selected = peaks.slice(0, maxStrands).sort((a, b) => a - b);
-  if (selected.length < 2) {
-    strandCache.set(image, whole);
-    return whole;
-  }
-
-  // 房境界 = 隣接ピーク間で輪郭が最も浅い（yが小さい）列
-  const strands: HairStrand[] = [];
-  let start = 0;
-  for (let i = 0; i < selected.length - 1; i += 1) {
-    let valley = selected[i];
-    let valleyDepth = Number.POSITIVE_INFINITY;
-    for (let ix = selected[i]; ix <= selected[i + 1]; ix += 1) {
-      const value = smoothed[ix] < 0 ? Number.POSITIVE_INFINITY : smoothed[ix];
-      if (value < valleyDepth) {
-        valleyDepth = value;
-        valley = ix;
-      }
-    }
-    strands.push({ x0: bbox.x + start, x1: bbox.x + valley });
-    start = valley + 1;
-  }
-  strands.push({ x0: bbox.x + start, x1: bbox.x + bbox.w - 1 });
-
-  strandCache.set(image, strands);
+  const rgba = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+  const alpha = new Uint8Array(canvas.width * canvas.height);
+  for (let i = 0; i < alpha.length; i += 1) alpha[i] = rgba[i * 4 + 3];
+  const strands = detectHairStrandsFromAlpha(alpha, canvas.width, canvas.height, limit);
+  const nextCache = cachedByLimit ?? new Map<number, HairStrand[]>();
+  nextCache.set(limit, strands);
+  strandCache.set(image, nextCache);
   return strands;
 }

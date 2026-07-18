@@ -47,7 +47,8 @@ pub fn rife_interpolate(
         }
     }
 
-    // Timestep as (1) tensor. TensorStack/RIFE expects a 1D scalar batch input.
+    // Practical-RIFE v4.9.2から監査済み手順で再出力したモデルは、
+    // timestepを1要素の1Dテンソルとして受け取る。
     let timestep = Array1::<f32>::from_elem(1, ratio);
 
     // Create TensorRef from arrays

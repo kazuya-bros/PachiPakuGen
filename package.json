@@ -1,13 +1,29 @@
 {
   "name": "pachipakugen-app",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.4.0",
+  "description": "Create layered facial-expression and motion assets for SpriTalk from a single illustration.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kazuya-bros/PachiPakuGen.git"
+  },
+  "homepage": "https://github.com/kazuya-bros/PachiPakuGen#readme",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test:blink": "node --test --experimental-strip-types scripts/blink-state.test.mjs",
+    "test:hair": "node --test --experimental-strip-types scripts/hair-strands.test.mjs",
+    "test:chest": "node --test --experimental-strip-types scripts/chest-warp.test.mjs",
+    "test:eyes": "node --test --experimental-strip-types scripts/eye-effects.test.mjs",
+    "test:ears": "node --test --experimental-strip-types scripts/ear-twitch.test.mjs",
+    "test:templates": "node --test --experimental-strip-types scripts/motion-templates.test.mjs",
+    "test:workspace": "node --test --experimental-strip-types scripts/workspace-checkpoint.test.mjs",
+    "licenses:npm": "node scripts/generate_npm_licenses.mjs",
+    "licenses:cargo": "node scripts/generate_cargo_licenses.mjs",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "node scripts/run-tauri.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

@@ -3,11 +3,16 @@ use crate::commands::parts::{
     MappingPreviewResult, ProgressPayload, SlotLoadResult,
 };
 use crate::commands::see_through;
+use crate::commands::workspace::{
+    complete_workspace_edit, invalidate_workspace_before_edit, visual_image_fingerprint,
+    WorkspaceProject,
+};
 use crate::error::AppError;
 use crate::inference::neck_extract;
 use crate::inference::rife::rife_interpolate;
 use crate::inference::session::{create_session, resolve_model_path};
 use crate::processing::composite::{extract_part_from_body_composite, premultiply_onto_body};
+use crate::processing::image_utils;
 use crate::state::AppState;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use image::{DynamicImage, GrayImage, ImageFormat, RgbaImage};
@@ -23,6 +28,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
 const EYE_LAYER_NAMES: &[&str] = &["eyewhite", "irides", "eyelash", "eyebrow"];
+const EYE_ANIMATION_LAYER_NAMES: &[&str] = &["eyewhite", "irides", "eyelash"];
 const KEYRING_SERVICE: &str = "com.kazuya.pachipakugen";
 const OPENAI_CREDENTIAL: &str = "openai-api-key";
 const GEMINI_CREDENTIAL: &str = "gemini-api-key";
@@ -42,6 +48,18 @@ const GENERATED_PART_TARGETS: &[&str] = &[
     "mouth-e",
     "mouth-o",
     "eyes-closed",
+];
+// STEP5ではsource由来のeyes-openも位置調整できる。Codex生成の必須成果物には含めないため、
+// GENERATED_PART_TARGETSとは分けて管理する。
+const ADJUSTABLE_PART_TARGETS: &[&str] = &[
+    "eyes-open",
+    "eyes-closed",
+    "mouth-closed",
+    "mouth-a",
+    "mouth-i",
+    "mouth-u",
+    "mouth-e",
+    "mouth-o",
 ];
 
 #[derive(Clone, Deserialize)]
@@ -106,7 +124,7 @@ pub struct InspectCodexGeneratedPartsResult {
     pub ready: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct PartAdjustment {
     pub offset_x: i32,
@@ -153,22 +171,6 @@ pub struct PreviewCodexCompositeResult {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CodexRifeFramePreviewItem {
-    pub part: String,
-    pub frame_index: u32,
-    pub frame_count: u32,
-    pub preview: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PreviewCodexRifeResult {
-    pub base_preview: String,
-    pub previews: Vec<CodexRifeFramePreviewItem>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct GenerateCodexRifeOutputResult {
     pub output_path: String,
     pub directories: Vec<String>,
@@ -194,7 +196,23 @@ pub struct AdjustCodexExtractedPartsRequest {
     pub part: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexPartAdjustmentUpdate {
+    pub part: String,
+    pub offset_x: i32,
+    pub offset_y: i32,
+    pub scale_percent: u32,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdjustCodexExtractedPartsBatchRequest {
+    pub job_path: String,
+    pub adjustments: Vec<CodexPartAdjustmentUpdate>,
+}
+
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdjustCodexExtractedPartsResult {
     pub extracted_parts_path: String,
@@ -320,15 +338,6 @@ pub async fn preview_codex_composite(
 }
 
 #[tauri::command]
-pub async fn preview_codex_rife_outputs(
-    job_path: String,
-) -> Result<PreviewCodexRifeResult, AppError> {
-    tauri::async_runtime::spawn_blocking(move || preview_codex_rife_outputs_inner(&job_path))
-        .await
-        .map_err(|error| AppError::General(format!("Task join error: {error}")))?
-}
-
-#[tauri::command]
 pub async fn generate_codex_rife_outputs(
     app: AppHandle,
     job_path: String,
@@ -353,10 +362,10 @@ pub async fn save_codex_base_parts(
 }
 
 #[tauri::command]
-pub async fn adjust_codex_extracted_parts(
-    request: AdjustCodexExtractedPartsRequest,
+pub async fn adjust_codex_extracted_parts_batch(
+    request: AdjustCodexExtractedPartsBatchRequest,
 ) -> Result<AdjustCodexExtractedPartsResult, AppError> {
-    tauri::async_runtime::spawn_blocking(move || adjust_codex_extracted_parts_inner(request))
+    tauri::async_runtime::spawn_blocking(move || adjust_codex_extracted_parts_batch_inner(request))
         .await
         .map_err(|error| AppError::General(format!("Task join error: {error}")))?
 }
@@ -489,7 +498,7 @@ fn load_codex_expression_job_inner(
     let generated_parts = inspect_codex_generated_parts_inner(job_path)?;
     let expected_parts = generated_parts.expected_parts.clone();
     let extracted_parts = read_extracted_parts_result(&job_dir);
-    let rife_output = read_rife_output_result(&job_dir);
+    let rife_output = read_current_rife_output_result(&job_dir);
     let reference_path = job_dir
         .join("reference.png")
         .is_file()
@@ -596,6 +605,22 @@ fn read_rife_output_result(job_dir: &Path) -> Option<GenerateCodexRifeOutputResu
     })
 }
 
+/// 旧形式の単体Codexジョブにはproject.jsonが無いため従来どおり物理成果物を読む。
+/// 現行ワークスペースではSTEP4/5再編集時にチェックポイントを5/6へ戻すので、
+/// 物理的に残した旧RIFE出力を「つづきから」で現行成果物として復活させない。
+fn read_current_rife_output_result(job_dir: &Path) -> Option<GenerateCodexRifeOutputResult> {
+    let project_path = job_dir.join("project.json");
+    if project_path.is_file() {
+        let project = fs::read(&project_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<WorkspaceProject>(&bytes).ok())?;
+        if project.current_step < 7 {
+            return None;
+        }
+    }
+    read_rife_output_result(job_dir)
+}
+
 fn export_current_base_parts(app: &AppHandle, output_dir: &Path) -> Result<(), AppError> {
     let Some(parts) = current_base_parts(app) else {
         return Err(AppError::General(
@@ -619,9 +644,18 @@ fn save_codex_base_parts_inner(
     let parts = current_base_parts(app)
         .ok_or_else(|| AppError::General("保存できる素体パーツがまだありません".into()))?;
     let output_dir = base_parts_dir(&job_dir);
+    let extracted_dir = extracted_parts_dir(&job_dir);
+    // 完了済み案件の再編集では、最初の画像書込より先にSTEP4へ戻す。
+    // 以降で保存に失敗・中断しても旧RIFEを現行成果物として復活させない。
+    invalidate_workspace_before_edit(&job_dir, 4)?;
     save_base_parts(&parts, &output_dir)?;
     save_layer_draw_order(app, &output_dir)?;
-    save_eyes_open_extracted_part(&job_dir, &parts, &extracted_parts_dir(&job_dir))?;
+    save_eyes_open_extracted_part(&job_dir, &parts, &extracted_dir)?;
+    let existing_output = rife_output_dir(&job_dir);
+    if existing_output.is_dir() {
+        sync_dynamic_eye_assets(&output_dir, &extracted_dir, &existing_output)?;
+    }
+    complete_workspace_edit(&job_dir, 5)?;
     let mut saved_parts = parts.keys().cloned().collect::<Vec<_>>();
     saved_parts.sort();
     Ok(SaveCodexBasePartsResult {
@@ -676,8 +710,16 @@ fn layer_order_document(group_order: &[String]) -> serde_json::Value {
     serde_json::Value::Object(document)
 }
 
+#[cfg(test)]
 fn adjust_codex_extracted_parts_inner(
     request: AdjustCodexExtractedPartsRequest,
+) -> Result<AdjustCodexExtractedPartsResult, AppError> {
+    adjust_codex_extracted_parts_core(request, true)
+}
+
+fn adjust_codex_extracted_parts_core(
+    request: AdjustCodexExtractedPartsRequest,
+    manage_workspace_checkpoint: bool,
 ) -> Result<AdjustCodexExtractedPartsResult, AppError> {
     if !(50..=150).contains(&request.scale_percent) {
         return Err(AppError::General(
@@ -697,23 +739,35 @@ fn adjust_codex_extracted_parts_inner(
             "抽出済みパーツが見つかりません。先にSee-Through一括分解を実行してください".into(),
         ));
     }
-    let originals_dir = extracted_dir.join("original_extracted_parts");
-    fs::create_dir_all(&originals_dir)?;
-    // eyes-open は素体の目そのもの（平常時の目）なので調整対象外。閉じ目・口だけが差分
     let target_parts: Vec<&str> = match request.part.as_deref() {
         Some(part) => {
-            if !GENERATED_PART_TARGETS.contains(&part) {
-                return Err(AppError::General(format!(
-                    "調整対象外のパーツです: {part}"
-                )));
+            if !ADJUSTABLE_PART_TARGETS.contains(&part) {
+                return Err(AppError::General(format!("調整対象外のパーツです: {part}")));
             }
             vec![part]
         }
-        None => GENERATED_PART_TARGETS.to_vec(),
+        None => ADJUSTABLE_PART_TARGETS.to_vec(),
     };
+    if !target_parts
+        .iter()
+        .any(|part| extracted_dir.join(format!("{part}.png")).is_file())
+    {
+        return Err(AppError::General(
+            "調整対象の差分パーツが見つかりません".into(),
+        ));
+    }
+    // 位置調整ファイルへ触れる前にSTEP5へ戻し、クラッシュ時も古いRIFEをfail-safeで無効化する。
+    if manage_workspace_checkpoint {
+        invalidate_workspace_before_edit(&job_dir, 5)?;
+    }
+    let originals_dir = extracted_dir.join("original_extracted_parts");
+    fs::create_dir_all(&originals_dir)?;
+    let updates_eyes_open = target_parts.contains(&"eyes-open");
     // パーツ個別の調整値を保持（v2）。一括適用時は全パーツを同値で上書きする
     let mut part_adjustments = read_part_adjustments(&extracted_dir);
     let mut adjusted_parts = Vec::new();
+    let reset_to_original =
+        request.offset_x == 0 && request.offset_y == 0 && request.scale_percent == 100;
     for part in target_parts {
         let current_path = extracted_dir.join(format!("{part}.png"));
         if !current_path.is_file() {
@@ -723,24 +777,36 @@ fn adjust_codex_extracted_parts_inner(
         if !original_path.is_file() {
             fs::copy(&current_path, &original_path)?;
         }
-        let original = image::open(&original_path)?;
-        let adjusted = transform_extracted_part(
-            &original,
-            request.offset_x,
-            request.offset_y,
-            request.scale_percent,
-        );
-        adjusted.save(&current_path)?;
-        part_adjustments.insert(
-            part.to_string(),
-            json!({
-                "offsetX": request.offset_x,
-                "offsetY": request.offset_y,
-                "scalePercent": request.scale_percent,
-            }),
-        );
+        if reset_to_original {
+            fs::copy(&original_path, &current_path)?;
+            part_adjustments.remove(part);
+        } else {
+            let original = image::open(&original_path)?;
+            let adjusted = transform_extracted_part(
+                &original,
+                request.offset_x,
+                request.offset_y,
+                request.scale_percent,
+            );
+            adjusted.save(&current_path)?;
+            part_adjustments.insert(
+                part.to_string(),
+                json!({
+                    "offsetX": request.offset_x,
+                    "offsetY": request.offset_y,
+                    "scalePercent": request.scale_percent,
+                }),
+            );
+        }
         adjusted_parts.push(part.to_string());
     }
+    // 旧バージョンが記録した既定値エントリも未調整として整理する。
+    part_adjustments.retain(|_, value| {
+        serde_json::from_value::<PartAdjustment>(value.clone())
+            .map(|adjustment| !is_default_part_adjustment(&adjustment))
+            .unwrap_or(false)
+    });
+    let active_adjusted_parts = part_adjustments.keys().cloned().collect::<Vec<_>>();
     let manifest_path = extracted_dir.join("adjustment.json");
     fs::write(
         manifest_path,
@@ -749,7 +815,7 @@ fn adjust_codex_extracted_parts_inner(
             "offsetX": request.offset_x,
             "offsetY": request.offset_y,
             "scalePercent": request.scale_percent,
-            "adjustedParts": adjusted_parts,
+            "adjustedParts": active_adjusted_parts,
             "parts": serde_json::Value::Object(part_adjustments.clone().into_iter().collect()),
         }))
         .map_err(|error| AppError::General(format!("adjustment.json作成失敗: {error}")))?,
@@ -762,6 +828,15 @@ fn adjust_codex_extracted_parts_inner(
                 .map(|adjustment| (part, adjustment))
         })
         .collect();
+    if updates_eyes_open {
+        let existing_output = rife_output_dir(&job_dir);
+        if existing_output.is_dir() {
+            sync_dynamic_eye_assets(&base_parts_dir(&job_dir), &extracted_dir, &existing_output)?;
+        }
+    }
+    if manage_workspace_checkpoint {
+        complete_workspace_edit(&job_dir, 6)?;
+    }
 
     Ok(AdjustCodexExtractedPartsResult {
         extracted_parts_path: extracted_dir.to_string_lossy().into_owned(),
@@ -771,6 +846,148 @@ fn adjust_codex_extracted_parts_inner(
         scale_percent: request.scale_percent,
         part_adjustments: typed_adjustments,
     })
+}
+
+fn adjust_codex_extracted_parts_batch_inner(
+    request: AdjustCodexExtractedPartsBatchRequest,
+) -> Result<AdjustCodexExtractedPartsResult, AppError> {
+    if request.adjustments.is_empty() {
+        return Err(AppError::General(
+            "保存する差分位置の変更がありません".into(),
+        ));
+    }
+    let job_dir = PathBuf::from(&request.job_path);
+    let extracted_dir = extracted_parts_dir(&job_dir);
+    if !extracted_dir.is_dir() {
+        return Err(AppError::General(
+            "抽出済みパーツが見つかりません。先にSee-Through一括分解を実行してください".into(),
+        ));
+    }
+
+    // すべてを先に検証・退避する。途中の1件が失敗しても、完了ボタン1回を部分コミットにしない。
+    let mut seen = HashSet::new();
+    let mut file_snapshots = Vec::new();
+    for adjustment in &request.adjustments {
+        if !ADJUSTABLE_PART_TARGETS.contains(&adjustment.part.as_str()) {
+            return Err(AppError::General(format!(
+                "調整対象外のパーツです: {}",
+                adjustment.part
+            )));
+        }
+        if !(50..=150).contains(&adjustment.scale_percent) {
+            return Err(AppError::General(
+                "scalePercent は 50 から 150 の範囲で指定してください".into(),
+            ));
+        }
+        if !seen.insert(adjustment.part.clone()) {
+            return Err(AppError::General(format!(
+                "同じパーツが複数指定されています: {}",
+                adjustment.part
+            )));
+        }
+        let path = extracted_dir.join(format!("{}.png", adjustment.part));
+        if !path.is_file() {
+            return Err(AppError::General(format!(
+                "調整対象のパーツが見つかりません: {}",
+                path.display()
+            )));
+        }
+        file_snapshots.push((path.clone(), fs::read(path)?));
+    }
+    let manifest_path = extracted_dir.join("adjustment.json");
+    let manifest_snapshot = match fs::read(&manifest_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let mut output_eye_snapshots = Vec::new();
+    if request
+        .adjustments
+        .iter()
+        .any(|adjustment| adjustment.part == "eyes-open")
+    {
+        let existing_output = rife_output_dir(&job_dir);
+        if existing_output.is_dir() {
+            for file_name in ["eyebrow.png", "eyewhite.png", "irides.png", "highlight.png"] {
+                let path = existing_output.join(file_name);
+                let snapshot = match fs::read(&path) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error.into()),
+                };
+                output_eye_snapshots.push((path, snapshot));
+            }
+        }
+    }
+
+    // 全入力と復元用スナップショットの検証後、最初のPNG書込より先にSTEP5へ戻す。
+    invalidate_workspace_before_edit(&job_dir, 5)?;
+    let mut last_result = None;
+    for adjustment in &request.adjustments {
+        match adjust_codex_extracted_parts_core(
+            AdjustCodexExtractedPartsRequest {
+                job_path: request.job_path.clone(),
+                offset_x: adjustment.offset_x,
+                offset_y: adjustment.offset_y,
+                scale_percent: adjustment.scale_percent,
+                part: Some(adjustment.part.clone()),
+            },
+            false,
+        ) {
+            Ok(result) => last_result = Some(result),
+            Err(error) => {
+                if let Err(rollback_error) = restore_part_adjustment_batch(
+                    &file_snapshots,
+                    &manifest_path,
+                    manifest_snapshot.as_deref(),
+                    &output_eye_snapshots,
+                ) {
+                    return Err(AppError::General(format!(
+                        "差分位置の保存に失敗し、変更前への復元にも失敗しました: {error} / {rollback_error}"
+                    )));
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    let mut result =
+        last_result.ok_or_else(|| AppError::General("差分位置を保存できませんでした".into()))?;
+    complete_workspace_edit(&job_dir, 6)?;
+    result.adjusted_parts = request
+        .adjustments
+        .iter()
+        .map(|adjustment| adjustment.part.clone())
+        .collect();
+    Ok(result)
+}
+
+fn restore_part_adjustment_batch(
+    file_snapshots: &[(PathBuf, Vec<u8>)],
+    manifest_path: &Path,
+    manifest_snapshot: Option<&[u8]>,
+    optional_file_snapshots: &[(PathBuf, Option<Vec<u8>>)],
+) -> Result<(), AppError> {
+    for (path, bytes) in file_snapshots {
+        fs::write(path, bytes)?;
+    }
+    if let Some(bytes) = manifest_snapshot {
+        fs::write(manifest_path, bytes)?;
+    } else if manifest_path.is_file() {
+        fs::remove_file(manifest_path)?;
+    }
+    for (path, snapshot) in optional_file_snapshots {
+        if let Some(bytes) = snapshot {
+            fs::write(path, bytes)?;
+        } else if path.is_file() {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn is_default_part_adjustment(adjustment: &PartAdjustment) -> bool {
+    adjustment.offset_x == 0 && adjustment.offset_y == 0 && adjustment.scale_percent == 100
 }
 
 /// adjustment.json（v2）からパーツごとの位置補正値を読む（STEP5でパーツ切替時の表示用）
@@ -861,6 +1078,10 @@ fn current_base_parts(app: &AppHandle) -> Option<HashMap<String, DynamicImage>> 
         "arm_r",
         "chest",
         "eye_open",
+        "eyebrow",
+        "eyewhite",
+        "irides",
+        "highlight",
         "mouth_closed",
     ] {
         if let Some(image) = parts.get(key) {
@@ -894,6 +1115,10 @@ fn save_base_parts(
         "arm_r",
         "chest",
         "eye_open",
+        "eyebrow",
+        "eyewhite",
+        "irides",
+        "highlight",
         "mouth_closed",
     ] {
         let path = output_dir.join(format!("{key}.png"));
@@ -949,10 +1174,25 @@ fn save_eyes_open_extracted_part(
         base_eye.clone()
     };
     fs::create_dir_all(extracted_dir)?;
+    let existing_adjustment = read_typed_part_adjustments(extracted_dir)
+        .get("eyes-open")
+        .cloned();
+    let displayed_eyes_open = existing_adjustment
+        .as_ref()
+        .filter(|adjustment| !is_default_part_adjustment(adjustment))
+        .map(|adjustment| {
+            transform_extracted_part(
+                &eyes_open,
+                adjustment.offset_x,
+                adjustment.offset_y,
+                adjustment.scale_percent,
+            )
+        })
+        .unwrap_or_else(|| eyes_open.clone());
     // eyes-open は「素体の目（eye_open）そのもの」を正とする。他フレーム（口パク等）が
     // 表示する平常時の目と完全一致させ、閉じ目だけが差分になるようにする。
-    // 抽出時のsource切り出し版は目の輪郭が微妙に異なるため、ここで必ず上書きする
-    eyes_open.save(extracted_dir.join("eyes-open.png"))?;
+    // STEP5で既に位置補正済みなら、その補正を新しい素体の目にも再適用する。
+    displayed_eyes_open.save(extracted_dir.join("eyes-open.png"))?;
     let originals_dir = extracted_dir.join("original_extracted_parts");
     fs::create_dir_all(&originals_dir)?;
     eyes_open.save(originals_dir.join("eyes-open.png"))?;
@@ -980,6 +1220,8 @@ fn cache_codex_source_see_through_inner(
             source_psd.display()
         )));
     }
+    // source.psdを差し替える前にSTEP3へ戻し、旧抽出/RIFEを再利用させない。
+    invalidate_workspace_before_edit(&job_dir, 3)?;
     let output_dir = job_dir.join(WORKSPACE_SEE_THROUGH_DIR);
     fs::create_dir_all(&output_dir)?;
     let cached_psd = output_dir.join("source.psd");
@@ -1103,15 +1345,23 @@ fn extract_codex_generated_parts_inner(
         }
     };
 
+    // STEP3を完了済み案件で再実行した場合も、抽出画像を上書きする前にSTEP3へ戻す。
+    invalidate_workspace_before_edit(&job_dir, 3)?;
+
     // eyes-open は常に source から再生成（生成素材の分解結果に依存させない）。
     // 位置補正の対象外なので original_extracted_parts 側も同時に更新する
-    regenerate_eyes_open_from_source(&source_image, &source_snapshot, &extracted_dir, &mut warnings)?;
+    regenerate_eyes_open_from_source(
+        &source_image,
+        &source_snapshot,
+        &extracted_dir,
+        &mut warnings,
+    )?;
 
-    // 位置合わせアンカー: source の目・口レイヤーのアルファ重心
-    // （852話氏のアンカー自動検出と同方式。bbox中心より外れ値に強い）
+    // 位置合わせアンカー: source の目・口レイヤーのアルファ重心。
+    // bbox中心より散在ピクセルの影響を受けにくい。
     let source_eye_anchor = extract_named_expression_layers(
         &source_snapshot.layers,
-        EYE_LAYER_NAMES,
+        EYE_ANIMATION_LAYER_NAMES,
         source_snapshot.width,
         source_snapshot.height,
     )
@@ -1127,7 +1377,10 @@ fn extract_codex_generated_parts_inner(
     .and_then(alpha_centroid);
 
     let previous_alignment = read_extraction_alignment(&extracted_dir);
+    let previous_generated_fingerprints =
+        read_extraction_generated_part_fingerprints(&extracted_dir);
     let mut alignment = serde_json::Map::new();
+    let mut generated_part_fingerprints = serde_json::Map::new();
 
     for (index, part) in status.expected_parts.iter().enumerate() {
         app.emit(
@@ -1142,20 +1395,30 @@ fn extract_codex_generated_parts_inner(
 
         let generated_path = generated_parts_dir.join(format!("{part}.png"));
         let output_path = extracted_dir.join(format!("{part}.png"));
-        // 位置合わせ済み（alignment記録あり）の場合のみ再利用可
-        if extracted_part_is_fresh(part, &generated_path, &output_path) {
-            if let Some(previous) = previous_alignment.get(part.as_str()) {
-                alignment.insert(part.clone(), previous.clone());
-                extracted_parts.push(part.clone());
-                continue;
-            }
-        }
         let generated_image = image::open(&generated_path).map_err(|error| {
             AppError::General(format!(
                 "Codex生成素材を読み込めません: {} ({error})",
                 generated_path.display()
             ))
         })?;
+        let generated_fingerprint = visual_image_fingerprint(&generated_image);
+        generated_part_fingerprints.insert(part.clone(), json!(generated_fingerprint.clone()));
+        // 位置合わせ済み（alignment記録あり）かつ生成画像の視覚内容が同じ場合だけ再利用可。
+        // ファイル時刻はWindowsコピーで維持されるため、再利用判定には使わない。
+        if extracted_part_is_fresh(
+            part,
+            &output_path,
+            previous_generated_fingerprints
+                .get(part)
+                .map(String::as_str),
+            &generated_fingerprint,
+        ) {
+            if let Some(previous) = previous_alignment.get(part.as_str()) {
+                alignment.insert(part.clone(), previous.clone());
+                extracted_parts.push(part.clone());
+                continue;
+            }
+        }
 
         let see_through_result = see_through::run_inference(
             &app,
@@ -1193,23 +1456,28 @@ fn extract_codex_generated_parts_inner(
             ));
         }
         // 生成素材を作業解像度へ正規化（マスク切り出し・差分フォールバックの前提）
-        let generated_image = if generated_image.width() != width || generated_image.height() != height {
-            generated_image.resize_exact(width, height, image::imageops::FilterType::Lanczos3)
-        } else {
-            generated_image
-        };
+        let generated_image =
+            if generated_image.width() != width || generated_image.height() != height {
+                generated_image.resize_exact(width, height, image::imageops::FilterType::Lanczos3)
+            } else {
+                generated_image
+            };
         let is_eye_part = part.starts_with("eyes-");
         // 1) See-Throughの名前付きレイヤー（eyewhite/irides等 or mouth）から抽出
         let extracted = extract_named_expression_layers(
             &layers,
-            if is_eye_part { EYE_LAYER_NAMES } else { &["mouth"] },
+            if is_eye_part {
+                EYE_ANIMATION_LAYER_NAMES
+            } else {
+                &["mouth"]
+            },
             width,
             height,
         )
         // 2) 名前付きが無ければ、See-Throughのマスクで生成素材から切り出し
         .or_else(|| {
             let mut mask = if is_eye_part {
-                expression_mask(&layers, EYE_LAYER_NAMES, width, height, 12, 3)
+                expression_mask(&layers, EYE_ANIMATION_LAYER_NAMES, width, height, 12, 3)
             } else {
                 mouth_expression_mask(&layers, width, height)
             };
@@ -1258,7 +1526,8 @@ fn extract_codex_generated_parts_inner(
         } else {
             source_mouth_anchor
         };
-        let (aligned, dx, dy) = align_extracted_to_anchor(&extracted, anchor, source_snapshot.width);
+        let (aligned, dx, dy) =
+            align_extracted_to_anchor(&extracted, anchor, source_snapshot.width);
         aligned.save(&output_path)?;
         alignment.insert(part.clone(), json!({ "dx": dx, "dy": dy }));
         extracted_parts.push(part.clone());
@@ -1274,12 +1543,13 @@ fn extract_codex_generated_parts_inner(
     include_existing_eyes_open(&extracted_dir, &mut extracted_parts);
 
     let manifest = json!({
-        "formatVersion": 2,
+        "formatVersion": 3,
         "mode": "codex-generated-parts-extracted",
         "sourceJob": job_dir.to_string_lossy(),
         "extractedPartsDirectory": extracted_dir.to_string_lossy(),
         "extractedParts": extracted_parts,
         "alignment": serde_json::Value::Object(alignment),
+        "generatedPartFingerprints": serde_json::Value::Object(generated_part_fingerprints),
         "eyesOpenSource": "source-image",
         "warnings": warnings,
     });
@@ -1288,6 +1558,12 @@ fn extract_codex_generated_parts_inner(
         serde_json::to_vec_pretty(&manifest)
             .map_err(|error| AppError::General(format!("抽出manifest作成失敗: {error}")))?,
     )?;
+    if ADJUSTABLE_PART_TARGETS
+        .iter()
+        .all(|required| extracted_parts.iter().any(|part| part == required))
+    {
+        complete_workspace_edit(&job_dir, 4)?;
+    }
 
     Ok(ExtractCodexGeneratedPartsResult {
         extracted_parts_path: extracted_dir.to_string_lossy().into_owned(),
@@ -1361,7 +1637,7 @@ fn regenerate_eyes_open_from_source(
 ) -> Result<(), AppError> {
     let mask = expression_mask(
         &snapshot.layers,
-        EYE_LAYER_NAMES,
+        EYE_ANIMATION_LAYER_NAMES,
         snapshot.width,
         snapshot.height,
         12,
@@ -1388,17 +1664,16 @@ fn regenerate_eyes_open_from_source(
         );
         return Ok(());
     }
-    let source_resized = if source_image.width() != snapshot.width
-        || source_image.height() != snapshot.height
-    {
-        source_image.resize_exact(
-            snapshot.width,
-            snapshot.height,
-            image::imageops::FilterType::Lanczos3,
-        )
-    } else {
-        source_image.clone()
-    };
+    let source_resized =
+        if source_image.width() != snapshot.width || source_image.height() != snapshot.height {
+            source_image.resize_exact(
+                snapshot.width,
+                snapshot.height,
+                image::imageops::FilterType::Lanczos3,
+            )
+        } else {
+            source_image.clone()
+        };
     // 抽出時点の暫定 eyes-open（base素体が未保存の段階の早期プレビュー用）。
     // STEP4の素体保存（save_eyes_open_extracted_part）で base の eye_open に上書きされ、
     // 最終的には平常時の目と完全一致する
@@ -1423,8 +1698,28 @@ fn read_extraction_alignment(extracted_dir: &Path) -> serde_json::Map<String, se
         .unwrap_or_default()
 }
 
+fn read_extraction_generated_part_fingerprints(
+    extracted_dir: &Path,
+) -> std::collections::BTreeMap<String, String> {
+    fs::read(extracted_dir.join("manifest.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .and_then(|manifest| manifest.get("generatedPartFingerprints").cloned())
+        .and_then(|fingerprints| match fingerprints {
+            serde_json::Value::Object(map) => Some(map),
+            _ => None,
+        })
+        .map(|fingerprints| {
+            fingerprints
+                .into_iter()
+                .filter_map(|(part, value)| value.as_str().map(|value| (part, value.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// 抽出パーツのアルファ重心を source 側アンカー（レイヤー重心）へ平行移動する。
-/// 重心方式は散在ピクセルに引きずられにくい（852話式アンカー検出と同方針）。
+/// アルファ重心はbbox中心より散在ピクセルに引きずられにくい。
 /// ずれ量が width/6 を超える場合は検出不良とみなし補正しない
 fn align_extracted_to_anchor(
     image: &DynamicImage,
@@ -1478,23 +1773,34 @@ fn cut_image_with_mask(image: &DynamicImage, mask: &GrayImage) -> DynamicImage {
 fn preview_codex_composite_inner(
     app: AppHandle,
     job_path: &str,
-    _profile: &str,
+    profile: &str,
 ) -> Result<PreviewCodexCompositeResult, AppError> {
     let job_dir = PathBuf::from(job_path);
     let early_extracted_dir = extracted_parts_dir(&job_dir);
+    let include_expression_previews = profile != "base-only";
     if !early_extracted_dir.is_dir() {
         return Err(AppError::General(
             "extracted_parts が見つかりません。先に生成素材をSee-Throughで分解してください".into(),
         ));
     }
     if let Some(base_parts) = load_job_base_parts(&job_dir)? {
-        return preview_from_base_parts(&base_parts, &early_extracted_dir, &base_parts_dir(&job_dir));
+        return preview_from_base_parts(
+            &base_parts,
+            &early_extracted_dir,
+            &base_parts_dir(&job_dir),
+            include_expression_previews,
+        );
     }
     if let Some(base_parts) = current_base_parts(&app) {
         let base_parts_dir = base_parts_dir(&job_dir);
         save_base_parts(&base_parts, &base_parts_dir)?;
         save_layer_draw_order(&app, &base_parts_dir)?;
-        return preview_from_base_parts(&base_parts, &early_extracted_dir, &base_parts_dir);
+        return preview_from_base_parts(
+            &base_parts,
+            &early_extracted_dir,
+            &base_parts_dir,
+            include_expression_previews,
+        );
     }
     // 素体データが無い場合でも、ここで暗黙にSee-Through推論へフォールバックしない。
     // 推論はSTEP3の「一括分解を開始」ボタンだけがトリガー（つづきから復帰時に
@@ -1519,6 +1825,10 @@ fn load_job_base_parts(job_dir: &Path) -> Result<Option<HashMap<String, DynamicI
         "arm_r",
         "chest",
         "eye_open",
+        "eyebrow",
+        "eyewhite",
+        "irides",
+        "highlight",
         "mouth_closed",
     ] {
         let path = base_dir.join(format!("{key}.png"));
@@ -1580,7 +1890,16 @@ fn read_base_layer_order(base_dir: &Path) -> Vec<String> {
 /// アルゴリズムはフロント drawMotionLabOrderedLayers と同じ（既定順で直前の要素の直後へ挿入）
 fn resolve_base_draw_order(custom: &[String]) -> Vec<String> {
     const DEFAULT: [&str; 10] = [
-        "hair_back", "body", "neck", "chest", "arm_l", "arm_r", "sways", "eye", "mouth", "hair",
+        "hair_back",
+        "body",
+        "neck",
+        "chest",
+        "arm_l",
+        "arm_r",
+        "sways",
+        "eye",
+        "mouth",
+        "hair",
     ];
     let mut order = Vec::new();
     let mut seen = HashSet::new();
@@ -1612,6 +1931,7 @@ fn preview_from_base_parts(
     base_parts: &HashMap<String, DynamicImage>,
     extracted_dir: &Path,
     base_dir: &Path,
+    include_expression_previews: bool,
 ) -> Result<PreviewCodexCompositeResult, AppError> {
     let body = base_parts
         .get("body")
@@ -1621,20 +1941,65 @@ fn preview_from_base_parts(
     // Step4のレイヤー調整で決めたグループ描画順（layer-order.json）を尊重する
     let draw_order = resolve_base_draw_order(&read_base_layer_order(base_dir));
     let mut part_names = Vec::new();
-    if extracted_dir.join("eyes-open.png").is_file() {
-        part_names.push("eyes-open".to_string());
-    }
-    if extracted_dir.join("eyes-closed.png").is_file() {
-        part_names.push("eyes-closed".to_string());
-    }
-    if extracted_dir.join("mouth-closed.png").is_file() {
-        part_names.push("mouth-closed".to_string());
-    }
-    for part in MOUTH_VOWEL_TARGETS {
-        if extracted_dir.join(format!("{part}.png")).is_file() {
-            part_names.push((*part).to_string());
+    if include_expression_previews {
+        if extracted_dir.join("eyes-open.png").is_file() {
+            part_names.push("eyes-open".to_string());
+        }
+        if extracted_dir.join("eyes-closed.png").is_file() {
+            part_names.push("eyes-closed".to_string());
+        }
+        if extracted_dir.join("mouth-closed.png").is_file() {
+            part_names.push("mouth-closed".to_string());
+        }
+        for part in MOUTH_VOWEL_TARGETS {
+            if extracted_dir.join(format!("{part}.png")).is_file() {
+                part_names.push((*part).to_string());
+            }
         }
     }
+
+    let independent_eyebrow = base_parts
+        .get("eyebrow")
+        .map(|eyebrow| image_utils::eyebrow_cleanup_mask(eyebrow, width, height));
+    let clean_eye_overlay = |name: &str, image: RgbaImage| -> RgbaImage {
+        if !name.starts_with("eyes-") {
+            return image;
+        }
+        independent_eyebrow
+            .as_ref()
+            .map(|eyebrow| {
+                erase_alpha_with_mask(&DynamicImage::ImageRgba8(image.clone()), eyebrow).to_rgba8()
+            })
+            .unwrap_or(image)
+    };
+
+    // 選択中パーツだけの「のっぺらぼう」表示にしない。目を調整中は閉じ口、口を
+    // 調整中は開き目を確認用として重ねる。current PNGを読むため、STEP5の補正も反映される。
+    // 独立眉がある案件では、旧目画像に焼き込まれた眉を消してから一枚だけ重ねる。
+    let load_companion = |name: &str| -> Result<Option<RgbaImage>, AppError> {
+        let path = extracted_dir.join(format!("{name}.png"));
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let image = image::open(&path).map_err(|error| {
+            AppError::General(format!(
+                "確認用の差分パーツを読み込めません: {} ({error})",
+                path.display()
+            ))
+        })?;
+        Ok(Some(clean_eye_overlay(
+            name,
+            resized_rgba(&image, width, height),
+        )))
+    };
+    let default_eye = include_expression_previews
+        .then(|| load_companion("eyes-open"))
+        .transpose()?
+        .flatten();
+    let default_mouth = include_expression_previews
+        .then(|| load_companion("mouth-closed"))
+        .transpose()?
+        .flatten();
 
     let mut previews = Vec::new();
     for part in part_names {
@@ -1645,15 +2010,25 @@ fn preview_from_base_parts(
                 part_path.display()
             ))
         })?;
-        let part_rgba = resized_rgba(&part_image, width, height);
+        let part_rgba = clean_eye_overlay(&part, resized_rgba(&part_image, width, height));
         let is_eye_part = part.starts_with("eyes-");
+        let eye_overlay = if is_eye_part {
+            Some(&part_rgba)
+        } else {
+            default_eye.as_ref()
+        };
+        let mouth_overlay = if is_eye_part {
+            default_mouth.as_ref()
+        } else {
+            Some(&part_rgba)
+        };
         let composite = compose_base_parts_ordered(
             base_parts,
             width,
             height,
             &draw_order,
-            is_eye_part.then_some(&part_rgba),
-            (!is_eye_part).then_some(&part_rgba),
+            eye_overlay,
+            mouth_overlay,
             true,
         );
         previews.push(CodexCompositePreviewItem {
@@ -1663,79 +2038,9 @@ fn preview_from_base_parts(
     }
 
     Ok(PreviewCodexCompositeResult {
-        // base = 素体そのもの（目・口の差分を乗せない のっぺらぼう）
+        // base = 直接編集キャンバスの土台。目・口は乗せず、独立眉などの静的パーツは含める。
         base_preview: image_data_url(&DynamicImage::ImageRgba8(compose_base_parts_ordered(
-            base_parts, width, height, &draw_order, None, None, false,
-        )))?,
-        previews,
-    })
-}
-
-fn preview_codex_rife_outputs_inner(job_path: &str) -> Result<PreviewCodexRifeResult, AppError> {
-    let job_dir = PathBuf::from(job_path);
-    let base_parts = load_job_base_parts(&job_dir)?.ok_or_else(|| {
-        AppError::General("base_parts/body.png が見つかりません。Step 4で素体を保存してください".into())
-    })?;
-    let body = base_parts
-        .get("body")
-        .ok_or_else(|| AppError::General("base_parts/body.png が見つかりません".into()))?;
-    let width = body.width();
-    let height = body.height();
-    let draw_order = resolve_base_draw_order(&read_base_layer_order(&base_parts_dir(&job_dir)));
-    let output_root = rife_output_dir(&job_dir);
-    if !output_root.is_dir() {
-        return Err(AppError::General(format!(
-            "RIFE出力フォルダが見つかりません: {}",
-            output_root.display()
-        )));
-    }
-
-    let mut previews = Vec::new();
-    for (folder, part) in [
-        ("eye", "eyes-closed"),
-        ("mouth_a", "mouth-a"),
-        ("mouth_i", "mouth-i"),
-        ("mouth_u", "mouth-u"),
-        ("mouth_e", "mouth-e"),
-        ("mouth_o", "mouth-o"),
-    ] {
-        let frame_dir = output_root.join(folder);
-        if !frame_dir.is_dir() {
-            continue;
-        }
-        let frames = sorted_png_files(&frame_dir)?;
-        let frame_count = frames.len() as u32;
-        for (index, frame_path) in frames.iter().enumerate() {
-            let frame = image::open(frame_path).map_err(|error| {
-                AppError::General(format!(
-                    "RIFEフレームを読み込めません: {} ({error})",
-                    frame_path.display()
-                ))
-            })?;
-            let frame_rgba = resized_rgba(&frame, width, height);
-            let is_eye_part = part.starts_with("eyes-");
-            let composite = compose_base_parts_ordered(
-                &base_parts,
-                width,
-                height,
-                &draw_order,
-                is_eye_part.then_some(&frame_rgba),
-                (!is_eye_part).then_some(&frame_rgba),
-                true,
-            );
-            previews.push(CodexRifeFramePreviewItem {
-                part: part.to_string(),
-                frame_index: index as u32 + 1,
-                frame_count,
-                preview: image_data_url(&DynamicImage::ImageRgba8(composite))?,
-            });
-        }
-    }
-
-    Ok(PreviewCodexRifeResult {
-        // base = 素体そのもの（目・口の差分を乗せない のっぺらぼう）
-        base_preview: image_data_url(&DynamicImage::ImageRgba8(compose_base_parts_ordered(
-            &base_parts,
+            base_parts,
             width,
             height,
             &draw_order,
@@ -1747,37 +2052,10 @@ fn preview_codex_rife_outputs_inner(job_path: &str) -> Result<PreviewCodexRifeRe
     })
 }
 
-fn sorted_png_files(dir: &Path) -> Result<Vec<PathBuf>, AppError> {
-    let mut files = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
-        {
-            files.push(path);
-        }
-    }
-    files.sort_by(|left, right| {
-        left.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .cmp(
-                right
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or_default(),
-            )
-    });
-    Ok(files)
-}
-
 /// base_parts をグループ描画順（layer-order.json由来、背面→前面）で合成する。
 /// eye/mouth スロットは overlay 指定時にそれで置き換え（差分パーツ・RIFEフレーム用）。
 /// overlay が None のスロットは include_face_defaults=true なら eye_open / mouth_closed を、
-/// false なら何も描かない（＝素体そのもの＝のっぺらぼう。baseプレビュー用）。
+/// false なら目・口は描かない。独立眉は直接編集キャンバスの静的土台として常に描く。
 fn compose_base_parts_ordered(
     base_parts: &HashMap<String, DynamicImage>,
     width: u32,
@@ -1806,6 +2084,9 @@ fn compose_base_parts_ordered(
                         draw(&mut result, image);
                     }
                 }
+                if let Some(image) = base_parts.get("eyebrow") {
+                    draw(&mut result, image);
+                }
             }
             "mouth" => {
                 if let Some(overlay) = mouth_overlay {
@@ -1822,8 +2103,7 @@ fn compose_base_parts_ordered(
                     // 旧layer-order.jsonの`sways`は後方互換用。個別指定済みの
                     // swayはその位置で描画されるため、ここでは未指定分だけを補完する。
                     .filter(|key| {
-                        key.starts_with("sway_")
-                            && !explicitly_ordered_sways.contains(key.as_str())
+                        key.starts_with("sway_") && !explicitly_ordered_sways.contains(key.as_str())
                     })
                     .collect();
                 sway_keys.sort();
@@ -1920,7 +2200,12 @@ fn alpha_composite_onto(dst: &mut RgbaImage, src: &RgbaImage, width: u32, height
     }
 }
 
-fn extracted_part_is_fresh(part: &str, generated_path: &Path, output_path: &Path) -> bool {
+fn extracted_part_is_fresh(
+    part: &str,
+    output_path: &Path,
+    previous_generated_fingerprint: Option<&str>,
+    current_generated_fingerprint: &str,
+) -> bool {
     let Ok(output_meta) = fs::metadata(output_path) else {
         return false;
     };
@@ -1933,14 +2218,7 @@ fn extracted_part_is_fresh(part: &str, generated_path: &Path, output_path: &Path
     if part.starts_with("mouth-") && !mouth_extracted_alpha_is_reasonable(output_path) {
         return false;
     }
-    let Ok(generated_modified) = fs::metadata(generated_path).and_then(|meta| meta.modified())
-    else {
-        return true;
-    };
-    let Ok(output_modified) = output_meta.modified() else {
-        return false;
-    };
-    output_modified >= generated_modified
+    previous_generated_fingerprint == Some(current_generated_fingerprint)
 }
 
 fn mouth_extracted_alpha_is_reasonable(path: &Path) -> bool {
@@ -1999,6 +2277,8 @@ fn generate_codex_rife_outputs_inner(
         ));
     }
     ensure_workspace_base_parts_ready(&job_dir)?;
+    // RIFE出力や補助画像へ触れる前にSTEP6へ戻し、途中終了時も部分出力を復活させない。
+    invalidate_workspace_before_edit(&job_dir, 6)?;
     ensure_eyes_open_part(&app, &job_dir, &extracted_dir, profile)?;
 
     let output_root = rife_output_dir(&job_dir);
@@ -2029,10 +2309,44 @@ fn generate_codex_rife_outputs_inner(
     let mut session_guard = state.rife_session.lock().unwrap();
     let session = session_guard.as_mut().unwrap();
     let body_image = image::open(base_parts_dir(&job_dir).join("body.png"))?;
+    let eyebrow_image = image::open(base_parts_dir(&job_dir).join("eyebrow.png")).ok();
+    let part_adjustments = read_typed_part_adjustments(&extracted_dir);
 
     for (folder, start_name, end_name) in jobs {
-        let start = image::open(extracted_dir.join(format!("{start_name}.png")))?;
-        let end = image::open(extracted_dir.join(format!("{end_name}.png")))?;
+        let mut start = image::open(extracted_dir.join(format!("{start_name}.png")))?;
+        let mut end = image::open(extracted_dir.join(format!("{end_name}.png")))?;
+        // New extractions omit eyebrows. This also cleans legacy cached eye
+        // parts so adding eyebrow.png never produces a fixed ghost underneath.
+        if folder == "eye" {
+            if let Some(eyebrow) = eyebrow_image.as_ref() {
+                let adjusted_mask = |part_name: &str| {
+                    part_adjustments
+                        .get(part_name)
+                        .filter(|adjustment| !is_default_part_adjustment(adjustment))
+                        .map(|adjustment| {
+                            transform_extracted_part(
+                                eyebrow,
+                                adjustment.offset_x,
+                                adjustment.offset_y,
+                                adjustment.scale_percent,
+                            )
+                        })
+                        .unwrap_or_else(|| eyebrow.clone())
+                };
+                let start_mask = image_utils::eyebrow_cleanup_mask(
+                    &adjusted_mask(start_name),
+                    start.width(),
+                    start.height(),
+                );
+                let end_mask = image_utils::eyebrow_cleanup_mask(
+                    &adjusted_mask(end_name),
+                    end.width(),
+                    end.height(),
+                );
+                start = erase_alpha_with_mask(&start, &start_mask);
+                end = erase_alpha_with_mask(&end, &end_mask);
+            }
+        }
         if start.width() != end.width() || start.height() != end.height() {
             return Err(AppError::General(format!(
                 "RIFE入力サイズが一致しません: {start_name}.png と {end_name}.png"
@@ -2097,6 +2411,7 @@ fn generate_codex_rife_outputs_inner(
         serde_json::to_vec_pretty(&manifest)
             .map_err(|error| AppError::General(format!("RIFE manifest作成失敗: {error}")))?,
     )?;
+    complete_workspace_edit(&job_dir, 7)?;
 
     Ok(GenerateCodexRifeOutputResult {
         output_path: output_root.to_string_lossy().into_owned(),
@@ -2112,6 +2427,10 @@ fn body_rgb_for_canvas(body: &DynamicImage, width: u32, height: u32) -> image::R
         body.resize_exact(width, height, image::imageops::FilterType::Lanczos3)
             .to_rgb8()
     }
+}
+
+fn erase_alpha_with_mask(image: &DynamicImage, mask: &DynamicImage) -> DynamicImage {
+    image_utils::subtract_alpha_mask(image, mask)
 }
 
 fn codex_rife_jobs(extracted_dir: &Path) -> Vec<(&'static str, &'static str, &'static str)> {
@@ -2138,7 +2457,7 @@ fn codex_rife_jobs(extracted_dir: &Path) -> Vec<(&'static str, &'static str, &'s
 
 fn materialize_spritalk_static_assets(
     job_dir: &Path,
-    _extracted_dir: &Path,
+    extracted_dir: &Path,
     output_root: &Path,
 ) -> Result<Vec<String>, AppError> {
     let mut copied = Vec::new();
@@ -2151,10 +2470,15 @@ fn materialize_spritalk_static_assets(
     }
     if source_base_dir.is_dir() {
         copy_spritalk_root_assets(&source_base_dir, output_root, &mut copied)?;
+        copied.extend(sync_dynamic_eye_assets(
+            &source_base_dir,
+            extracted_dir,
+            output_root,
+        )?);
     }
     fs::write(
         output_root.join("README.txt"),
-        "PachiPakuGen SpriTalk output\nSelect this folder in SpriTalk layer import.\nRequired: body.png\nOptional: hair.png, hair_back.png, arm_l.png, arm_r.png, chest.png, sway_*.png, arm_l_overlay_*.png, arm_r_overlay_*.png\nLayer linkage and draw order: layer-order.json\nAnimation folders: eye, mouth_a, mouth_i, mouth_u, mouth_e, mouth_o\n",
+        "PachiPakuGen assets for SpriTalk\nUse the image assets in this folder with the layer-import flow supported by your SpriTalk version.\nRequired: body.png\nOptional: hair.png, hair_back.png, arm_l.png, arm_r.png, chest.png, sway_*.png, arm_l_overlay_*.png, arm_r_overlay_*.png\nDynamic eyes: eyebrow.png, eyewhite.png, irides.png, highlight.png (optional)\nLayer linkage and draw order: layer-order.json\nAnimation folders: eye, mouth_a, mouth_i, mouth_u, mouth_e, mouth_o\nNote: spritalk-motion-profile.json schema v2 is used by PachiPakuGen live view and reserved for future SpriTalk integration; current SpriTalk does not import it.\n",
     )?;
     Ok(copied)
 }
@@ -2186,9 +2510,6 @@ fn copy_spritalk_root_assets(
         "arm_l.png",
         "arm_r.png",
         "chest.png",
-        "eyewhite.png",
-        "irides.png",
-        "highlight.png",
         "layer-order.json",
     ] {
         let source_path = source_dir.join(file_name);
@@ -2246,6 +2567,80 @@ fn copy_spritalk_root_assets(
     Ok(())
 }
 
+/// RIFEフレームを再生成せず、開眼時だけ使う分離目素材を既存の出力へ同期する。
+fn sync_dynamic_eye_assets(
+    source_base_dir: &Path,
+    extracted_dir: &Path,
+    output_root: &Path,
+) -> Result<Vec<String>, AppError> {
+    fs::create_dir_all(output_root)?;
+    let adjustment = read_typed_part_adjustments(extracted_dir)
+        .get("eyes-open")
+        .cloned();
+    let mut synced = Vec::new();
+    for file_name in ["eyebrow.png", "eyewhite.png", "irides.png", "highlight.png"] {
+        let source_path = source_base_dir.join(file_name);
+        let dest_path = output_root.join(file_name);
+        if !source_path.is_file() {
+            if dest_path.is_file() {
+                fs::remove_file(dest_path)?;
+            }
+            continue;
+        }
+        if let Some(adjustment) = adjustment
+            .as_ref()
+            .filter(|adjustment| !is_default_part_adjustment(adjustment))
+        {
+            let image = image::open(&source_path)?;
+            transform_extracted_part(
+                &image,
+                adjustment.offset_x,
+                adjustment.offset_y,
+                adjustment.scale_percent,
+            )
+            .save(&dest_path)?;
+        } else {
+            fs::copy(&source_path, &dest_path)?;
+        }
+        synced.push(dest_path.to_string_lossy().into_owned());
+    }
+    let eyebrow_path = output_root.join("eyebrow.png");
+    if eyebrow_path.is_file() {
+        let eyebrow = image::open(&eyebrow_path)?;
+        sanitize_legacy_eye_frames(output_root, &eyebrow)?;
+    }
+    Ok(synced)
+}
+
+/// Older STEP6 outputs contain the eyebrow in every eye frame. Once an
+/// independent eyebrow is available, remove that baked copy in place so both
+/// Motion Lab and external SpriTalk consumers see exactly one moving eyebrow.
+fn sanitize_legacy_eye_frames(output_root: &Path, eyebrow: &DynamicImage) -> Result<(), AppError> {
+    let eye_dir = output_root.join("eye");
+    if !eye_dir.is_dir() {
+        return Ok(());
+    }
+    let mut frame_paths = fs::read_dir(&eye_dir)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
+        })
+        .collect::<Vec<_>>();
+    frame_paths.sort();
+    for frame_path in frame_paths {
+        let frame = image::open(&frame_path)?;
+        let cleanup_mask =
+            image_utils::eyebrow_cleanup_mask(eyebrow, frame.width(), frame.height());
+        image_utils::subtract_alpha_mask(&frame, &cleanup_mask).save(&frame_path)?;
+    }
+    Ok(())
+}
+
 fn ensure_eyes_open_part(
     app: &AppHandle,
     job_dir: &Path,
@@ -2287,7 +2682,7 @@ fn ensure_eyes_open_part(
         })?;
     let width = *state.canvas_width.lock().unwrap();
     let height = *state.canvas_height.lock().unwrap();
-    let mask = expression_mask(&layers, EYE_LAYER_NAMES, width, height, 12, 3);
+    let mask = expression_mask(&layers, EYE_ANIMATION_LAYER_NAMES, width, height, 12, 3);
     if !mask_has_minimum_edit_area(&mask, 80) {
         return Err(AppError::General(
             "元画像から eyes-open を抽出できませんでした。分解結果の目レイヤーを確認してください"
@@ -2681,7 +3076,7 @@ fn generate_expression_set_inner(
     let width = source.width();
     let height = source.height();
     let mouth_mask = mouth_expression_mask(&layers, width, height);
-    let eye_mask = expression_mask(&layers, EYE_LAYER_NAMES, width, height, 36, 3);
+    let eye_mask = expression_mask(&layers, EYE_ANIMATION_LAYER_NAMES, width, height, 36, 3);
     validate_selected_masks(&generation_targets, &mouth_mask, &eye_mask)?;
     let rife_frame_count = request
         .rife_frame_count
@@ -3767,17 +4162,34 @@ mod tests {
     #[test]
     fn resolve_base_draw_order_inserts_missing_groups() {
         // layer-order.json は neck / sways を含まない → 既定の相対位置へ補完される
-        let custom: Vec<String> = ["hair_back", "arm_l", "arm_r", "body", "chest", "eye", "mouth", "hair"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let custom: Vec<String> = [
+            "hair_back",
+            "arm_l",
+            "arm_r",
+            "body",
+            "chest",
+            "eye",
+            "mouth",
+            "hair",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let order = resolve_base_draw_order(&custom);
         // sways は既定順の直前要素 arm_r の直後へ補完される
         // （sways が custom に無い = swayパーツ未使用なので実描画には影響しない）
         assert_eq!(
             order,
             vec![
-                "hair_back", "arm_l", "arm_r", "sways", "body", "neck", "chest", "eye", "mouth",
+                "hair_back",
+                "arm_l",
+                "arm_r",
+                "sways",
+                "body",
+                "neck",
+                "chest",
+                "eye",
+                "mouth",
                 "hair"
             ]
         );
@@ -3785,7 +4197,15 @@ mod tests {
         assert_eq!(
             resolve_base_draw_order(&[]),
             vec![
-                "hair_back", "body", "neck", "chest", "arm_l", "arm_r", "sways", "eye", "mouth",
+                "hair_back",
+                "body",
+                "neck",
+                "chest",
+                "arm_l",
+                "arm_r",
+                "sways",
+                "eye",
+                "mouth",
                 "hair"
             ]
         );
@@ -3888,6 +4308,18 @@ mod tests {
             "arm_l_overlay_patch_fingers".into(),
             DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, Rgba([4, 5, 6, 255]))),
         );
+        parts.insert(
+            "eyewhite".into(),
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, Rgba([7, 8, 9, 255]))),
+        );
+        parts.insert(
+            "irides".into(),
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, Rgba([10, 11, 12, 255]))),
+        );
+        parts.insert(
+            "eyebrow".into(),
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, Rgba([13, 14, 15, 255]))),
+        );
 
         save_base_parts(&parts, &base_dir).unwrap();
         let loaded = load_job_base_parts(&root).unwrap().unwrap();
@@ -3896,6 +4328,418 @@ mod tests {
         assert!(base_dir.join("arm_l_overlay_patch_fingers.png").is_file());
         assert!(loaded.contains_key("body"));
         assert!(loaded.contains_key("arm_l_overlay_patch_fingers"));
+        assert!(loaded.contains_key("eyewhite"));
+        assert!(loaded.contains_key("irides"));
+        assert!(loaded.contains_key("eyebrow"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn base_only_preview_skips_expression_frame_decoding() {
+        let root = std::env::temp_dir().join(format!(
+            "pachipakugen_base_only_preview_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let base_dir = root.join("base_parts");
+        let extracted_dir = root.join("extracted_parts");
+        fs::create_dir_all(&base_dir).unwrap();
+        fs::create_dir_all(&extracted_dir).unwrap();
+        // base-only復元では、存在する差分画像にも触れないことを壊れたPNGで保証する。
+        fs::write(extracted_dir.join("eyes-closed.png"), b"not a png").unwrap();
+
+        let mut parts = HashMap::new();
+        parts.insert(
+            "body".into(),
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, Rgba([1, 2, 3, 255]))),
+        );
+
+        let preview = preview_from_base_parts(&parts, &extracted_dir, &base_dir, false).unwrap();
+
+        assert!(preview.previews.is_empty());
+        assert!(preview.base_preview.starts_with("data:image/png;base64,"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn expression_previews_include_the_non_selected_face_part() {
+        let root = std::env::temp_dir().join(format!(
+            "pachipakugen_companion_preview_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let base_dir = root.join("base_parts");
+        let extracted_dir = root.join("extracted_parts");
+        fs::create_dir_all(&base_dir).unwrap();
+        fs::create_dir_all(&extracted_dir).unwrap();
+
+        let transparent = Rgba([0, 0, 0, 0]);
+        let mut parts = HashMap::new();
+        parts.insert(
+            "body".into(),
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(4, 4, transparent)),
+        );
+        let mut eyebrow = RgbaImage::from_pixel(4, 4, transparent);
+        eyebrow.put_pixel(2, 0, Rgba([255, 0, 255, 255]));
+        parts.insert("eyebrow".into(), DynamicImage::ImageRgba8(eyebrow));
+        let mut eyes_open = RgbaImage::from_pixel(4, 4, transparent);
+        eyes_open.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
+        eyes_open.put_pixel(2, 0, Rgba([70, 40, 20, 255]));
+        eyes_open.save(extracted_dir.join("eyes-open.png")).unwrap();
+        let mut eyes_closed = RgbaImage::from_pixel(4, 4, transparent);
+        eyes_closed.put_pixel(1, 0, Rgba([0, 255, 0, 255]));
+        eyes_closed.put_pixel(2, 0, Rgba([60, 30, 15, 255]));
+        eyes_closed
+            .save(extracted_dir.join("eyes-closed.png"))
+            .unwrap();
+        let mut mouth_closed = RgbaImage::from_pixel(4, 4, transparent);
+        mouth_closed.put_pixel(0, 1, Rgba([0, 0, 255, 255]));
+        mouth_closed
+            .save(extracted_dir.join("mouth-closed.png"))
+            .unwrap();
+        let mut mouth_a = RgbaImage::from_pixel(4, 4, transparent);
+        mouth_a.put_pixel(1, 1, Rgba([255, 255, 0, 255]));
+        mouth_a.save(extracted_dir.join("mouth-a.png")).unwrap();
+
+        let preview = preview_from_base_parts(&parts, &extracted_dir, &base_dir, true).unwrap();
+        let decode = |data_url: &str| {
+            let encoded = data_url.split_once(',').unwrap().1;
+            let bytes = STANDARD.decode(encoded).unwrap();
+            image::load_from_memory(&bytes).unwrap().to_rgba8()
+        };
+        let eye_preview = decode(
+            &preview
+                .previews
+                .iter()
+                .find(|item| item.part == "eyes-closed")
+                .unwrap()
+                .preview,
+        );
+        assert_eq!(eye_preview.get_pixel(1, 0), &Rgba([0, 255, 0, 255]));
+        assert_eq!(eye_preview.get_pixel(0, 1), &Rgba([0, 0, 255, 255]));
+        assert_eq!(eye_preview.get_pixel(2, 0), &Rgba([255, 0, 255, 255]));
+
+        let mouth_preview = decode(
+            &preview
+                .previews
+                .iter()
+                .find(|item| item.part == "mouth-a")
+                .unwrap()
+                .preview,
+        );
+        assert_eq!(mouth_preview.get_pixel(0, 0), &Rgba([255, 0, 0, 255]));
+        assert_eq!(mouth_preview.get_pixel(1, 1), &Rgba([255, 255, 0, 255]));
+        assert_eq!(mouth_preview.get_pixel(2, 0), &Rgba([255, 0, 255, 255]));
+        let base_preview = decode(&preview.base_preview);
+        assert_eq!(base_preview.get_pixel(2, 0), &Rgba([255, 0, 255, 255]));
+        assert_eq!(base_preview.get_pixel(0, 0)[3], 0);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn eyes_open_can_be_adjusted_without_becoming_a_generated_requirement() {
+        assert!(!GENERATED_PART_TARGETS.contains(&"eyes-open"));
+        assert!(ADJUSTABLE_PART_TARGETS.contains(&"eyes-open"));
+
+        let root = std::env::temp_dir().join(format!(
+            "pachipakugen_adjust_eyes_open_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let extracted_dir = root.join("extracted_parts");
+        let base_dir = root.join("base_parts");
+        let rife_dir = root.join("rife_output");
+        fs::create_dir_all(&extracted_dir).unwrap();
+        fs::create_dir_all(&base_dir).unwrap();
+        fs::create_dir_all(&rife_dir).unwrap();
+        let mut original = RgbaImage::new(4, 4);
+        original.put_pixel(1, 1, Rgba([10, 20, 30, 255]));
+        original.save(extracted_dir.join("eyes-open.png")).unwrap();
+        let mut iris = RgbaImage::new(4, 4);
+        iris.put_pixel(1, 1, Rgba([0, 200, 255, 255]));
+        iris.save(base_dir.join("irides.png")).unwrap();
+
+        let result = adjust_codex_extracted_parts_inner(AdjustCodexExtractedPartsRequest {
+            job_path: root.to_string_lossy().into_owned(),
+            offset_x: 1,
+            offset_y: 0,
+            scale_percent: 100,
+            part: Some("eyes-open".into()),
+        })
+        .unwrap();
+
+        assert_eq!(result.adjusted_parts, vec!["eyes-open"]);
+        assert_eq!(result.part_adjustments["eyes-open"].offset_x, 1);
+        let adjusted = image::open(extracted_dir.join("eyes-open.png"))
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(adjusted.get_pixel(2, 1), &Rgba([10, 20, 30, 255]));
+        let synced_iris = image::open(rife_dir.join("irides.png")).unwrap().to_rgba8();
+        assert_eq!(synced_iris.get_pixel(2, 1), &Rgba([0, 200, 255, 255]));
+        let preserved = image::open(
+            extracted_dir
+                .join("original_extracted_parts")
+                .join("eyes-open.png"),
+        )
+        .unwrap()
+        .to_rgba8();
+        assert_eq!(preserved.get_pixel(1, 1), &Rgba([10, 20, 30, 255]));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refreshing_eyes_open_preserves_existing_step5_adjustment() {
+        let root = std::env::temp_dir().join(format!(
+            "pachipakugen_refresh_eyes_open_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let extracted_dir = root.join("extracted_parts");
+        fs::create_dir_all(&extracted_dir).unwrap();
+        fs::write(
+            extracted_dir.join("adjustment.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "formatVersion": 2,
+                "adjustedParts": ["eyes-open"],
+                "parts": {
+                    "eyes-open": { "offsetX": 1, "offsetY": 0, "scalePercent": 100 }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut eye = RgbaImage::new(4, 4);
+        eye.put_pixel(1, 1, Rgba([10, 20, 30, 255]));
+        let mut parts = HashMap::new();
+        parts.insert("eye_open".into(), DynamicImage::ImageRgba8(eye));
+
+        save_eyes_open_extracted_part(&root, &parts, &extracted_dir).unwrap();
+
+        let displayed = image::open(extracted_dir.join("eyes-open.png"))
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(displayed.get_pixel(2, 1), &Rgba([10, 20, 30, 255]));
+        assert_eq!(displayed.get_pixel(1, 1), &Rgba([0, 0, 0, 0]));
+
+        let original = image::open(
+            extracted_dir
+                .join("original_extracted_parts")
+                .join("eyes-open.png"),
+        )
+        .unwrap()
+        .to_rgba8();
+        assert_eq!(original.get_pixel(1, 1), &Rgba([10, 20, 30, 255]));
+        assert_eq!(
+            read_typed_part_adjustments(&extracted_dir)["eyes-open"].offset_x,
+            1
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn individual_adjustments_accumulate_and_reset_from_original() {
+        let root = std::env::temp_dir().join(format!(
+            "pachipakugen_adjust_reset_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let extracted_dir = root.join("extracted_parts");
+        fs::create_dir_all(&extracted_dir).unwrap();
+
+        let mut eye = RgbaImage::new(4, 4);
+        eye.put_pixel(1, 1, Rgba([10, 20, 30, 255]));
+        eye.save(extracted_dir.join("eyes-open.png")).unwrap();
+        let mut mouth = RgbaImage::new(4, 4);
+        mouth.put_pixel(1, 1, Rgba([40, 50, 60, 255]));
+        mouth.save(extracted_dir.join("mouth-closed.png")).unwrap();
+
+        let batch =
+            adjust_codex_extracted_parts_batch_inner(AdjustCodexExtractedPartsBatchRequest {
+                job_path: root.to_string_lossy().into_owned(),
+                adjustments: vec![
+                    CodexPartAdjustmentUpdate {
+                        part: "eyes-open".into(),
+                        offset_x: 1,
+                        offset_y: 0,
+                        scale_percent: 100,
+                    },
+                    CodexPartAdjustmentUpdate {
+                        part: "mouth-closed".into(),
+                        offset_x: 0,
+                        offset_y: 1,
+                        scale_percent: 100,
+                    },
+                ],
+            })
+            .unwrap();
+        assert_eq!(batch.adjusted_parts, vec!["eyes-open", "mouth-closed"]);
+        let reset = adjust_codex_extracted_parts_inner(AdjustCodexExtractedPartsRequest {
+            job_path: root.to_string_lossy().into_owned(),
+            offset_x: 0,
+            offset_y: 0,
+            scale_percent: 100,
+            part: Some("eyes-open".into()),
+        })
+        .unwrap();
+
+        assert!(!reset.part_adjustments.contains_key("eyes-open"));
+        assert_eq!(reset.part_adjustments["mouth-closed"].offset_y, 1);
+        let restored_eye = image::open(extracted_dir.join("eyes-open.png"))
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(restored_eye.get_pixel(1, 1), &Rgba([10, 20, 30, 255]));
+        assert_eq!(restored_eye.get_pixel(2, 1), &Rgba([0, 0, 0, 0]));
+        let adjusted_mouth = image::open(extracted_dir.join("mouth-closed.png"))
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(adjusted_mouth.get_pixel(1, 2), &Rgba([40, 50, 60, 255]));
+
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(extracted_dir.join("adjustment.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["adjustedParts"], json!(["mouth-closed"]));
+        assert!(manifest["parts"].get("eyes-open").is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_adjustment_failure_restores_earlier_parts_and_manifest() {
+        let root = std::env::temp_dir().join(format!(
+            "pachipakugen_adjust_batch_rollback_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let extracted_dir = root.join("extracted_parts");
+        let base_dir = root.join("base_parts");
+        let rife_dir = root.join("rife_output");
+        fs::create_dir_all(&extracted_dir).unwrap();
+        fs::create_dir_all(&base_dir).unwrap();
+        fs::create_dir_all(&rife_dir).unwrap();
+        let mut eye = RgbaImage::new(4, 4);
+        eye.put_pixel(1, 1, Rgba([70, 80, 90, 255]));
+        let eye_path = extracted_dir.join("eyes-open.png");
+        eye.save(&eye_path).unwrap();
+        let original_eye_bytes = fs::read(&eye_path).unwrap();
+        let mut iris = RgbaImage::new(4, 4);
+        iris.put_pixel(1, 1, Rgba([0, 200, 255, 255]));
+        iris.save(base_dir.join("irides.png")).unwrap();
+        let old_output_iris = RgbaImage::from_pixel(4, 4, Rgba([90, 0, 120, 255]));
+        let output_iris_path = rife_dir.join("irides.png");
+        old_output_iris.save(&output_iris_path).unwrap();
+        let original_output_iris_bytes = fs::read(&output_iris_path).unwrap();
+        // 1件目の目は保存できるが、2件目の口は画像デコードで失敗する。
+        fs::write(extracted_dir.join("mouth-closed.png"), b"not a png").unwrap();
+
+        let result =
+            adjust_codex_extracted_parts_batch_inner(AdjustCodexExtractedPartsBatchRequest {
+                job_path: root.to_string_lossy().into_owned(),
+                adjustments: vec![
+                    CodexPartAdjustmentUpdate {
+                        part: "eyes-open".into(),
+                        offset_x: 1,
+                        offset_y: 0,
+                        scale_percent: 100,
+                    },
+                    CodexPartAdjustmentUpdate {
+                        part: "mouth-closed".into(),
+                        offset_x: 1,
+                        offset_y: 0,
+                        scale_percent: 100,
+                    },
+                ],
+            });
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&eye_path).unwrap(), original_eye_bytes);
+        assert_eq!(
+            fs::read(&output_iris_path).unwrap(),
+            original_output_iris_bytes
+        );
+        assert!(!extracted_dir.join("adjustment.json").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_adjustment_updates_checkpoint_and_preflight_failure_preserves_it() {
+        let root = std::env::temp_dir().join(format!(
+            "pachipakugen_adjust_workspace_checkpoint_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let extracted_dir = root.join(WORKSPACE_SEE_THROUGH_DIR);
+        fs::create_dir_all(&extracted_dir).unwrap();
+        let write_project = |current_step| {
+            fs::write(
+                root.join("project.json"),
+                serde_json::to_vec_pretty(&WorkspaceProject {
+                    version: 1,
+                    created_at: 1,
+                    updated_at: 2,
+                    current_step,
+                    source_image_path: None,
+                    reference_image_path: None,
+                    codex_prompt: None,
+                    mouth_corner: Default::default(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        };
+        let mut eye = RgbaImage::new(4, 4);
+        eye.put_pixel(1, 1, Rgba([10, 20, 30, 255]));
+        eye.save(extracted_dir.join("eyes-open.png")).unwrap();
+        write_project(7);
+
+        adjust_codex_extracted_parts_batch_inner(AdjustCodexExtractedPartsBatchRequest {
+            job_path: root.to_string_lossy().into_owned(),
+            adjustments: vec![CodexPartAdjustmentUpdate {
+                part: "eyes-open".into(),
+                offset_x: 1,
+                offset_y: 0,
+                scale_percent: 100,
+            }],
+        })
+        .unwrap();
+        let project: WorkspaceProject =
+            serde_json::from_slice(&fs::read(root.join("project.json")).unwrap()).unwrap();
+        assert_eq!(project.current_step, 6);
+
+        fs::remove_file(extracted_dir.join("eyes-open.png")).unwrap();
+        write_project(7);
+        let error = adjust_codex_extracted_parts_inner(AdjustCodexExtractedPartsRequest {
+            job_path: root.to_string_lossy().into_owned(),
+            offset_x: 1,
+            offset_y: 0,
+            scale_percent: 100,
+            part: Some("eyes-open".into()),
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("調整対象の差分パーツ"));
+        let project: WorkspaceProject =
+            serde_json::from_slice(&fs::read(root.join("project.json")).unwrap()).unwrap();
+        assert_eq!(project.current_step, 7);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -4128,6 +4972,15 @@ mod tests {
         image::RgbaImage::from_pixel(2, 2, image::Rgba([40, 50, 60, 255]))
             .save(base_dir.join("arm_l_overlay_patch_fingers.png"))
             .unwrap();
+        let mut eyewhite = image::RgbaImage::new(4, 4);
+        eyewhite.put_pixel(1, 1, image::Rgba([240, 240, 240, 255]));
+        eyewhite.save(base_dir.join("eyewhite.png")).unwrap();
+        let mut eyebrow = image::RgbaImage::new(4, 4);
+        eyebrow.put_pixel(1, 1, image::Rgba([35, 20, 15, 255]));
+        eyebrow.save(base_dir.join("eyebrow.png")).unwrap();
+        let mut irides = image::RgbaImage::new(4, 4);
+        irides.put_pixel(1, 1, image::Rgba([0, 200, 255, 255]));
+        irides.save(base_dir.join("irides.png")).unwrap();
         let layer_order = serde_json::json!({
             "formatVersion": 1,
             "drawOrder": [
@@ -4149,6 +5002,18 @@ mod tests {
         image::RgbaImage::from_pixel(2, 2, image::Rgba([4, 5, 6, 128]))
             .save(extracted_dir.join("mouth-a.png"))
             .unwrap();
+        fs::write(
+            extracted_dir.join("adjustment.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "formatVersion": 2,
+                "adjustedParts": ["eyes-open"],
+                "parts": {
+                    "eyes-open": { "offsetX": 1, "offsetY": 0, "scalePercent": 100 }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
         fs::create_dir_all(output_dir.join("base_parts")).unwrap();
         fs::create_dir_all(output_dir.join("extracted_parts")).unwrap();
         image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 255, 0, 255]))
@@ -4168,6 +5033,9 @@ mod tests {
         assert!(output_dir.join("hair.png").is_file());
         assert!(output_dir.join("sway_ear.png").is_file());
         assert!(output_dir.join("arm_l_overlay_patch_fingers.png").is_file());
+        assert!(output_dir.join("eyewhite.png").is_file());
+        assert!(output_dir.join("eyebrow.png").is_file());
+        assert!(output_dir.join("irides.png").is_file());
         assert!(!output_dir.join("sway_stale.png").exists());
         assert!(!output_dir.join("arm_r_overlay_stale.png").exists());
         assert_eq!(
@@ -4188,6 +5056,27 @@ mod tests {
             serde_json::from_slice(&fs::read(output_dir.join("layer-order.json")).unwrap())
                 .unwrap();
         assert_eq!(copied_layer_order, layer_order);
+        assert_eq!(
+            image::open(output_dir.join("eyewhite.png"))
+                .unwrap()
+                .to_rgba8()
+                .get_pixel(2, 1),
+            &image::Rgba([240, 240, 240, 255])
+        );
+        assert_eq!(
+            image::open(output_dir.join("eyebrow.png"))
+                .unwrap()
+                .to_rgba8()
+                .get_pixel(2, 1),
+            &image::Rgba([35, 20, 15, 255])
+        );
+        assert_eq!(
+            image::open(output_dir.join("irides.png"))
+                .unwrap()
+                .to_rgba8()
+                .get_pixel(2, 1),
+            &image::Rgba([0, 200, 255, 255])
+        );
         assert!(!output_dir.join("base_parts").exists());
         assert!(!output_dir.join("extracted_parts").exists());
         assert!(!output_dir.join("mouth-a.png").is_file());
@@ -4195,7 +5084,102 @@ mod tests {
         assert!(fs::read_to_string(output_dir.join("README.txt"))
             .unwrap()
             .contains("arm_l_overlay_*.png"));
-        assert_eq!(copied.len(), 5);
+        assert_eq!(copied.len(), 8);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn regressed_workspace_does_not_restore_stale_rife_output() {
+        let root = std::env::temp_dir().join(format!(
+            "pachipakugen_stale_rife_checkpoint_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let output_dir = root.join(WORKSPACE_SPRITALK_PARTS_DIR);
+        fs::create_dir_all(output_dir.join("eye")).unwrap();
+        fs::write(
+            output_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&json!({ "frameCount": 8 })).unwrap(),
+        )
+        .unwrap();
+
+        let write_project = |current_step| {
+            fs::write(
+                root.join("project.json"),
+                serde_json::to_vec_pretty(&WorkspaceProject {
+                    version: 1,
+                    created_at: 1,
+                    updated_at: 2,
+                    current_step,
+                    source_image_path: None,
+                    reference_image_path: None,
+                    codex_prompt: None,
+                    mouth_corner: Default::default(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        };
+
+        write_project(7);
+        assert!(read_current_rife_output_result(&root).is_some());
+
+        // 再編集後は旧画像を物理的に残していても現行成果物としては扱わない。
+        write_project(6);
+        assert!(output_dir.join("eye").is_dir());
+        assert!(read_rife_output_result(&root).is_some());
+        assert!(read_current_rife_output_result(&root).is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn extracted_part_reuse_requires_matching_visual_fingerprint() {
+        let root = std::env::temp_dir().join(format!(
+            "pachipakugen_extracted_fingerprint_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let output_path = root.join("mouth-a.png");
+        let mut output = RgbaImage::new(64, 64);
+        for y in 30..35 {
+            for x in 30..35 {
+                output.put_pixel(x, y, Rgba([120, 20, 30, 255]));
+            }
+        }
+        output.save(&output_path).unwrap();
+
+        let generated_before =
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(64, 64, Rgba([10, 20, 30, 255])));
+        let generated_after =
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(64, 64, Rgba([11, 20, 30, 255])));
+        let before = visual_image_fingerprint(&generated_before);
+        let after = visual_image_fingerprint(&generated_after);
+
+        assert!(extracted_part_is_fresh(
+            "mouth-a",
+            &output_path,
+            Some(&before),
+            &before,
+        ));
+        assert!(!extracted_part_is_fresh(
+            "mouth-a",
+            &output_path,
+            Some(&before),
+            &after,
+        ));
+        assert!(!extracted_part_is_fresh(
+            "mouth-a",
+            &output_path,
+            None,
+            &before,
+        ));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -4466,5 +5450,48 @@ mod tests {
         let decoded = image::load_from_memory(&encoded).unwrap().to_rgba8();
         assert_eq!(decoded.get_pixel(0, 0)[3], 255);
         assert_eq!(decoded.get_pixel(1, 0)[3], 0);
+    }
+
+    #[test]
+    fn eyebrow_mask_removes_only_baked_brow_alpha() {
+        let mut source = RgbaImage::from_pixel(2, 1, Rgba([20, 30, 40, 255]));
+        source.put_pixel(1, 0, Rgba([20, 30, 40, 128]));
+        let image = DynamicImage::ImageRgba8(source);
+        let mut mask = RgbaImage::new(2, 1);
+        mask.put_pixel(1, 0, Rgba([10, 10, 10, 128]));
+
+        let result = erase_alpha_with_mask(&image, &DynamicImage::ImageRgba8(mask)).to_rgba8();
+
+        assert_eq!(result.get_pixel(0, 0)[3], 255);
+        assert_eq!(result.get_pixel(1, 0)[3], 0);
+    }
+
+    #[test]
+    fn syncing_independent_eyebrow_sanitizes_legacy_eye_frames() {
+        let root = std::env::temp_dir().join(format!(
+            "pachipakugen_spritalk_brow_cleanup_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let eye_dir = root.join("eye");
+        fs::create_dir_all(&eye_dir).unwrap();
+
+        let mut eyebrow = RgbaImage::new(256, 2);
+        eyebrow.put_pixel(100, 0, Rgba([35, 20, 15, 160]));
+        let eyebrow = DynamicImage::ImageRgba8(eyebrow);
+        let mut legacy_eye = RgbaImage::new(256, 2);
+        // The old antialiased edge sits one pixel outside the source mask.
+        legacy_eye.put_pixel(101, 0, Rgba([35, 20, 15, 64]));
+        legacy_eye.put_pixel(110, 0, Rgba([0, 200, 255, 255]));
+        legacy_eye.save(eye_dir.join("001.png")).unwrap();
+
+        sanitize_legacy_eye_frames(&root, &eyebrow).unwrap();
+
+        let cleaned = image::open(eye_dir.join("001.png")).unwrap().to_rgba8();
+        assert_eq!(cleaned.get_pixel(101, 0)[3], 0);
+        assert_eq!(cleaned.get_pixel(110, 0)[3], 255);
+        let _ = fs::remove_dir_all(root);
     }
 }

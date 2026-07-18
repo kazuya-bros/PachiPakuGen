@@ -47,10 +47,10 @@
         ]
       },
       {
-        "repoId": "frankjoshua/juggernautXL_version6Rundiffusion",
-        "revision": "aadab4c7cb252b83a0e2d6f3386b8c837af23932",
+        "repoId": "layerdifforg/seethroughv0.0.2_layerdiff3d",
+        "revision": "966721bb4ef2ddc3af3696862fa10b3f78d9785d",
         "files": [
-          { "path": "scheduler/scheduler_config.json", "size": 479 }
+          { "path": "scheduler/scheduler_config.json", "size": 992 }
         ]
       }
     ],
@@ -97,13 +97,6 @@
           { "path": "unet/diffusion_pytorch_model.safetensors", "size": 2426482432 },
           { "path": "vae/config.json", "size": 919 },
           { "path": "vae/diffusion_pytorch_model.safetensors", "size": 167335590 }
-        ]
-      },
-      {
-        "repoId": "frankjoshua/juggernautXL_version6Rundiffusion",
-        "revision": "aadab4c7cb252b83a0e2d6f3386b8c837af23932",
-        "files": [
-          { "path": "scheduler/scheduler_config.json", "size": 479 }
         ]
       }
     ]

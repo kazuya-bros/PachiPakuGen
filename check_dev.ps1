@@ -1,14 +1,24 @@
 # Check PachiPakuGen Tauri app (dev mode - fast compile check only)
-Set-Location "E:\develop\PachiPakuGen\PachiPakuGen-app\src-tauri"
+$repoRoot = $PSScriptRoot
+$tauriRoot = Join-Path $repoRoot "src-tauri"
+Push-Location $tauriRoot
 
 # Ensure cargo is in PATH
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 
 # cargo check (fast, no codegen)
-cargo check 2>&1
+$exitCode = 0
+try {
+    cargo check 2>&1
+    $exitCode = $LASTEXITCODE
+} finally {
+    Pop-Location
+}
 
-if ($LASTEXITCODE -eq 0) {
+if ($exitCode -eq 0) {
     Write-Host "`n=== Check passed! ===" -ForegroundColor Green
 } else {
     Write-Host "`n=== Check failed ===" -ForegroundColor Red
 }
+
+exit $exitCode

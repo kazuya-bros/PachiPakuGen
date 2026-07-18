@@ -9,6 +9,15 @@ __pycache__/
 dist/
 src-tauri/target/
 prototype-results/
+prototype/
+tmp/
+
+# Local development logs and recovery files
+*.log
+App_restored_candidate.tsx
+src/App.tsx.corrupt-backup-*
+CLAUDE_SANDBOX_TEST.txt
+docs/*.patch
 
 # Model files (large binaries)
 src-tauri/models/*.onnx

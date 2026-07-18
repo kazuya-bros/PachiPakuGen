@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "PachiPakuGen",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "identifier": "com.kazuya.pachipakugen",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -24,8 +24,26 @@
   "bundle": {
     "active": true,
     "targets": "nsis",
+    "publisher": "kazuya_bros",
+    "copyright": "Copyright (c) 2026 kazuya_bros",
+    "shortDescription": "1枚の立ち絵からSpriTalk向け表情・モーション素材を作成",
+    "longDescription": "See-Throughによるレイヤー分解、RIFE補完、モーション調整、マイク連動ライブ表示をまとめたWindowsデスクトップアプリです。",
+    "license": "MIT",
+    "licenseFile": "../LICENSE",
+    "category": "GraphicsAndDesign",
     "resources": {
-      "models/rife.onnx": "models/rife.onnx"
+      "models/rife.onnx": "models/rife.onnx",
+      "../LICENSE": "LICENSE",
+      "../NOTICE": "NOTICE",
+      "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
+      "../licenses/Apache-2.0.txt": "licenses/Apache-2.0.txt",
+      "../licenses/Anime2.5DRig-MIT.txt": "licenses/Anime2.5DRig-MIT.txt",
+      "../licenses/Practical-RIFE-MIT.txt": "licenses/Practical-RIFE-MIT.txt",
+      "../licenses/NPM_DEPENDENCIES.html": "licenses/NPM_DEPENDENCIES.html",
+      "../licenses/CARGO_DEPENDENCIES.html": "licenses/CARGO_DEPENDENCIES.html",
+      "../licenses/SEE_THROUGH_PYTHON_DEPENDENCIES.html": "licenses/SEE_THROUGH_PYTHON_DEPENDENCIES.html",
+      "../docs/rife-model-provenance.md": "docs/rife-model-provenance.md",
+      "../scripts/export_rife_v492_onnx.py": "scripts/export_rife_v492_onnx.py"
     },
     "icon": [
       "icons/32x32.png",

@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, isTauri } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { open, save } from "@tauri-apps/plugin-dialog";
+import { open } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
 import "./App.css";
 
@@ -12,20 +12,10 @@ import {
   type LayerInfo,
   type MappingPreviewResult,
   type RenderCategoryResult,
-  type ExportCorrectedLayerResult,
-  type ImportCorrectionLayerResult,
-  type OriginalImageResult,
-  type MouthMaskPreviewResult,
   type CreateBaseResult,
-  type CreateDiffResult,
   type ProgressPayload,
   type LayerPatch,
-  type InterpPair,
-  type MouthMaskSetting,
   type PreviewPan,
-  type DiffPreview,
-  type InterpStep,
-  type BaseStep,
   type WorkspaceStep,
   type WorkspaceMouthCornerMode,
   type SeeThroughProfile,
@@ -38,11 +28,11 @@ import {
   type WorkspaceGeneratedPartsStatus,
   type ExtractCodexGeneratedPartsResult,
   type PreviewCodexCompositeResult,
-  type PreviewCodexRifeResult,
   type GenerateCodexRifeOutputResult,
   type SaveCodexBasePartsResult,
   type AdjustCodexExtractedPartsResult,
   type LoadCodexExpressionJobResult,
+  type PartAdjustment,
   DEFAULT_SEE_THROUGH_OPTIONS,
   RIFE_FRAME_MIN,
   RIFE_FRAME_MAX,
@@ -56,15 +46,212 @@ import {
   workspacePreviewItemLabel,
   WORKSPACE_ADJUST_PART_KEYS,
   DEFAULT_PART_ADJUSTMENT,
-  EYE_PAIRS,
-  MOUTH_PAIRS_SINGLE,
-  MOUTH_PAIRS_VOWELS,
 } from "./workspace/types";
 import { loadMotionLabImage } from "./motionLab/render";
 import { MotionTunePanel } from "./motionLab/MotionTunePanel";
+import { MotionLiveView } from "./motionLab/MotionLiveView";
+import type { MotionLabManifestResult, SpritalkMotionProfileResult } from "./motionLab/types";
+import {
+  buildWorkspacePhaseModel,
+  persistenceCommandAfterWorkspaceEdit,
+  restoredWorkspaceStep,
+  workspaceArtifactReadiness,
+} from "./workspace/phaseModel";
+import "./WorkspaceFlow.css";
 
-type Mode = "select" | "workspace" | "base_input" | "hair_edit" | "base_edit" | "correction" | "interp";
+type Mode = "select" | "workspace" | "live";
 type ThemeMode = "dark" | "light";
+type WorkspaceInlineEditor = "base" | "position" | "motion" | null;
+type LiveOrigin = "select" | "workspace";
+type WorkspaceBaseEditorSnapshot = {
+  signature: string;
+  layerMapping: Record<string, string>;
+  bodyPreview: string;
+  enabledLayers: Record<string, boolean>;
+  layerOrder: string[];
+  layerPatches: LayerPatch[];
+  layerOpacities: Record<string, number>;
+  chestMaskDataUrl: string | null;
+};
+type WorkspacePartBounds = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+type WorkspacePositionVisual = {
+  part: string;
+  baseImage: HTMLImageElement;
+  partImage: HTMLImageElement;
+  companionImage: HTMLImageElement | null;
+  companionPart: string | null;
+  alphaMask: Uint8Array;
+  bounds: WorkspacePartBounds;
+  width: number;
+  height: number;
+};
+type WorkspacePartAdjustmentDrafts = Record<string, PartAdjustment>;
+
+function sameWorkspacePartAdjustment(left: PartAdjustment | undefined, right: PartAdjustment | undefined) {
+  return left?.offsetX === right?.offsetX
+    && left?.offsetY === right?.offsetY
+    && left?.scalePercent === right?.scalePercent;
+}
+
+function cloneWorkspacePartAdjustment(adjustment?: PartAdjustment): PartAdjustment {
+  const source = adjustment ?? DEFAULT_PART_ADJUSTMENT;
+  return {
+    offsetX: source.offsetX,
+    offsetY: source.offsetY,
+    scalePercent: source.scalePercent,
+  };
+}
+
+function normalizeWorkspacePartAdjustment(adjustment: PartAdjustment): PartAdjustment {
+  const finiteOr = (value: number, fallback: number) => Number.isFinite(value) ? Math.round(value) : fallback;
+  return {
+    offsetX: finiteOr(adjustment.offsetX, 0),
+    offsetY: finiteOr(adjustment.offsetY, 0),
+    scalePercent: Math.min(150, Math.max(50, finiteOr(adjustment.scalePercent, 100))),
+  };
+}
+
+function createWorkspacePartAdjustmentDrafts(
+  adjustments: Record<string, PartAdjustment> = {},
+): WorkspacePartAdjustmentDrafts {
+  return Object.fromEntries(WORKSPACE_ADJUST_PART_KEYS.map(part => [
+    part,
+    cloneWorkspacePartAdjustment(adjustments[part]),
+  ]));
+}
+
+function cloneWorkspacePartAdjustmentDrafts(
+  drafts: WorkspacePartAdjustmentDrafts,
+): WorkspacePartAdjustmentDrafts {
+  return Object.fromEntries(WORKSPACE_ADJUST_PART_KEYS.map(part => [
+    part,
+    cloneWorkspacePartAdjustment(drafts[part]),
+  ]));
+}
+
+function workspacePartAdjustmentDraftsDiffer(
+  left: WorkspacePartAdjustmentDrafts,
+  right: WorkspacePartAdjustmentDrafts,
+) {
+  return WORKSPACE_ADJUST_PART_KEYS.some(part => !sameWorkspacePartAdjustment(left[part], right[part]));
+}
+
+function isDefaultWorkspacePartAdjustment(adjustment?: PartAdjustment) {
+  return sameWorkspacePartAdjustment(adjustment, DEFAULT_PART_ADJUSTMENT);
+}
+
+function workspaceChildPath(root: string, ...segments: string[]) {
+  const separator = root.includes("\\") ? "\\" : "/";
+  return [root.replace(/[\\/]+$/, ""), ...segments.map(segment => segment.replace(/^[\\/]+|[\\/]+$/g, ""))]
+    .join(separator);
+}
+
+function workspaceCompanionPart(part: string) {
+  if (part.startsWith("eyes-")) return "mouth-closed";
+  if (part.startsWith("mouth-")) return "eyes-open";
+  return null;
+}
+
+function analyzeWorkspacePartImage(image: HTMLImageElement) {
+  const width = image.naturalWidth;
+  const height = image.naturalHeight;
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  if (!context) throw new Error("差分パーツの当たり判定を準備できませんでした");
+  context.drawImage(image, 0, 0, width, height);
+  const pixels = context.getImageData(0, 0, width, height).data;
+  const alphaMask = new Uint8Array(width * height);
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+  for (let index = 0; index < alphaMask.length; index += 1) {
+    const alpha = pixels[index * 4 + 3];
+    alphaMask[index] = alpha;
+    if (alpha <= 8) continue;
+    const x = index % width;
+    const y = Math.floor(index / width);
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+  if (maxX < minX || maxY < minY) throw new Error("差分パーツに表示できる画素がありません");
+  return {
+    alphaMask,
+    bounds: { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 },
+    width,
+    height,
+  };
+}
+
+function workspacePartGeometry(
+  visual: WorkspacePositionVisual,
+  offsetX: number,
+  offsetY: number,
+  scalePercent: number,
+) {
+  const { scaledWidth, scaledHeight, originX, originY } = workspacePartCanvasTransform(
+    visual.width,
+    visual.height,
+    offsetX,
+    offsetY,
+    scalePercent,
+  );
+  const scaleX = scaledWidth / visual.width;
+  const scaleY = scaledHeight / visual.height;
+  return {
+    scaledWidth,
+    scaledHeight,
+    originX,
+    originY,
+    scaleX,
+    scaleY,
+    bounds: {
+      x: originX + visual.bounds.x * scaleX,
+      y: originY + visual.bounds.y * scaleY,
+      width: visual.bounds.width * scaleX,
+      height: visual.bounds.height * scaleY,
+    },
+  };
+}
+
+function workspacePartCanvasTransform(
+  width: number,
+  height: number,
+  offsetX: number,
+  offsetY: number,
+  scalePercent: number,
+) {
+  const scaledWidth = Math.max(1, Math.floor((width * scalePercent) / 100));
+  const scaledHeight = Math.max(1, Math.floor((height * scalePercent) / 100));
+  return {
+    scaledWidth,
+    scaledHeight,
+    originX: Math.floor((width - scaledWidth) / 2) + offsetX,
+    originY: Math.floor((height - scaledHeight) / 2) + offsetY,
+  };
+}
+
+function WorkspaceToolbarIcon({ name }: { name: "sun" | "moon" | "home" | "folder" }) {
+  if (name === "sun") {
+    return <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.42-1.42M17.66 6.34l1.41-1.41" /></svg>;
+  }
+  if (name === "moon") {
+    return <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20.3 15.7A8.5 8.5 0 0 1 8.3 3.7 8.5 8.5 0 1 0 20.3 15.7Z" /></svg>;
+  }
+  if (name === "home") {
+    return <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m3 11 9-8 9 8" /><path d="M5 10v10h14V10M9 20v-6h6v6" /></svg>;
+  }
+  return <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M3 6.5h7l2 2h9v10.5H3z" /><path d="M3 9h18" /></svg>;
+}
 
 const WORKSPACE_MOUTH_CORNER_OPTIONS: Array<{
   value: WorkspaceMouthCornerMode;
@@ -87,20 +274,25 @@ function App() {
   // Shared
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
-  const [status, setStatus] = useState("モードを選択してください");
+  const [status, setStatus] = useState("作業を選択してください");
 
   const [workspaceStep, setWorkspaceStep] = useState<WorkspaceStep>(1);
   const [expressionWorkspace, setExpressionWorkspace] = useState<ExpressionWorkspaceResult | null>(null);
+  const activeWorkspacePath = useRef<string | null>(null);
   const [workspaceFiles, setWorkspaceFiles] = useState<Record<string, string>>({});
   const [workspaceImagePreviews, setWorkspaceImagePreviews] = useState<Record<string, string>>({});
   const [workspaceCodexPrompt, setWorkspaceCodexPrompt] = useState("");
   const [workspaceMouthCorner, setWorkspaceMouthCorner] = useState<WorkspaceMouthCornerMode>("flat");
+  const [workspaceAssetPreparationMethod, setWorkspaceAssetPreparationMethod] = useState<"codex" | "image-ai" | "manual">("codex");
   const [workspaceCodexRequestDirty, setWorkspaceCodexRequestDirty] = useState(false);
   const [workspaceGeneratedStatus, setWorkspaceGeneratedStatus] = useState<WorkspaceGeneratedPartsStatus | null>(null);
+  const workspaceGeneratedPollRequestId = useRef(0);
   const [workspaceExtractResult, setWorkspaceExtractResult] = useState<ExtractCodexGeneratedPartsResult | null>(null);
   const [workspaceCompositePreview, setWorkspaceCompositePreview] = useState<PreviewCodexCompositeResult | null>(null);
-  const [workspaceRifePreview, setWorkspaceRifePreview] = useState<PreviewCodexRifeResult | null>(null);
-  const [workspaceSelectedPreviewPart, setWorkspaceSelectedPreviewPart] = useState<string>("base");
+  const [workspaceOverviewPreviewPart, setWorkspaceOverviewPreviewPart] = useState<string>("eyes-open");
+  const [workspaceOverviewPreviewLoading, setWorkspaceOverviewPreviewLoading] = useState(false);
+  const workspaceOverviewPreviewLoadingRef = useRef(false);
+  const [workspaceSelectedPreviewPart, setWorkspaceSelectedPreviewPart] = useState<string>("eyes-open");
   const [workspacePreviewZoom, setWorkspacePreviewZoom] = useState(1);
   const [workspacePreviewPan, setWorkspacePreviewPan] = useState<PreviewPan>({ x: 0, y: 0 });
   const [workspacePreviewDragging, setWorkspacePreviewDragging] = useState(false);
@@ -112,9 +304,34 @@ function App() {
     mode: "pan" | "part";
     startOffsetX: number;
     startOffsetY: number;
+    sourcePerClientX?: number;
+    sourcePerClientY?: number;
   } | null>(null);
+  const workspacePositionCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [workspacePositionVisual, setWorkspacePositionVisual] = useState<WorkspacePositionVisual | null>(null);
+  const [workspacePartHovered, setWorkspacePartHovered] = useState(false);
+  const [workspacePartSaving, setWorkspacePartSaving] = useState(false);
+  const workspacePositionVisualLoadId = useRef(0);
+  const [workspacePartDrafts, setWorkspacePartDrafts] = useState<WorkspacePartAdjustmentDrafts>(
+    () => createWorkspacePartAdjustmentDrafts(),
+  );
+  const workspacePartDraftsRef = useRef<WorkspacePartAdjustmentDrafts>(createWorkspacePartAdjustmentDrafts());
+  const workspacePartEditorBaseline = useRef<WorkspacePartAdjustmentDrafts>(createWorkspacePartAdjustmentDrafts());
+  const workspacePartPersistedDuringEditor = useRef(false);
   const [workspaceRifeResult, setWorkspaceRifeResult] = useState<GenerateCodexRifeOutputResult | null>(null);
   const [workspaceBusy, setWorkspaceBusy] = useState(false);
+  const [workspaceInlineEditor, setWorkspaceInlineEditor] = useState<WorkspaceInlineEditor>(null);
+  const [workspaceEditorPreparing, setWorkspaceEditorPreparing] = useState(false);
+  const [motionProfileReady, setMotionProfileReady] = useState(false);
+  const [motionEditorDirty, setMotionEditorDirty] = useState(false);
+  const [motionDraftSaveRequestId, setMotionDraftSaveRequestId] = useState(0);
+  const [motionEditorDraftSaveBusy, setMotionEditorDraftSaveBusy] = useState(false);
+  const [motionExportRequestId, setMotionExportRequestId] = useState(0);
+  const [motionEditorExportReady, setMotionEditorExportReady] = useState(false);
+  const [motionEditorExportBusy, setMotionEditorExportBusy] = useState(false);
+  const [motionPostSaveDestination, setMotionPostSaveDestination] = useState<"overview" | "live">("overview");
+  const [livePartsDir, setLivePartsDir] = useState<string | null>(null);
+  const [liveOrigin, setLiveOrigin] = useState<LiveOrigin>("select");
   const [seeThroughRuntime, setSeeThroughRuntime] = useState<SeeThroughRuntimeStatus | null>(null);
   const [seeThroughProgress, setSeeThroughProgress] = useState<SeeThroughProgress | null>(null);
   const [seeThroughStartedAt, setSeeThroughStartedAt] = useState<number | null>(null);
@@ -150,16 +367,10 @@ function App() {
   const [workspacePartOffsetX, setWorkspacePartOffsetX] = useState(0);
   const [workspacePartOffsetY, setWorkspacePartOffsetY] = useState(0);
   const [workspacePartScale, setWorkspacePartScale] = useState(100);
-  /** Step5の調整対象: "all"=全パーツ一括 / それ以外=パーツ個別（例: "mouth-a"） */
-  const [workspaceAdjustTarget, setWorkspaceAdjustTarget] = useState("all");
+  /** Step5で現在選択している目・口パーツ */
+  const [workspaceAdjustTarget, setWorkspaceAdjustTarget] = useState("eyes-open");
   /** Step5プレビュー上のドラッグでパーツを動かすモード */
-  const [workspacePartDragMode, setWorkspacePartDragMode] = useState(false);
-  /** Step5で位置補正を適用済みのパーツ（サムネイルのバッジ表示用） */
-  const [workspaceAdjustedParts, setWorkspaceAdjustedParts] = useState<Record<string, boolean>>({});
-  /** 直近に「読み込んだ/適用した」値のベースライン。これと一致する間は変更なしとみなし自動適用しない
-   * （対象パーツ切替時に値を復元しても誤って再適用しないため。値の一致だけでなくtargetも見る） */
-  const workspaceAdjustBaseline = useRef({ target: "all", offsetX: 0, offsetY: 0, scalePercent: 100 });
-  const workspaceAdjustDebounceTimer = useRef<number | null>(null);
+  const [workspacePartDragMode, setWorkspacePartDragMode] = useState(true);
   /** 完了フィードバック用トースト（3秒で自動消滅） */
   const [toast, setToast] = useState("");
   const toastTimer = useRef<number | null>(null);
@@ -184,79 +395,281 @@ function App() {
     window.localStorage.setItem("pachipakugen-theme", themeMode);
   }, [themeMode]);
 
-  // STEP2: Codex成果物の自動確認（依頼作成後〜揃うまで5秒間隔でポーリング）
+  // STEP2: 表情素材の自動確認（作成ガイド出力後〜揃うまで5秒間隔でポーリング）
   useEffect(() => {
-    if (mode !== "workspace" || workspaceStep !== 2) return;
+    if (mode !== "workspace" || workspaceStep !== 2 || workspaceBusy) return;
     if (!expressionWorkspace || !workspaceGeneratedStatus || workspaceGeneratedStatus.ready) return;
     const workPath = expressionWorkspace.workPath;
-    const timer = window.setInterval(async () => {
+    const pollRequestId = ++workspaceGeneratedPollRequestId.current;
+    let checking = false;
+    const checkGeneratedParts = async () => {
+      if (checking) return;
+      checking = true;
       try {
         const generated = await invoke<WorkspaceGeneratedPartsStatus>("inspect_workspace_generated_parts", { workPath });
+        if (workspaceGeneratedPollRequestId.current !== pollRequestId || activeWorkspacePath.current !== workPath) return;
         setWorkspaceGeneratedStatus(generated);
+        if (generated.downstreamStale) {
+          const synced = await reloadWorkspaceAfterMutationFailure(workPath);
+          if (workspaceGeneratedPollRequestId.current !== pollRequestId || activeWorkspacePath.current !== workPath) return;
+          if (!synced) {
+            setError("表情素材の変更を検知しましたが、作業状態を再読込できませんでした。作業フォルダを開き直してください");
+            return;
+          }
+          setStatus("表情素材の変更を検知しました。STEP3から再処理してください");
+          showToast("表情素材の変更を検知しました");
+          return;
+        }
         if (generated.ready) {
-          showToast("Codex成果物が揃いました");
-          setStatus("Codex成果物が揃いました。STEP3へ進めます");
+          showToast("表情素材が揃いました");
+          setStatus("表情素材が揃いました。STEP3へ進めます");
         }
       } catch {
         // 依頼作成前のフォルダ状態では失敗してよい
+      } finally {
+        checking = false;
       }
-    }, 5000);
-    return () => window.clearInterval(timer);
+    };
+    const timer = window.setInterval(() => void checkGeneratedParts(), 5000);
+    return () => {
+      workspaceGeneratedPollRequestId.current += 1;
+      window.clearInterval(timer);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, workspaceStep, expressionWorkspace, workspaceGeneratedStatus]);
+  }, [mode, workspaceStep, workspaceBusy, expressionWorkspace, workspaceGeneratedStatus]);
 
-  // STEP5: 「パーツ移動」ON中は矢印キーで±1px（Shiftで±10px）微調整できる
+  function setWorkspacePartDraft(part: string, adjustment: PartAdjustment, syncFields = true) {
+    const normalized = normalizeWorkspacePartAdjustment(adjustment);
+    const nextDrafts = {
+      ...workspacePartDraftsRef.current,
+      [part]: normalized,
+    };
+    workspacePartDraftsRef.current = nextDrafts;
+    setWorkspacePartDrafts(nextDrafts);
+    if (syncFields && part === workspaceAdjustTarget) {
+      setWorkspacePartOffsetX(normalized.offsetX);
+      setWorkspacePartOffsetY(normalized.offsetY);
+      setWorkspacePartScale(normalized.scalePercent);
+    }
+  }
+
+  function updateSelectedWorkspacePartDraft(patch: Partial<PartAdjustment>) {
+    const current = workspacePartDraftsRef.current[workspaceAdjustTarget] ?? DEFAULT_PART_ADJUSTMENT;
+    setWorkspacePartDraft(workspaceAdjustTarget, { ...current, ...patch });
+  }
+
+  /** STEP5: 選択したパーツの下書き値をフィールドへ投影する。パーツ切替では保存しない。 */
+  function loadWorkspacePartAdjustmentFields(target: string) {
+    const values = workspacePartDraftsRef.current[target] ?? DEFAULT_PART_ADJUSTMENT;
+    setWorkspacePartOffsetX(values.offsetX);
+    setWorkspacePartOffsetY(values.offsetY);
+    setWorkspacePartScale(values.scalePercent);
+  }
+
+  function selectWorkspacePositionPart(part: string) {
+    if (!WORKSPACE_ADJUST_PART_KEYS.includes(part)) return;
+    if (part === workspaceAdjustTarget && part === workspaceSelectedPreviewPart) return;
+    setWorkspaceSelectedPreviewPart(part);
+    setWorkspaceAdjustTarget(part);
+    setWorkspacePartDragMode(true);
+    loadWorkspacePartAdjustmentFields(part);
+  }
+
+  // STEP5: 矢印キーは選択中パーツの下書きだけを±1px（Shiftで±10px）動かす。
   useEffect(() => {
-    if (mode !== "workspace" || workspaceStep !== 5 || !workspacePartDragMode) return;
+    if (mode !== "workspace"
+      || workspaceStep !== 5
+      || workspaceInlineEditor !== "position"
+      || !workspacePartDragMode
+      || workspaceBusy) return;
     const onKey = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
       if (target && ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName)) return;
       const delta = event.shiftKey ? 10 : 1;
-      if (event.key === "ArrowLeft") setWorkspacePartOffsetX(v => v - delta);
-      else if (event.key === "ArrowRight") setWorkspacePartOffsetX(v => v + delta);
-      else if (event.key === "ArrowUp") setWorkspacePartOffsetY(v => v - delta);
-      else if (event.key === "ArrowDown") setWorkspacePartOffsetY(v => v + delta);
+      const current = workspacePartDraftsRef.current[workspaceAdjustTarget] ?? DEFAULT_PART_ADJUSTMENT;
+      if (event.key === "ArrowLeft") setWorkspacePartDraft(workspaceAdjustTarget, { ...current, offsetX: current.offsetX - delta });
+      else if (event.key === "ArrowRight") setWorkspacePartDraft(workspaceAdjustTarget, { ...current, offsetX: current.offsetX + delta });
+      else if (event.key === "ArrowUp") setWorkspacePartDraft(workspaceAdjustTarget, { ...current, offsetY: current.offsetY - delta });
+      else if (event.key === "ArrowDown") setWorkspacePartDraft(workspaceAdjustTarget, { ...current, offsetY: current.offsetY + delta });
       else return;
       event.preventDefault();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [mode, workspaceStep, workspacePartDragMode]);
-
-  // STEP5: オフセット/スケールが読み込み済みベースラインから変化したら、ドラッグ中でなければ
-  // 少し待って自動適用する。「対象パーツ切替による値の読み込み」はベースライン比較で除外され、
-  // 誤って別パーツへ上書き適用してしまう事故を防ぐ
-  useEffect(() => {
-    if (mode !== "workspace" || workspaceStep !== 5) return;
-    const baseline = workspaceAdjustBaseline.current;
-    const unchanged = baseline.target === workspaceAdjustTarget
-      && baseline.offsetX === workspacePartOffsetX
-      && baseline.offsetY === workspacePartOffsetY
-      && baseline.scalePercent === workspacePartScale;
-    if (unchanged || workspacePreviewDragging || !workspaceExtractResult) return;
-    if (workspaceAdjustDebounceTimer.current !== null) window.clearTimeout(workspaceAdjustDebounceTimer.current);
-    workspaceAdjustDebounceTimer.current = window.setTimeout(() => {
-      workspaceAdjustDebounceTimer.current = null;
-      void applyWorkspacePartAdjustment();
-    }, 250);
-    return () => {
-      if (workspaceAdjustDebounceTimer.current !== null) {
-        window.clearTimeout(workspaceAdjustDebounceTimer.current);
-        workspaceAdjustDebounceTimer.current = null;
-      }
-    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [workspacePartOffsetX, workspacePartOffsetY, workspacePartScale, workspaceAdjustTarget]);
+  }, [mode, workspaceStep, workspaceInlineEditor, workspacePartDragMode, workspaceAdjustTarget, workspaceBusy]);
 
-  /** STEP5: 「対象」切替時、そのパーツの実際の現在値をフィールドへ読み込む（前の対象の値が残るのを防ぐ） */
-  function loadWorkspacePartAdjustmentFields(target: string) {
-    const adjustment = target === "all" ? undefined : workspaceExtractResult?.partAdjustments[target];
-    const values = adjustment ?? DEFAULT_PART_ADJUSTMENT;
-    workspaceAdjustBaseline.current = { target, ...values };
-    setWorkspacePartOffsetX(values.offsetX);
-    setWorkspacePartOffsetY(values.offsetY);
-    setWorkspacePartScale(values.scalePercent);
-  }
+  useEffect(() => {
+    if (workspaceInlineEditor !== "position" || WORKSPACE_ADJUST_PART_KEYS.includes(workspaceAdjustTarget)) return;
+    const available = workspaceCompositePreview?.previews.map(item => item.part) ?? [];
+    const fallback = available.includes("eyes-open")
+      ? "eyes-open"
+      : available.find(part => WORKSPACE_ADJUST_PART_KEYS.includes(part));
+    if (!fallback) return;
+    setWorkspaceSelectedPreviewPart(fallback);
+    setWorkspaceAdjustTarget(fallback);
+    setWorkspacePartDragMode(true);
+    loadWorkspacePartAdjustmentFields(fallback);
+  }, [workspaceInlineEditor, workspaceAdjustTarget, workspaceCompositePreview, workspaceExtractResult]);
+
+  useEffect(() => {
+    const loadId = ++workspacePositionVisualLoadId.current;
+    const basePreview = workspaceCompositePreview?.basePreview;
+    const extractedPath = workspaceExtractResult?.extractedPartsPath;
+    const editable = mode === "workspace"
+      && workspaceStep === 5
+      && workspaceInlineEditor === "position"
+      && workspaceAdjustTarget !== "all"
+      && WORKSPACE_ADJUST_PART_KEYS.includes(workspaceAdjustTarget);
+    if (!editable || !basePreview || !extractedPath) {
+      setWorkspacePositionVisual(null);
+      setWorkspacePartHovered(false);
+      return;
+    }
+
+    void (async () => {
+      try {
+        const loadOriginalPartPreview = async (part: string) => {
+          const originalPath = workspaceChildPath(
+            extractedPath,
+            "original_extracted_parts",
+            `${part}.png`,
+          );
+          try {
+            return await invoke<string>("load_expression_source_preview", { path: originalPath });
+          } catch {
+            // 初回調整前はoriginal_extracted_partsが無い。現在PNGはまだ原本と同じなので利用できる。
+            return invoke<string>("load_expression_source_preview", {
+              path: workspaceChildPath(extractedPath, `${part}.png`),
+            });
+          }
+        };
+        const partPreview = await loadOriginalPartPreview(workspaceAdjustTarget);
+        const companionPart = workspaceCompanionPart(workspaceAdjustTarget);
+        const companionPreview = companionPart
+          ? await loadOriginalPartPreview(companionPart).catch(() => null)
+          : null;
+        const [baseImage, partImage, companionImage] = await Promise.all([
+          loadMotionLabImage(basePreview),
+          loadMotionLabImage(partPreview),
+          companionPreview ? loadMotionLabImage(companionPreview) : Promise.resolve(null),
+        ]);
+        const analyzed = analyzeWorkspacePartImage(partImage);
+        if (loadId !== workspacePositionVisualLoadId.current) return;
+        setWorkspacePositionVisual({
+          part: workspaceAdjustTarget,
+          baseImage,
+          partImage,
+          companionImage,
+          companionPart,
+          ...analyzed,
+        });
+        setWorkspacePartHovered(false);
+      } catch {
+        if (loadId === workspacePositionVisualLoadId.current) {
+          // 合成済みプレビューへフォールバックする。位置調整自体は数値・矢印で継続できる。
+          setWorkspacePositionVisual(null);
+          setWorkspacePartHovered(false);
+        }
+      }
+    })();
+  }, [
+    mode,
+    workspaceStep,
+    workspaceInlineEditor,
+    workspaceAdjustTarget,
+    workspaceExtractResult?.extractedPartsPath,
+    workspaceCompositePreview?.basePreview,
+  ]);
+
+  useEffect(() => {
+    const canvas = workspacePositionCanvasRef.current;
+    const visual = workspacePositionVisual;
+    if (!canvas || !visual || visual.part !== workspaceAdjustTarget) return;
+    if (canvas.width !== visual.width) canvas.width = visual.width;
+    if (canvas.height !== visual.height) canvas.height = visual.height;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+
+    context.clearRect(0, 0, visual.width, visual.height);
+    context.imageSmoothingEnabled = true;
+    context.imageSmoothingQuality = "high";
+    context.drawImage(visual.baseImage, 0, 0, visual.width, visual.height);
+    const geometry = workspacePartGeometry(
+      visual,
+      workspacePartOffsetX,
+      workspacePartOffsetY,
+      workspacePartScale,
+    );
+    const drawSelectedPart = () => context.drawImage(
+      visual.partImage,
+      geometry.originX,
+      geometry.originY,
+      geometry.scaledWidth,
+      geometry.scaledHeight,
+    );
+    const drawCompanion = () => {
+      if (!visual.companionImage || !visual.companionPart) return;
+      const adjustment = workspacePartDrafts[visual.companionPart] ?? DEFAULT_PART_ADJUSTMENT;
+      const companionGeometry = workspacePartCanvasTransform(
+        visual.width,
+        visual.height,
+        adjustment.offsetX,
+        adjustment.offsetY,
+        adjustment.scalePercent,
+      );
+      context.drawImage(
+        visual.companionImage,
+        companionGeometry.originX,
+        companionGeometry.originY,
+        companionGeometry.scaledWidth,
+        companionGeometry.scaledHeight,
+      );
+    };
+    // 実際の合成順と同じく目→口。相方は表示のみで、当たり判定は選択中パーツに限定する。
+    if (visual.part.startsWith("eyes-")) {
+      drawSelectedPart();
+      drawCompanion();
+    } else {
+      drawCompanion();
+      drawSelectedPart();
+    }
+
+    // 小さい閉じ口でも見失わないよう、実画素の周囲に画面上最低32pxの操作枠を表示する。
+    if (workspacePartDragMode) {
+      const canvasRect = canvas.getBoundingClientRect();
+      const displayScale = Math.max(0.001, canvasRect.width / visual.width);
+      const padding = 8 / displayScale;
+      const minimumSize = 32 / displayScale;
+      const hitWidth = Math.max(geometry.bounds.width + padding * 2, minimumSize);
+      const hitHeight = Math.max(geometry.bounds.height + padding * 2, minimumSize);
+      const hitX = geometry.bounds.x + geometry.bounds.width / 2 - hitWidth / 2;
+      const hitY = geometry.bounds.y + geometry.bounds.height / 2 - hitHeight / 2;
+      const draggingPart = workspacePreviewDragging && workspacePreviewDrag.current?.mode === "part";
+      context.save();
+      context.lineWidth = (workspacePartHovered || draggingPart ? 2.5 : 1.5) / displayScale;
+      context.strokeStyle = workspacePartHovered || draggingPart ? "#1677ff" : "rgba(22, 119, 255, 0.72)";
+      context.fillStyle = workspacePartHovered || draggingPart
+        ? "rgba(22, 119, 255, 0.10)"
+        : "rgba(22, 119, 255, 0.04)";
+      context.setLineDash([6 / displayScale, 4 / displayScale]);
+      context.fillRect(hitX, hitY, hitWidth, hitHeight);
+      context.strokeRect(hitX, hitY, hitWidth, hitHeight);
+      context.restore();
+    }
+  }, [
+    workspacePositionVisual,
+    workspaceAdjustTarget,
+    workspacePartOffsetX,
+    workspacePartOffsetY,
+    workspacePartScale,
+    workspacePartDrafts,
+    workspacePartDragMode,
+    workspacePartHovered,
+    workspacePreviewDragging,
+    workspacePreviewZoom,
+    workspacePreviewPan,
+  ]);
 
   // STEP1: 画像ファイルのドラッグ&ドロップ対応（1枚目=立ち絵、2枚目=参照画像）
   useEffect(() => {
@@ -281,6 +694,7 @@ function App() {
         void loadWorkspaceImagePreviews(next);
         return next;
       });
+      setWorkspaceCodexRequestDirty(true);
       setStatus("ドロップした画像を設定しました");
     }).then(fn => {
       if (disposed) fn();
@@ -297,16 +711,8 @@ function App() {
   const [loadResult, setLoadResult] = useState<SlotLoadResult | null>(null);
   const [layerMapping, setLayerMapping] = useState<Record<string, string>>({});
 
-  // === 素体モード ===
+  // === STEP 4: 素体編集 ===
   const [mappingPreview, setMappingPreview] = useState<MappingPreviewResult | null>(null);
-  // Step1: hair
-  const [hairPreview, setHairPreview] = useState("");
-  const [hairEnabledLayers, setHairEnabledLayers] = useState<Record<string, boolean>>({});
-  const [hairLayerOrder, setHairLayerOrder] = useState<string[]>([]);
-  const [hairBackPreview, setHairBackPreview] = useState("");
-  const [hairBackEnabledLayers, setHairBackEnabledLayers] = useState<Record<string, boolean>>({});
-  const [hairBackLayerOrder, setHairBackLayerOrder] = useState<string[]>([]);
-  // Step2: body
   const [bodyPreview, setBodyPreview] = useState("");
   const [enabledLayers, setEnabledLayers] = useState<Record<string, boolean>>({});
   const [layerOrder, setLayerOrder] = useState<string[]>([]);
@@ -314,44 +720,19 @@ function App() {
   const [layerOpacities, setLayerOpacities] = useState<Record<string, number>>({});
   const [selectedBodyLayer, setSelectedBodyLayer] = useState<string>("");
   const [overlapHighlightEnabled, setOverlapHighlightEnabled] = useState(false);
-  const [baseResult, setBaseResult] = useState<CreateBaseResult | null>(null);
-  const [correctionOutputPath, setCorrectionOutputPath] = useState("");
-  const [baseStep, setBaseStep] = useState<BaseStep>(1);
   const [patchDraftSource, setPatchDraftSource] = useState("");
   const [patchTool, setPatchTool] = useState<"paint" | "erase">("paint");
   const [patchBrushSize, setPatchBrushSize] = useState(24);
   // 0=硬いエッジ（従来）、1=最大にぼかしたエッジ（境界のギザギザを緩和）
   const [patchBrushSoftness, setPatchBrushSoftness] = useState(0.5);
-  const [sam3SelectMode, setSam3SelectMode] = useState(false);
-  const [sam3Selecting, setSam3Selecting] = useState(false);
-  // 胸を切出（852話式・素体調整の標準導線）: bodyから塗った範囲を chest.png として分離する
+  // 胸部範囲ガイド: Motion Labの局所ワープ位置と旧形式chest.pngの互換出力に使う
   const [chestMaskDataUrl, setChestMaskDataUrl] = useState<string | null>(null);
   const [brushCursor, setBrushCursor] = useState<{ x: number; y: number; size: number; visible: boolean }>({ x: 0, y: 0, size: 0, visible: false });
 
-  // === フレーム補間モード (interp) ===
-  const [diffTarget] = useState<"eye" | "mouth">("eye");
   const [frameCount, setFrameCount] = useState(8);
-  const [outputPath, setOutputPath] = useState("");
   const [progress, setProgress] = useState({ current: 0, total: 0, pair_name: "" });
-  const [completedDiffs, setCompletedDiffs] = useState<string[]>([]);
-  const [diffPreviews, setDiffPreviews] = useState<DiffPreview[]>([]);
-  const [diffPreviewTick, setDiffPreviewTick] = useState(0);
-  const [diffPreviewZoom, setDiffPreviewZoom] = useState(1);
-  const [interpPaths, setInterpPaths] = useState<Record<string, string>>({});
-  const [interpOriginals, setInterpOriginals] = useState<Record<string, string>>({});
-  const [interpGenerating, setInterpGenerating] = useState(false);
-  const [interpStep, setInterpStep] = useState<InterpStep>(1);
-  const [mouthMode] = useState<"single" | "vowels">("single");
-  const [mouthMaskSettings, setMouthMaskSettings] = useState<Record<string, MouthMaskSetting>>({});
-  const [mouthMaskPreviews, setMouthMaskPreviews] = useState<Record<string, string>>({});
-  const [mouthMaskPreviewing, setMouthMaskPreviewing] = useState<Record<string, boolean>>({});
-  const [mouthPreviewZooms, setMouthPreviewZooms] = useState<Record<string, number>>({});
-  const [mouthPreviewPans, setMouthPreviewPans] = useState<Record<string, PreviewPan>>({});
-  const [activePreviewKey, setActivePreviewKey] = useState("");
-  const mouthMaskUpdateTimers = useRef<Record<string, number>>({});
-  const mouthPreviewDrag = useRef<{ key: string; startX: number; startY: number; startPan: PreviewPan } | null>(null);
 
-  // Zoom & pan (base_edit)
+  // Zoom & pan for the unified STEP 4 editor
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [isPanning, setIsPanning] = useState(false);
@@ -363,21 +744,25 @@ function App() {
   layerPatchesRef.current = layerPatches;
   const layerOpacitiesRef = useRef(layerOpacities);
   layerOpacitiesRef.current = layerOpacities;
+  const baseEditorBaselineRef = useRef<WorkspaceBaseEditorSnapshot | null>(null);
   const opacityRenderTimer = useRef<number | null>(null);
   // 表示切替の連打をまとめて1回の再合成にするためのデバウンス
   const toggleRenderTimer = useRef<number | null>(null);
   const enabledLayersRef = useRef<Record<string, boolean>>({});
-  // Drag reorder (generic - used for body, hair, hair_back)
-  type DragTarget = "body" | "hair" | "hair_back";
-  const dragState = useRef<{ target: DragTarget; idx: number; startY: number; currentIdx: number } | null>(null);
+  const dragState = useRef<{ idx: number; startY: number; currentIdx: number } | null>(null);
+
+  useEffect(() => {
+    if (workspaceInlineEditor === "base" && !workspaceEditorPreparing && baseEditorBaselineRef.current === null) {
+      baseEditorBaselineRef.current = createWorkspaceBaseEditorSnapshot();
+    } else if (workspaceInlineEditor !== "base") {
+      baseEditorBaselineRef.current = null;
+    }
+    // 編集開始時の一度だけ基準値を記録し、編集操作では更新しない。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspaceInlineEditor, workspaceEditorPreparing]);
   const [draggedIdx, setDraggedIdx] = useState<number | null>(null);
-  const [dragTarget, setDragTarget] = useState<DragTarget | null>(null);
   const layerOrderRef = useRef(layerOrder);
   layerOrderRef.current = layerOrder;
-  const hairLayerOrderRef = useRef(hairLayerOrder);
-  hairLayerOrderRef.current = hairLayerOrder;
-  const hairBackLayerOrderRef = useRef(hairBackLayerOrder);
-  hairBackLayerOrderRef.current = hairBackLayerOrder;
 
   // 旧版では ears* と headwear を同時に獣耳として扱っていたため、髪飾りまで
   // sway_ear* に保存されている場合がある。明示的な ears* が存在する素材では
@@ -399,6 +784,7 @@ function App() {
   }, [layerOrder, layerMapping]);
 
   useEffect(() => {
+    if (!isTauri()) return;
     const unlisten = listen<ProgressPayload>("generation-progress", (event) => {
       setProgress({ current: event.payload.current, total: event.payload.total, pair_name: event.payload.pair_name });
     });
@@ -419,9 +805,6 @@ function App() {
       if (opacityRenderTimer.current !== null) {
         window.clearTimeout(opacityRenderTimer.current);
       }
-      for (const timer of Object.values(mouthMaskUpdateTimers.current)) {
-        window.clearTimeout(timer);
-      }
     };
   }, []);
 
@@ -437,39 +820,6 @@ function App() {
     const timer = window.setInterval(updateElapsed, 1000);
     return () => window.clearInterval(timer);
   }, [workspaceBusy, seeThroughStartedAt]);
-
-  useEffect(() => {
-    if (diffPreviews.length === 0) return;
-    const timer = window.setInterval(() => {
-      setDiffPreviewTick(prev => prev + 1);
-    }, 160);
-    return () => window.clearInterval(timer);
-  }, [diffPreviews.length]);
-
-  // --- Category rendering ---
-  async function renderCategory(
-    order: string[],
-    enabled: Record<string, boolean>,
-    patches: LayerPatch[] = [],
-    opacities: Record<string, number> = {},
-  ): Promise<string> {
-    const active = [...order.filter(name => enabled[name] !== false)].reverse();
-    try {
-      const result = await invoke<RenderCategoryResult>("render_category", {
-        mappingJson: JSON.stringify(layerMapping), target: "body", enabledLayers: active, layerPatches: patches, layerOpacities: opacities,
-        overlapHighlight: false,
-      });
-      return result.preview;
-    } catch (e) { console.error("render error:", e); return ""; }
-  }
-
-  async function renderHair(order: string[], enabled: Record<string, boolean>) {
-    setHairPreview(await renderCategory(order, enabled, [], {}));
-  }
-
-  async function renderHairBack(order: string[], enabled: Record<string, boolean>) {
-    setHairBackPreview(await renderCategory(order, enabled, [], {}));
-  }
 
   // --- Body rendering ---
   async function renderBody(
@@ -575,38 +925,28 @@ function App() {
     return next;
   }
 
-  // Drag handlers (generic)
-  function getOrderRef(t: DragTarget) {
-    return t === "body" ? layerOrderRef : t === "hair" ? hairLayerOrderRef : hairBackLayerOrderRef;
-  }
-  function onDragPointerDown(e: React.PointerEvent, idx: number, target: DragTarget = "body") {
+  function onDragPointerDown(e: React.PointerEvent, idx: number) {
     e.preventDefault(); (e.target as HTMLElement).setPointerCapture(e.pointerId);
-    dragState.current = { target, idx, startY: e.clientY, currentIdx: idx };
-    setDraggedIdx(idx); setDragTarget(target);
+    dragState.current = { idx, startY: e.clientY, currentIdx: idx };
+    setDraggedIdx(idx);
   }
   function onDragPointerMove(e: React.PointerEvent) {
     if (!dragState.current) return;
-    const ref = getOrderRef(dragState.current.target);
-    const newIdx = Math.max(0, Math.min(ref.current.length - 1,
+    const newIdx = Math.max(0, Math.min(layerOrderRef.current.length - 1,
       dragState.current.idx + Math.round((e.clientY - dragState.current.startY) / 50)));
     if (newIdx !== dragState.current.currentIdx) {
-      const newOrder = [...ref.current];
+      const newOrder = [...layerOrderRef.current];
       const [item] = newOrder.splice(dragState.current.currentIdx, 1);
       newOrder.splice(newIdx, 0, item);
-      const t = dragState.current.target;
-      if (t === "body") setLayerOrder(newOrder);
-      else if (t === "hair") setHairLayerOrder(newOrder);
-      else setHairBackLayerOrder(newOrder);
+      setLayerOrder(newOrder);
       dragState.current.currentIdx = newIdx; setDraggedIdx(newIdx);
     }
   }
   async function onDragPointerUp() {
     if (!dragState.current) return;
-    const t = dragState.current.target;
-    dragState.current = null; setDraggedIdx(null); setDragTarget(null);
-    if (t === "body") await renderBody(layerOrderRef.current, enabledLayers);
-    else if (t === "hair") await renderHair(hairLayerOrderRef.current, hairEnabledLayers);
-    else await renderHairBack(hairBackLayerOrderRef.current, hairBackEnabledLayers);
+    dragState.current = null;
+    setDraggedIdx(null);
+    await renderBody(layerOrderRef.current, enabledLayers);
   }
 
   // Zoom
@@ -630,14 +970,12 @@ function App() {
     if (!e.currentTarget.hasPointerCapture(e.pointerId)) {
       e.currentTarget.setPointerCapture(e.pointerId);
     }
-    // Step5でパーツ移動モードかつ個別パーツ選択中は、ドラッグ=パーツのXY補正
-    const partDrag = workspaceStep === 5 && workspacePartDragMode && workspaceAdjustTarget !== "all";
     workspacePreviewDrag.current = {
       pointerId: e.pointerId,
       startX: e.clientX,
       startY: e.clientY,
       startPan: workspacePreviewPan,
-      mode: partDrag ? "part" : "pan",
+      mode: "pan",
       startOffsetX: workspacePartOffsetX,
       startOffsetY: workspacePartOffsetY,
     };
@@ -651,8 +989,10 @@ function App() {
     if (drag.mode === "part") {
       // 画面座標→画像座標（ズーム補正）でパーツのXY補正値を更新
       const scale = Math.max(0.01, workspacePreviewZoom);
-      setWorkspacePartOffsetX(Math.round(drag.startOffsetX + (e.clientX - drag.startX) / scale));
-      setWorkspacePartOffsetY(Math.round(drag.startOffsetY + (e.clientY - drag.startY) / scale));
+      updateSelectedWorkspacePartDraft({
+        offsetX: Math.round(drag.startOffsetX + (e.clientX - drag.startX) / scale),
+        offsetY: Math.round(drag.startOffsetY + (e.clientY - drag.startY) / scale),
+      });
       return;
     }
     setWorkspacePreviewPan({
@@ -670,13 +1010,11 @@ function App() {
     if (e.currentTarget.hasPointerCapture(e.pointerId)) {
       e.currentTarget.releasePointerCapture(e.pointerId);
     }
-    // パーツ移動ドラッグ終了時は自動で適用→プレビュー更新
-    // （setStateの反映を待たず、イベント座標から最終値を直接計算して渡す）
     if (drag.mode === "part") {
       const scale = Math.max(0.01, workspacePreviewZoom);
-      void applyWorkspacePartAdjustment({
-        x: Math.round(drag.startOffsetX + (e.clientX - drag.startX) / scale),
-        y: Math.round(drag.startOffsetY + (e.clientY - drag.startY) / scale),
+      updateSelectedWorkspacePartDraft({
+        offsetX: Math.round(drag.startOffsetX + (e.clientX - drag.startX) / scale),
+        offsetY: Math.round(drag.startOffsetY + (e.clientY - drag.startY) / scale),
       });
     }
   }
@@ -687,55 +1025,134 @@ function App() {
     setWorkspacePreviewDragging(false);
   }
 
-  // === Step 1: Input ===
-  async function loadPsd() {
-    setError("");
-    const file = await open({ multiple: false, directory: false, filters: [{ name: "PSD", extensions: ["psd"] }] });
-    if (!file) return;
-    setLoading(true); setStatus("PSD読み込み中...");
-    try {
-      const result = await invoke<SlotLoadResult>("load_slot", { path: file });
-      setLoadResult(result);
-      if (Object.keys(layerMapping).length === 0) {
-        const m: Record<string, string> = {};
-        for (const l of result.adjustable_layers) m[l.name] = l.default_target;
-        setLayerMapping(m);
+  function workspacePositionHitTest(clientX: number, clientY: number) {
+    const canvas = workspacePositionCanvasRef.current;
+    const visual = workspacePositionVisual;
+    if (!canvas || !visual || visual.part !== workspaceAdjustTarget || !workspacePartDragMode) {
+      return { hit: false, sourcePerClientX: 1, sourcePerClientY: 1 };
+    }
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) {
+      return { hit: false, sourcePerClientX: 1, sourcePerClientY: 1 };
+    }
+    const canvasX = (clientX - rect.left) * visual.width / rect.width;
+    const canvasY = (clientY - rect.top) * visual.height / rect.height;
+    const geometry = workspacePartGeometry(
+      visual,
+      workspacePartOffsetX,
+      workspacePartOffsetY,
+      workspacePartScale,
+    );
+    const sourceX = (canvasX - geometry.originX) / geometry.scaleX;
+    const sourceY = (canvasY - geometry.originY) / geometry.scaleY;
+    // アルファ形状を画面上12pxだけ膨張。35%表示の閉じ口も掴めるが、顔や胴体は反応しない。
+    const radiusX = Math.max(1, (12 * visual.width / rect.width) / geometry.scaleX);
+    const radiusY = Math.max(1, (12 * visual.height / rect.height) / geometry.scaleY);
+    const bounds = visual.bounds;
+    if (sourceX < bounds.x - radiusX
+      || sourceX > bounds.x + bounds.width + radiusX
+      || sourceY < bounds.y - radiusY
+      || sourceY > bounds.y + bounds.height + radiusY) {
+      return {
+        hit: false,
+        sourcePerClientX: visual.width / rect.width,
+        sourcePerClientY: visual.height / rect.height,
+      };
+    }
+
+    const minY = Math.max(0, Math.floor(sourceY - radiusY));
+    const maxY = Math.min(visual.height - 1, Math.ceil(sourceY + radiusY));
+    let hit = false;
+    for (let y = minY; y <= maxY && !hit; y += 1) {
+      const normalizedY = (y - sourceY) / radiusY;
+      const horizontalRadius = radiusX * Math.sqrt(Math.max(0, 1 - normalizedY * normalizedY));
+      const minX = Math.max(0, Math.floor(sourceX - horizontalRadius));
+      const maxX = Math.min(visual.width - 1, Math.ceil(sourceX + horizontalRadius));
+      for (let x = minX; x <= maxX; x += 1) {
+        if (visual.alphaMask[y * visual.width + x] > 8) {
+          hit = true;
+          break;
+        }
       }
-      setStatus(`PSD読み込み完了 (${result.detected_layers.length}レイヤー)`);
-    } catch (e) { setError(String(e)); }
-    finally { setLoading(false); }
+    }
+    return {
+      hit,
+      sourcePerClientX: visual.width / rect.width,
+      sourcePerClientY: visual.height / rect.height,
+    };
   }
 
-  async function proceedToHairEdit() {
-    setLoading(true); setStatus("Hairレイヤー準備中...");
-    try {
-      const preview = await invoke<MappingPreviewResult>("get_mapping_preview", { mappingJson: JSON.stringify(layerMapping) });
-      setMappingPreview(preview);
-      await openHairEditorWithPreview(preview);
-    } catch (e) { setError(String(e)); }
-    finally { setLoading(false); }
+  function handleWorkspacePositionPointerDown(e: React.PointerEvent<HTMLCanvasElement>) {
+    if (e.button !== 0) return;
+    const hit = workspacePositionHitTest(e.clientX, e.clientY);
+    e.preventDefault();
+    e.stopPropagation();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    workspacePreviewDrag.current = {
+      pointerId: e.pointerId,
+      startX: e.clientX,
+      startY: e.clientY,
+      startPan: workspacePreviewPan,
+      mode: hit.hit ? "part" : "pan",
+      startOffsetX: workspacePartOffsetX,
+      startOffsetY: workspacePartOffsetY,
+      sourcePerClientX: hit.sourcePerClientX,
+      sourcePerClientY: hit.sourcePerClientY,
+    };
+    setWorkspacePartHovered(hit.hit);
+    setWorkspacePreviewDragging(true);
   }
 
-  async function openHairEditorWithPreview(preview: MappingPreviewResult) {
-    const hairCat = preview.categories.find(c => c.target === "hair");
-    if (hairCat) {
-      const order = hairCat.layers.map(l => l.name);
-      setHairLayerOrder(order);
-      const en: Record<string, boolean> = {};
-      for (const l of hairCat.layers) en[l.name] = true;
-      setHairEnabledLayers(en);
-      await renderHair(order, en);
+  function handleWorkspacePositionPointerMove(e: React.PointerEvent<HTMLCanvasElement>) {
+    const drag = workspacePreviewDrag.current;
+    if (!drag || drag.pointerId !== e.pointerId) {
+      const hit = workspacePositionHitTest(e.clientX, e.clientY).hit;
+      setWorkspacePartHovered(previous => previous === hit ? previous : hit);
+      return;
     }
-    const hairBackCat = preview.categories.find(c => c.target === "hair_back");
-    if (hairBackCat) {
-      const order = hairBackCat.layers.map(l => l.name);
-      setHairBackLayerOrder(order);
-      const en: Record<string, boolean> = {};
-      for (const l of hairBackCat.layers) en[l.name] = true;
-      setHairBackEnabledLayers(en);
-      await renderHairBack(order, en);
+    e.preventDefault();
+    e.stopPropagation();
+    if (drag.mode === "part") {
+      updateSelectedWorkspacePartDraft({
+        offsetX: Math.round(
+          drag.startOffsetX + (e.clientX - drag.startX) * (drag.sourcePerClientX ?? 1),
+        ),
+        offsetY: Math.round(
+          drag.startOffsetY + (e.clientY - drag.startY) * (drag.sourcePerClientY ?? 1),
+        ),
+      });
+      return;
     }
-    resetZoom(); setBaseStep(2); setMode("hair_edit"); setStatus("Step 2/4: Hairレイヤーを確認");
+    setWorkspacePreviewPan({
+      x: drag.startPan.x + e.clientX - drag.startX,
+      y: drag.startPan.y + e.clientY - drag.startY,
+    });
+  }
+
+  function handleWorkspacePositionPointerUp(e: React.PointerEvent<HTMLCanvasElement>) {
+    const drag = workspacePreviewDrag.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    e.preventDefault();
+    e.stopPropagation();
+    workspacePreviewDrag.current = null;
+    setWorkspacePreviewDragging(false);
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    if (drag.mode === "part") {
+      const finalOffset = {
+        x: Math.round(drag.startOffsetX + (e.clientX - drag.startX) * (drag.sourcePerClientX ?? 1)),
+        y: Math.round(drag.startOffsetY + (e.clientY - drag.startY) * (drag.sourcePerClientY ?? 1)),
+      };
+      updateSelectedWorkspacePartDraft({ offsetX: finalOffset.x, offsetY: finalOffset.y });
+    }
+  }
+
+  function handleWorkspacePositionLostPointerCapture(e: React.PointerEvent<HTMLCanvasElement>) {
+    const drag = workspacePreviewDrag.current;
+    if (!drag || drag.pointerId !== e.pointerId) return;
+    workspacePreviewDrag.current = null;
+    setWorkspacePreviewDragging(false);
   }
 
   async function openUnifiedBaseEditorWithPreview(preview: MappingPreviewResult) {
@@ -760,8 +1177,6 @@ function App() {
     setLayerOpacities(opacities);
     await renderBody(order, enabled, [], opacities);
     resetZoom();
-    setBaseStep(3);
-    setMode("base_edit");
     setStatus("Step 4: 全レイヤーを元の順序で調整");
   }
 
@@ -812,556 +1227,82 @@ function App() {
     await renderBody(nextOrder, enabledLayers, layerPatchesRef.current, layerOpacitiesRef.current);
   }
 
-  async function proceedToBodyEdit() {
-    const bodyCat = mappingPreview?.categories.find(c => c.target === "body");
-    if (bodyCat) {
-      const order = bodyCat.layers.map(l => l.name);
-      setLayerOrder(order);
-      setLayerPatches([]);
-      setPatchDraftSource("");
-      setSelectedBodyLayer(order[0] ?? "");
-      const en: Record<string, boolean> = {};
-      for (const l of bodyCat.layers) en[l.name] = true;
-      const opacities = createDefaultOpacities(order);
-      setEnabledLayers(en);
-      setLayerOpacities(opacities);
-      await renderBody(order, en, [], opacities);
-    }
-    resetZoom(); setBaseStep(3); setMode("base_edit"); setStatus("Step 3/4: Bodyレイヤーを調整して出力");
-  }
-
-  async function loadCorrectionPsd() {
-    setError("");
-    const file = await open({ multiple: false, directory: false, filters: [{ name: "PSD", extensions: ["psd"] }] });
-    if (!file) return;
-    setLoading(true); setStatus("See-Through補正: PSD読み込み中...");
-    try {
-      const result = await invoke<SlotLoadResult>("load_slot", { path: file });
-      setLoadResult(result);
-      const preview = await invoke<MappingPreviewResult>("get_all_layers_preview");
-      setMappingPreview(preview);
-      const freeCat = preview.categories.find(c => c.target === "free");
-      const order = freeCat?.layers.map(l => l.name) ?? [];
-      const enabled: Record<string, boolean> = {};
-      const opacities: Record<string, number> = {};
-      for (const name of order) {
-        enabled[name] = true;
-        opacities[name] = 1;
-      }
-      setLayerOrder(order);
-      setEnabledLayers(enabled);
-      setLayerPatches([]);
-      setLayerOpacities(opacities);
-      setSelectedBodyLayer(order[0] ?? "");
-      setPatchDraftSource("");
-      setOverlapHighlightEnabled(false);
-      setCorrectionOutputPath("");
-      await renderBody(order, enabled, [], opacities, false);
-      resetZoom();
-      setStatus(`See-Through補正: ${result.detected_layers.length}レイヤーを読み込みました`);
-    } catch (e) { setError(String(e)); }
-    finally { setLoading(false); }
-  }
-
-  async function addCorrectionLayerImage() {
-    setError("");
-    const file = await open({
-      multiple: false,
-      directory: false,
-      filters: [{ name: "Image", extensions: ["png", "jpg", "jpeg", "webp"] }],
-    });
-    if (!file) return;
-
-    const fileName = String(file).split(/[\\/]/).pop() ?? "layer.png";
-    const defaultName = fileName.replace(/\.[^.]+$/, "").trim() || "layer";
-    const inputName = window.prompt("追加するレイヤー名", defaultName);
-    if (!inputName) return;
-
-    setLoading(true);
-    setStatus("See-Through補正: 追加レイヤー読み込み中...");
-    try {
-      const imported = await invoke<ImportCorrectionLayerResult>("import_correction_layer", {
-        path: file,
-        layerName: inputName,
-      });
-      const preview = await invoke<MappingPreviewResult>("get_all_layers_preview");
-      setMappingPreview(preview);
-
-      const freeCat = preview.categories.find(c => c.target === "free");
-      const availableNames = freeCat?.layers.map(l => l.name) ?? [];
-      const previousOrder = layerOrder.filter(name => availableNames.includes(name));
-      const missing = availableNames.filter(name => !previousOrder.includes(name));
-      const nextOrder = imported.layer_name
-        ? [imported.layer_name, ...previousOrder.filter(name => name !== imported.layer_name), ...missing.filter(name => name !== imported.layer_name)]
-        : [...previousOrder, ...missing];
-      const nextEnabled = { ...enabledLayers, [imported.layer_name]: true };
-      const nextOpacities = { ...layerOpacities, [imported.layer_name]: 1 };
-
-      setLayerOrder(nextOrder);
-      setEnabledLayers(nextEnabled);
-      setLayerOpacities(nextOpacities);
-      setSelectedBodyLayer(imported.layer_name);
-      await renderBody(nextOrder, nextEnabled, layerPatches, nextOpacities);
-      setStatus(`See-Through補正: ${imported.layer_name} を追加しました`);
-    } catch (e) { setError(String(e)); }
-    finally { setLoading(false); }
-  }
-
-  async function handleExportCorrection() {
-    setError("");
-    const output = await save({
-      defaultPath: "corrected.png",
-      filters: [{ name: "PNG", extensions: ["png"] }],
-    });
-    if (!output) return;
-    setLoading(true); setStatus("See-Through補正: PNG出力中...");
-    try {
-      const activeOrder = layerOrder.filter(name => enabledLayers[name] !== false).reverse();
-      const result = await invoke<ExportCorrectedLayerResult>("export_corrected_layer", {
-        outputPath: output,
-        enabledLayers: activeOrder,
-        layerPatches,
-        layerOpacities,
-      });
-      setCorrectionOutputPath(result.output_path);
-      setStatus(`See-Through補正完了: ${result.output_path}`);
-    } catch (e) { setError(String(e)); }
-    finally { setLoading(false); }
-  }
-
-  // === Step 3A: base_edit - create base ===
+  // === STEP 4: 素体を保存 ===
   async function handleCreateBase() {
     setError("");
-    const workspacePath = expressionWorkspace?.workPath ?? "";
-    if (workspacePath) {
-      setLoading(true);
-      setStatus("素体を作成しています...");
-      try {
-        // 素体合成は必ず source の分解結果（source.psd）を対象にする。
-        // 直前にどの画像を分解したかというグローバル状態に依存させない
-        // （eyes-closed分解が残って素体の目が閉じる問題の根治）
-        await invoke("load_codex_source_see_through", { jobPath: workspacePath });
-        const activeOrder = layerOrder.filter(name => enabledLayers[name] !== false);
-        const result = await invoke<CreateBaseResult>("create_base", {
-          mappingJson: JSON.stringify(layerMapping),
-          // 素体の目を元画像の画素そのまま（exact_eye経路）にするため source を渡す
-          originalImagePath: workspaceFiles.source ?? "",
-          baseEyeSlot: "eye_open",
-          baseMouthSlot: "mouth_closed",
-          bodyLayerOrder: activeOrder,
-          bodyLayerPatches: layerPatches,
-          hairLayerOrder: [] as string[],
-          hairBackLayerOrder: [] as string[],
-          outputPath: "",
-          chestMaskPng: chestMaskDataUrl,
-        });
-        await invoke<SaveCodexBasePartsResult>("save_codex_base_parts", {
-          jobPath: workspacePath,
-        });
-        // 素体画像とlayer-order.jsonが更新された時点で、同じ出力フォルダを参照する
-        // 既存のRIFE/Motion Lab結果は古い。再生成されるまで下流を無効化する。
-        setWorkspaceRifeResult(null);
-        setWorkspaceRifePreview(null);
-        await refreshWorkspaceCompositePreview().catch(() => null);
-        setBaseResult(result);
-        setBaseStep(4);
-        await setWorkspaceStepAndPersist(5);
-        setMode("workspace");
-        setStatus("素体を作業フォルダに保存しました。差分位置調整へ進めます。");
-      } catch (e) {
-        setError(String(e));
-      } finally {
-        setLoading(false);
-      }
+    const workspacePath = expressionWorkspace?.workPath;
+    if (!workspacePath) {
+      setError("作業フォルダが読み込まれていません");
       return;
     }
-    const dir = await open({ multiple: false, directory: true, title: "素体の出力先フォルダを選択" });
-    if (!dir) return;
-    setLoading(true); setStatus("素体を作成中...");
+
+    setLoading(true);
+    setWorkspaceBusy(true);
+    setStatus("素体を作成しています...");
     try {
+      // 素体合成は必ず source の分解結果（source.psd）を対象にする。
+      // 直前にどの画像を分解したかというグローバル状態に依存させない
+      // （eyes-closed分解が残って素体の目が閉じる問題の根治）
+      await invoke("load_codex_source_see_through", { jobPath: workspacePath });
       const activeOrder = layerOrder.filter(name => enabledLayers[name] !== false);
-      const activeHairOrder = hairLayerOrder.filter(name => hairEnabledLayers[name] !== false);
-      const activeHairBackOrder = hairBackLayerOrder.filter(name => hairBackEnabledLayers[name] !== false);
-      const result = await invoke<CreateBaseResult>("create_base", {
-        mappingJson: JSON.stringify(layerMapping), originalImagePath: "",
-        baseEyeSlot: "eye_open", baseMouthSlot: "mouth_closed",
-        bodyLayerOrder: activeOrder, bodyLayerPatches: layerPatches, hairLayerOrder: activeHairOrder,
-        hairBackLayerOrder: activeHairBackOrder, outputPath: dir,
+      await invoke<CreateBaseResult>("create_base", {
+        mappingJson: JSON.stringify(layerMapping),
+        // 素体の目を元画像の画素そのまま（exact_eye経路）にするため source を渡す
+        originalImagePath: workspaceFiles.source ?? "",
+        baseEyeSlot: "eye_open",
+        baseMouthSlot: "mouth_closed",
+        bodyLayerOrder: activeOrder,
+        bodyLayerPatches: layerPatches,
+        hairLayerOrder: [] as string[],
+        hairBackLayerOrder: [] as string[],
+        outputPath: "",
         chestMaskPng: chestMaskDataUrl,
       });
-      setBaseResult(result);
-      setBaseStep(4);
-      setStatus(`素体作成完了: ${result.file_count}ファイル出力`);
-    } catch (e) { setError(String(e)); }
-    finally { setLoading(false); }
-  }
-
-  // === Step 3B: interp ===
-  function resetMouthMaskForSlot(slotKey: string) {
-    const affected = visiblePairs.filter(pair =>
-      pair.closed.key === slotKey || pair.open.key === slotKey
-    );
-    if (affected.length === 0) return;
-    const affectedOpenKeys = new Set(affected.map(pair => pair.open.key));
-    setMouthMaskPreviews(prev => {
-      const next = { ...prev };
-      for (const key of affectedOpenKeys) delete next[key];
-      return next;
-    });
-    setMouthMaskPreviewing(prev => {
-      const next = { ...prev };
-      for (const key of affectedOpenKeys) delete next[key];
-      return next;
-    });
-    setMouthPreviewZooms(prev => {
-      const next = { ...prev };
-      for (const key of affectedOpenKeys) next[key] = 1;
-      return next;
-    });
-    setMouthPreviewPans(prev => {
-      const next = { ...prev };
-      for (const key of affectedOpenKeys) next[key] = { x: 0, y: 0 };
-      return next;
-    });
-    setActivePreviewKey(prev => affected.some(pair => pair.name === prev || pair.open.key === prev) ? "" : prev);
-  }
-
-  async function pickInterpPsd(slot: string) {
-    setError("");
-    const file = await open({ multiple: false, directory: false, filters: [{ name: "PSD", extensions: ["psd"] }] });
-    if (file) {
-      setInterpPaths(prev => ({ ...prev, [slot]: file }));
-      setCompletedDiffs([]);
-      setDiffPreviews([]);
-      setDiffPreviewTick(0);
-      setDiffPreviewZoom(1);
-      setInterpStep(1);
-      resetMouthMaskForSlot(slot);
-    }
-  }
-
-  async function pickInterpOriginal(slotKey: string) {
-    setError("");
-    const file = await open({ multiple: false, directory: false, filters: [{ name: "画像", extensions: ["png", "jpg", "jpeg", "webp"] }] });
-    if (file) {
-      setInterpOriginals(prev => ({ ...prev, [slotKey]: file }));
-      setCompletedDiffs([]);
-      setDiffPreviews([]);
-      setDiffPreviewTick(0);
-      setDiffPreviewZoom(1);
-      resetMouthMaskForSlot(slotKey);
-    }
-  }
-
-  function getMouthMaskSetting(slotKey: string): MouthMaskSetting {
-    return mouthMaskSettings[slotKey] ?? { dilate: 15, blur: 0 };
-  }
-
-  async function previewMouthMask(pair: InterpPair) {
-    setError("");
-    const openOriginal = interpOriginals[pair.open.key];
-    const closedPsd = interpPaths[pair.closed.key];
-    if (!openOriginal || !closedPsd) return;
-    const setting = getMouthMaskSetting(pair.open.key);
-
-    setMouthMaskPreviewing(prev => ({ ...prev, [pair.open.key]: true }));
-    try {
-      // Set the canvas size from the closed PSD before resizing the original image for SAM3.
-      await invoke<SlotLoadResult>("load_slot", { path: closedPsd });
-      setStatus(`${pair.label}: SAM3口マスク確認中...`);
-      const result = await invoke<OriginalImageResult>("load_original_image", {
-        path: openOriginal,
-        mouthMaskDilateRadius: setting.dilate,
-        mouthMaskBlurRadius: setting.blur,
-      });
-      if (result.mouth_preview) {
-        setMouthMaskPreviews(prev => ({ ...prev, [pair.open.key]: result.mouth_preview! }));
-        setActivePreviewKey(pair.name);
-        setMouthPreviewZooms(prev => ({ ...prev, [pair.open.key]: 1 }));
-        setMouthPreviewPans(prev => ({ ...prev, [pair.open.key]: { x: 0, y: 0 } }));
-        setStatus(`${pair.label}: 口マスクを確認しました`);
-      } else {
-        setError(`${pair.label}: 口マスクを取得できませんでした`);
-      }
+      await invoke<SaveCodexBasePartsResult>("save_codex_base_parts", { jobPath: workspacePath });
+      // 素体画像とlayer-order.jsonが更新された時点で、同じ出力フォルダを参照する
+      // 既存のRIFE/Motion Lab結果は古い。再生成されるまで下流を無効化する。
+      setWorkspaceRifeResult(null);
+      setMotionProfileReady(false);
+      await refreshWorkspaceCompositePreview();
+      await setWorkspaceStepAfterEdit(5);
+      setWorkspaceInlineEditor("position");
+      setStatus("素体を作業フォルダに保存しました。差分位置調整へ進めます。");
     } catch (e) {
+      await reloadWorkspaceAfterMutationFailure(workspacePath);
       setError(String(e));
     } finally {
-      setMouthMaskPreviewing(prev => ({ ...prev, [pair.open.key]: false }));
+      setLoading(false);
+      setWorkspaceBusy(false);
     }
   }
-
-  function updateMouthMaskSetting(slotKey: string, patch: Partial<MouthMaskSetting>) {
-    const current = getMouthMaskSetting(slotKey);
-    const next = { ...current, ...patch };
-    setMouthMaskSettings(prev => ({ ...prev, [slotKey]: next }));
-    setCompletedDiffs([]);
-    setDiffPreviews([]);
-    setDiffPreviewTick(0);
-    setDiffPreviewZoom(1);
-
-    if (!mouthMaskPreviews[slotKey] || !interpOriginals[slotKey]) return;
-    if (mouthMaskUpdateTimers.current[slotKey]) {
-      window.clearTimeout(mouthMaskUpdateTimers.current[slotKey]);
-    }
-    mouthMaskUpdateTimers.current[slotKey] = window.setTimeout(() => {
-      delete mouthMaskUpdateTimers.current[slotKey];
-      void refreshMouthMaskPreview(slotKey, next);
-    }, 80);
+  function resetWorkspaceBaseEditorState() {
+    setLoadResult(null);
+    setLayerMapping({});
+    setMappingPreview(null);
+    setBodyPreview("");
+    setEnabledLayers({});
+    enabledLayersRef.current = {};
+    setLayerOrder([]);
+    layerOrderRef.current = [];
+    setLayerPatches([]);
+    layerPatchesRef.current = [];
+    setLayerOpacities({});
+    layerOpacitiesRef.current = {};
+    setSelectedBodyLayer("");
+    setOverlapHighlightEnabled(false);
+    setChestMaskDataUrl(null);
+    baseEditorBaselineRef.current = null;
   }
 
-  async function refreshMouthMaskPreview(slotKey: string, setting: MouthMaskSetting = getMouthMaskSetting(slotKey)) {
-    const original = interpOriginals[slotKey];
-    if (!original) return;
-    setMouthMaskPreviewing(prev => ({ ...prev, [slotKey]: true }));
-    try {
-      const result = await invoke<MouthMaskPreviewResult>("update_mouth_mask_preview", {
-        path: original,
-        mouthMaskDilateRadius: setting.dilate,
-        mouthMaskBlurRadius: setting.blur,
-      });
-      setMouthMaskPreviews(prev => ({ ...prev, [slotKey]: result.mouth_preview }));
-      setActivePreviewKey(prev => prev || visiblePairs.find(pair => pair.open.key === slotKey)?.name || "");
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setMouthMaskPreviewing(prev => ({ ...prev, [slotKey]: false }));
-    }
-  }
-
-  function setMouthPreviewZoom(slotKey: string, zoom: number) {
-    setMouthPreviewZooms(prev => {
-      return { ...prev, [slotKey]: Math.max(1, Math.min(5, zoom)) };
-    });
-  }
-
-  function onMouthPreviewPointerDown(e: React.PointerEvent, slotKey: string) {
-    if (!mouthMaskPreviews[slotKey]) return;
-    (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    mouthPreviewDrag.current = {
-      key: slotKey,
-      startX: e.clientX,
-      startY: e.clientY,
-      startPan: mouthPreviewPans[slotKey] ?? { x: 0, y: 0 },
-    };
-  }
-
-  function onMouthPreviewPointerMove(e: React.PointerEvent) {
-    const drag = mouthPreviewDrag.current;
-    if (!drag) return;
-    setMouthPreviewPans(prev => ({
-      ...prev,
-      [drag.key]: {
-        x: drag.startPan.x + e.clientX - drag.startX,
-        y: drag.startPan.y + e.clientY - drag.startY,
-      },
-    }));
-  }
-
-  function onMouthPreviewPointerUp() {
-    mouthPreviewDrag.current = null;
-  }
-
-  function resetMouthPreviewView(slotKey: string) {
-    setMouthPreviewZooms(prev => ({ ...prev, [slotKey]: 1 }));
-    setMouthPreviewPans(prev => ({ ...prev, [slotKey]: { x: 0, y: 0 } }));
-  }
-
-  // Pairs for current interp mode
-  const visiblePairs = diffTarget === "eye"
-    ? EYE_PAIRS
-    : (mouthMode === "single" ? MOUTH_PAIRS_SINGLE : MOUTH_PAIRS_VOWELS);
-
-  function pingPongFrameIndex(tick: number, frameLength: number) {
-    if (frameLength <= 1) return 0;
-    const cycle = frameLength * 2 - 2;
-    const pos = tick % cycle;
-    return pos < frameLength ? pos : cycle - pos;
-  }
-
-  function isPairReady(pair: typeof EYE_PAIRS[0]) {
-    const hasPsds = !!interpPaths[pair.closed.key] && !!interpPaths[pair.open.key];
-    if (diffTarget === "eye") return hasPsds;
-    return hasPsds && !!interpOriginals[pair.closed.key] && !!interpOriginals[pair.open.key];
-  }
-
-  const canGenerate = visiblePairs.some(isPairReady);
-  const anyMouthMaskPreviewing = Object.values(mouthMaskPreviewing).some(Boolean);
-  const readyPairsForMask = visiblePairs.filter(pair => isPairReady(pair));
-  const missingMouthMaskCount = readyPairsForMask.filter(pair => !mouthMaskPreviews[pair.open.key]).length;
-  const allReadyPairsHaveMasks = diffTarget !== "mouth" || (readyPairsForMask.length > 0 && readyPairsForMask.every(pair => !!mouthMaskPreviews[pair.open.key]));
-  const canOpenInterpStep = (step: InterpStep) => {
-    if (step === 1) return true;
-    if (step === 2) return canGenerate;
-    if (step === 3) return diffTarget === "eye" ? canGenerate : allReadyPairsHaveMasks;
-    return diffPreviews.length > 0;
-  };
-  function goInterpStep(step: InterpStep) {
-    if (canOpenInterpStep(step)) setInterpStep(step);
-  }
-  const activeMaskPair = visiblePairs.find(pair => pair.name === activePreviewKey || pair.open.key === activePreviewKey)
-    ?? visiblePairs.find(pair => !!mouthMaskPreviews[pair.open.key])
-    ?? visiblePairs[0];
-  const activeMaskSlot = activeMaskPair?.open.key ?? "";
-  const activeMaskSetting = activeMaskSlot ? getMouthMaskSetting(activeMaskSlot) : { dilate: 15, blur: 0 };
-  const activeMaskPreview = activeMaskSlot ? mouthMaskPreviews[activeMaskSlot] : "";
-  const activeMaskZoom = activeMaskSlot ? (mouthPreviewZooms[activeMaskSlot] ?? 1) : 1;
-  const activeMaskPan = activeMaskSlot ? (mouthPreviewPans[activeMaskSlot] ?? { x: 0, y: 0 }) : { x: 0, y: 0 };
-  const activeDiffPreview = diffPreviews.find(preview => preview.pairName === activePreviewKey) ?? diffPreviews[0];
-  const hasInterpWork = Object.keys(interpPaths).length > 0
-    || Object.keys(interpOriginals).length > 0
-    || Object.keys(mouthMaskPreviews).length > 0
-    || diffPreviews.length > 0
-    || completedDiffs.length > 0;
-
-  async function handleGenerateAll() {
-    setError("");
-    const dir = outputPath || await open({ multiple: false, directory: true, title: "出力先フォルダを選択" });
-    if (!dir) return;
-    setOutputPath(dir);
-    setInterpGenerating(true);
-    setCompletedDiffs([]);
-    setDiffPreviews([]);
-    setDiffPreviewTick(0);
-
-    try {
-      const readyPairs = visiblePairs.filter(isPairReady);
-      const mappingJson = JSON.stringify(layerMapping);
-
-      for (const pair of readyPairs) {
-        // Load the "closed" PSD as base (frame_001 = closed)
-        setStatus(`${pair.label}: ベース読み込み中...`);
-        const result = await invoke<SlotLoadResult>("load_slot", { path: interpPaths[pair.closed.key] });
-        if (Object.keys(layerMapping).length === 0) {
-          const m: Record<string, string> = {};
-          for (const l of result.adjustable_layers) m[l.name] = l.default_target;
-          setLayerMapping(m);
-        }
-
-        const pairDiffType = pair.name.startsWith("mouth") ? "mouth" : "eye";
-
-        // Load original image for SAM3 mouth extraction (use "open" original - open mouth is easier to detect)
-        const openOriginal = interpOriginals[pair.open.key];
-        if (pairDiffType === "mouth" && openOriginal) {
-          const setting = getMouthMaskSetting(pair.open.key);
-          if (mouthMaskPreviews[pair.open.key]) {
-            setStatus(`${pair.label}: 口マスク設定を適用中...`);
-            await invoke<MouthMaskPreviewResult>("update_mouth_mask_preview", {
-              path: openOriginal,
-              mouthMaskDilateRadius: setting.dilate,
-              mouthMaskBlurRadius: setting.blur,
-            });
-          } else {
-            setStatus(`${pair.label}: SAM3で口を検出中...`);
-            await invoke<OriginalImageResult>("load_original_image", {
-              path: openOriginal,
-              mouthMaskDilateRadius: setting.dilate,
-              mouthMaskBlurRadius: setting.blur,
-            });
-          }
-        }
-
-        // Determine base slot names
-        const baseSlotEye = pairDiffType === "eye" ? "eye_closed" : "eye_closed";
-        const baseSlotMouth = pairDiffType === "mouth" ? "mouth_closed" : "mouth_closed";
-
-        await invoke<CreateBaseResult>("create_base", {
-          mappingJson,
-          originalImagePath: pairDiffType === "mouth" ? (interpOriginals[pair.closed.key] || "") : "",
-          baseEyeSlot: baseSlotEye, baseMouthSlot: baseSlotMouth,
-          bodyLayerOrder: [] as string[], bodyLayerPatches: [], hairLayerOrder: [] as string[],
-          hairBackLayerOrder: [] as string[], outputPath: "",
-          chestMaskPng: null,
-        });
-
-        // Generate diff: open PSD against closed base (frame_N = open)
-        setStatus(`${pair.label}: フレーム生成中...`);
-        setProgress({ current: 0, total: frameCount, pair_name: pair.label });
-
-        const diffResult = await invoke<CreateDiffResult>("create_diff", {
-          path: interpPaths[pair.open.key],
-          diffType: pairDiffType,
-          slotName: pair.name,
-          frameCount,
-          outputPath: dir,
-          originalImagePath: pairDiffType === "mouth" ? (interpOriginals[pair.open.key] || "") : "",
-        });
-        setCompletedDiffs(prev => [...prev, diffResult.pair_name]);
-        setDiffPreviews(prev => [...prev, {
-          pairName: diffResult.pair_name,
-          label: pair.label,
-          frames: diffResult.previews.length > 0 ? diffResult.previews : [diffResult.preview],
-        }]);
-        setActivePreviewKey(diffResult.pair_name);
-      }
-
-      setInterpStep(4);
-      setStatus(`生成完了: ${readyPairs.length}パーツ`);
-    } catch (e) { setError(String(e)); }
-    finally { setInterpGenerating(false); }
-  }
-
-  async function openOutputFolder() {
-    if (outputPath) try { await openPath(outputPath); } catch (_) {}
-  }
-
-  async function handleCreateMouthMasks() {
-    setError("");
-    const targets = visiblePairs.filter(pair => isPairReady(pair) && !mouthMaskPreviews[pair.open.key]);
-    if (targets.length === 0) return;
-    setInterpGenerating(true);
-    try {
-      for (const pair of targets) {
-        await previewMouthMask(pair);
-      }
-      setInterpStep(2);
-    } finally {
-      setInterpGenerating(false);
-    }
-  }
-
-  function discardMouthMask(pair: typeof EYE_PAIRS[0]) {
-    if (!mouthMaskPreviews[pair.open.key]) return;
-    const ok = window.confirm(`${pair.label} の口マスクを破棄します。生成済みプレビューもクリアされます。続けますか？`);
-    if (!ok) return;
-
-    setMouthMaskPreviews(prev => {
-      const next = { ...prev };
-      delete next[pair.open.key];
-      return next;
-    });
-    setMouthPreviewZooms(prev => {
-      const next = { ...prev };
-      delete next[pair.open.key];
-      return next;
-    });
-    setMouthPreviewPans(prev => {
-      const next = { ...prev };
-      delete next[pair.open.key];
-      return next;
-    });
-    setCompletedDiffs([]);
-    setDiffPreviews([]);
-    setDiffPreviewTick(0);
-    setDiffPreviewZoom(1);
-    setActivePreviewKey(pair.name);
-    setStatus(`${pair.label}: 口マスクを破棄しました`);
-  }
-
-  async function startExpressionWorkspace(kind: "new" | "resume") {
-    setError("");
-    const selected = await open({
-      multiple: false,
-      directory: true,
-      title: kind === "new" ? "作業フォルダを選択" : "既存の作業フォルダを選択",
-    });
-    const workPath = typeof selected === "string" ? selected : null;
-    if (!workPath) return;
+  async function loadExpressionWorkspaceAtPath(workPath: string, kind: "new" | "resume") {
+    activeWorkspacePath.current = workPath;
     setWorkspaceBusy(true);
     try {
       const workspace = await invoke<ExpressionWorkspaceResult>(
         kind === "new" ? "create_expression_workspace" : "load_expression_workspace",
         { workPath },
       );
+      if (activeWorkspacePath.current !== workPath) return null;
       setExpressionWorkspace(workspace);
       const nextFiles = {
         ...(workspace.project.sourceImagePath ? { source: workspace.project.sourceImagePath } : {}),
@@ -1371,60 +1312,263 @@ function App() {
       setWorkspaceCodexPrompt(workspace.project.codexPrompt ?? "");
       setWorkspaceMouthCorner(workspace.project.mouthCorner ?? "flat");
       setWorkspaceCodexRequestDirty(false);
-      await loadWorkspaceImagePreviews(nextFiles);
+      await loadWorkspaceImagePreviews(nextFiles, workPath);
+      if (activeWorkspacePath.current !== workPath) return null;
       setWorkspaceGeneratedStatus(null);
       setWorkspaceExtractResult(null);
       setWorkspaceCompositePreview(null);
+      setWorkspaceOverviewPreviewPart("eyes-open");
+      setWorkspaceOverviewPreviewLoading(false);
+      workspaceOverviewPreviewLoadingRef.current = false;
+      setWorkspaceSelectedPreviewPart("eyes-open");
+      setWorkspaceAdjustTarget("eyes-open");
+      setWorkspacePartDragMode(true);
+      setWorkspacePartOffsetX(0);
+      setWorkspacePartOffsetY(0);
+      setWorkspacePartScale(100);
+      const emptyPartDrafts = createWorkspacePartAdjustmentDrafts();
+      workspacePartDraftsRef.current = emptyPartDrafts;
+      workspacePartEditorBaseline.current = cloneWorkspacePartAdjustmentDrafts(emptyPartDrafts);
+      setWorkspacePartDrafts(emptyPartDrafts);
+      setWorkspacePositionVisual(null);
+      setWorkspacePartHovered(false);
+      setWorkspacePartSaving(false);
+      workspacePartPersistedDuringEditor.current = false;
       setWorkspaceRifeResult(null);
-      setWorkspaceRifePreview(null);
+      setWorkspaceInlineEditor(null);
+      setWorkspaceEditorPreparing(false);
+      setMotionProfileReady(false);
+      setMotionEditorDirty(false);
+      setMotionDraftSaveRequestId(0);
+      setMotionEditorDraftSaveBusy(false);
+      setMotionExportRequestId(0);
+      setMotionPostSaveDestination("overview");
+      resetWorkspaceBaseEditorState();
       setWorkspaceStep(Math.min(Math.max(workspace.project.currentStep || 1, 1), 7) as WorkspaceStep);
       setMode("workspace");
       setStatus(`作業フォルダ: ${workspace.workPath}`);
       if (kind === "resume") {
         await restoreWorkspaceProgress(workspace);
       }
-      await refreshWorkspaceSeeThroughStatus();
+      if (activeWorkspacePath.current !== workPath) return null;
+      if (workspace.project.currentStep <= 3) await refreshWorkspaceSeeThroughStatus();
+      return workspace;
     } catch (cause) {
+      if (activeWorkspacePath.current !== workPath) return null;
       const message = String(cause);
       if (kind === "resume" && message.includes("project.json が見つかりません")) {
         setError("選択したフォルダはPachiPakuGenの作業フォルダではありません（project.json がありません）。「はじめから」で作成した作業フォルダを選んでください");
       } else {
         setError(message);
       }
+      return null;
+    } finally {
+      if (activeWorkspacePath.current === workPath) setWorkspaceBusy(false);
+    }
+  }
+
+  async function startExpressionWorkspace(kind: "new" | "resume") {
+    if (workspaceBusy) return;
+    setError("");
+    setWorkspaceBusy(true);
+    try {
+      const selected = await open({
+        multiple: false,
+        directory: true,
+        title: kind === "new" ? "作業フォルダを選択" : "既存の作業フォルダを選択",
+      });
+      const workPath = typeof selected === "string" ? selected : null;
+      if (!workPath) return;
+      await loadExpressionWorkspaceAtPath(workPath, kind);
     } finally {
       setWorkspaceBusy(false);
     }
   }
 
+  async function startLiveDisplayFromMenu() {
+    if (workspaceBusy) return;
+    setError("");
+    setWorkspaceBusy(true);
+    try {
+      const selected = await open({
+        multiple: false,
+        directory: true,
+        title: "ライブ表示に使う作業フォルダを選択",
+      });
+      const workPath = typeof selected === "string" ? selected : null;
+      if (!workPath) return;
+      const workspace = await invoke<ExpressionWorkspaceResult>("load_expression_workspace", { workPath });
+      if (workspace.project.currentStep < 7) {
+        throw new Error("この作業フォルダは再編集後のフレーム生成が未完了です。STEP6でRIFE補完を再実行してください。");
+      }
+      await invoke("load_motion_lab_parts", { dir: workspace.spritalkPartsPath });
+      setLiveOrigin("select");
+      setLivePartsDir(workspace.spritalkPartsPath);
+      setMode("live");
+      setStatus(`ライブ表示: ${workspace.workPath}`);
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      setError(message.includes("body.png")
+        ? "この作業フォルダにはライブ表示できる素材がありません。先にSTEP6まで完了してください。"
+        : message);
+    } finally {
+      setWorkspaceBusy(false);
+    }
+  }
+
+  function openLiveDisplayFromWorkspace() {
+    if (!expressionWorkspace) return;
+    const partsDir = workspaceRifeResult?.outputPath || expressionWorkspace.spritalkPartsPath;
+    setLiveOrigin("workspace");
+    setLivePartsDir(partsDir);
+    setWorkspaceInlineEditor(null);
+    setMode("live");
+    setStatus("マイクを選択してライブ表示を開始できます");
+  }
+
+  function requestLiveDisplayFromMotionEditor() {
+    if (motionEditorDraftSaveBusy || motionEditorExportBusy) return;
+    if (motionEditorDirty) {
+      setError("");
+      setMotionPostSaveDestination("live");
+      setMotionEditorDraftSaveBusy(true);
+      setStatus("変更を保存してライブ表示を準備しています...");
+      setMotionDraftSaveRequestId(previous => previous + 1);
+      return;
+    }
+    openLiveDisplayFromWorkspace();
+  }
+
+  function returnFromLiveDisplay() {
+    setLivePartsDir(null);
+    if (liveOrigin === "workspace" && expressionWorkspace) {
+      setMode("workspace");
+      setWorkspaceStep(7);
+      setStatus("モーション仕上げ");
+      return;
+    }
+    setMode("select");
+    setStatus("モードを選択してください");
+  }
+
   async function persistWorkspaceStep(step: WorkspaceStep, workspaceOverride?: ExpressionWorkspaceResult) {
     const workspace = workspaceOverride ?? expressionWorkspace;
-    if (!workspace) return;
-    try {
-      const updated = await invoke<ExpressionWorkspaceResult>("update_expression_workspace_step", {
-        workPath: workspace.workPath,
-        currentStep: step,
-      });
+    if (!workspace) throw new Error("作業フォルダが読み込まれていません");
+    const updated = await invoke<ExpressionWorkspaceResult>("update_expression_workspace_step", {
+      workPath: workspace.workPath,
+      currentStep: step,
+    });
+    if (activeWorkspacePath.current === workspace.workPath) {
       setExpressionWorkspace(updated);
-    } catch {
-      // UI progress can continue even if project.json could not be updated.
     }
   }
 
   async function setWorkspaceStepAndPersist(step: WorkspaceStep) {
-    setWorkspaceStep(step);
     await persistWorkspaceStep(step);
+    setWorkspaceStep(step);
+  }
+
+  // STEP4/5で実際に保存した時だけ使う明示的な編集チェックポイント更新。
+  // 通常の工程更新は前進専用のままにし、完了済み案件の再編集時だけ下流成果物を
+  // 無効扱いにするためproject.jsonを5/6へ巻き戻す。
+  async function setWorkspaceStepAfterEdit(step: WorkspaceStep) {
+    const workspace = expressionWorkspace;
+    if (!workspace) throw new Error("作業フォルダが読み込まれていません");
+    const command = persistenceCommandAfterWorkspaceEdit(workspace.project.currentStep, step);
+    const updated = await invoke<ExpressionWorkspaceResult>(command, {
+      workPath: workspace.workPath,
+      currentStep: step,
+    });
+    if (activeWorkspacePath.current === workspace.workPath) {
+      setExpressionWorkspace(updated);
+      setWorkspaceStep(step);
+    }
+  }
+
+  /**
+   * 画像を書き換えるバックエンド処理は、最初の書き込み前にproject.jsonを安全な
+   * checkpointへ戻す。途中で失敗した場合も同じ画面に古い下流成果物を残さないよう、
+   * ディスク上のcheckpointを正本として作業状態を読み直す。
+   */
+  async function reloadWorkspaceAfterMutationFailure(workPath: string): Promise<boolean> {
+    try {
+      const workspace = await invoke<ExpressionWorkspaceResult>("load_expression_workspace", { workPath });
+      if (activeWorkspacePath.current !== workPath) return false;
+      const checkpoint = Math.min(Math.max(workspace.project.currentStep || 1, 1), 7) as WorkspaceStep;
+      setExpressionWorkspace(workspace);
+      setWorkspaceStep(checkpoint);
+      if (checkpoint <= 2) setWorkspaceGeneratedStatus(null);
+      if (checkpoint < 4) {
+        setWorkspaceExtractResult(null);
+        resetWorkspaceBaseEditorState();
+      }
+      if (checkpoint < 5) setWorkspaceCompositePreview(null);
+      if (checkpoint < 7) {
+        setWorkspaceRifeResult(null);
+        setMotionProfileReady(false);
+      }
+      await restoreWorkspaceProgress(workspace);
+      return activeWorkspacePath.current === workPath;
+    } catch {
+      // 元の処理エラーを優先する。再同期に失敗してもエラー内容は上書きしない。
+      return false;
+    }
+  }
+
+  async function refreshMotionOutputStatus(
+    workspace: ExpressionWorkspaceResult,
+    rifeOutput?: GenerateCodexRifeOutputResult | null,
+  ) {
+    const sourceDir = rifeOutput?.outputPath || workspace.spritalkPartsPath;
+    if (!rifeOutput && !workspaceRifeResult) {
+      if (activeWorkspacePath.current === workspace.workPath) {
+        setMotionProfileReady(false);
+      }
+      return;
+    }
+    const [manifestResult, profileResult] = await Promise.allSettled([
+      invoke<MotionLabManifestResult>("load_motion_lab_manifest", { sourceDir }),
+      invoke<SpritalkMotionProfileResult>("load_spritalk_motion_profile", { sourceDir }),
+    ]);
+    if (activeWorkspacePath.current !== workspace.workPath) return;
+    const fingerprints = manifestResult.status === "fulfilled"
+      ? manifestResult.value.manifest.contentFingerprints
+      : undefined;
+    const profileFresh = profileResult.status === "fulfilled"
+      && !!fingerprints?.spritalk
+      && profileResult.value.profile.contentFingerprint === fingerprints.spritalk;
+    setMotionProfileReady(profileFresh);
   }
 
   async function restoreWorkspaceProgress(workspace: ExpressionWorkspaceResult) {
+    if (activeWorkspacePath.current !== workspace.workPath) return;
     let restoredStep = Math.min(Math.max(workspace.project.currentStep || 1, 1), 7) as WorkspaceStep;
     let workspaceGeneratedReady = false;
     try {
       const generated = await invoke<WorkspaceGeneratedPartsStatus>("inspect_workspace_generated_parts", {
         workPath: workspace.workPath,
       });
+      if (activeWorkspacePath.current !== workspace.workPath) return;
       setWorkspaceGeneratedStatus(generated);
       workspaceGeneratedReady = generated.ready;
-      if (generated.ready && restoredStep < 3) restoredStep = 3;
+      if (generated.downstreamStale) {
+        setWorkspaceExtractResult(null);
+        setWorkspaceCompositePreview(null);
+        setWorkspaceRifeResult(null);
+        setMotionProfileReady(false);
+        setWorkspaceStep(3);
+        try {
+          const updated = await invoke<ExpressionWorkspaceResult>("load_expression_workspace", {
+            workPath: workspace.workPath,
+          });
+          if (activeWorkspacePath.current !== workspace.workPath) return;
+          setExpressionWorkspace(updated);
+          await restoreWorkspaceProgress(updated);
+        } catch (cause) {
+          setError(`表情素材の変更を検知しましたが、作業状態を再読込できませんでした: ${String(cause)}`);
+        }
+        return;
+      }
     } catch {
       // Step 1 workspaces may not have a source image or request files yet.
     }
@@ -1433,91 +1577,124 @@ function App() {
       const loaded = await invoke<LoadCodexExpressionJobResult>("load_codex_expression_job", {
         jobPath: workspace.workPath,
       });
-      setWorkspaceExtractResult(loaded.extractedParts);
-      setWorkspaceRifeResult(loaded.rifeOutput);
+      if (activeWorkspacePath.current !== workspace.workPath) return;
+      // project.jsonを正本にする。再編集前の物理ファイルが残っていても、対応する
+      // checkpointへ再到達するまではReact stateへ復活させない。
+      const validExtractedParts = workspace.project.currentStep >= 4 ? loaded.extractedParts : null;
+      const validRifeOutput = workspace.project.currentStep >= 7 ? loaded.rifeOutput : null;
+      setWorkspaceExtractResult(validExtractedParts);
+      setWorkspaceRifeResult(validRifeOutput);
+      if (validRifeOutput) setFrameCount(validRifeOutput.frameCount);
       // プレビュー再構築は保存済みbase_partsからのみ行う（推論は走らない）。
       // base_parts未保存の作業ではここで失敗し、STEP4からのやり直しに誘導する
       let compositeReady = false;
-      if (loaded.extractedParts) {
-        compositeReady = await refreshWorkspaceCompositePreview(workspace)
-          .then(() => true)
+      if (workspace.project.currentStep >= 5 && validExtractedParts) {
+        compositeReady = await refreshWorkspaceCompositePreview(workspace, true)
+          .then(() => activeWorkspacePath.current === workspace.workPath)
           .catch(() => false);
-      }
-      if (loaded.rifeOutput) {
-        await refreshWorkspaceRifePreview(workspace).catch(() => null);
-      }
-      // project.jsonが7を保持していれば7で復帰。rifeOutputがあるのに6未満なら6へ引き上げ。
-      // rifeOutputが無いのに7が保存されていた場合（出力を削除した等）は6へ落とす
-      if (loaded.rifeOutput) {
-        restoredStep = Math.max(restoredStep, 6) as WorkspaceStep;
       } else {
-        if (restoredStep > 6) restoredStep = 6;
-        if (loaded.extractedParts) {
-          restoredStep = compositeReady
-            ? (Math.max(restoredStep, 5) as WorkspaceStep)
-            : (Math.min(Math.max(restoredStep, 4), 4) as WorkspaceStep);
-        } else if (workspaceGeneratedReady) {
-          restoredStep = Math.max(restoredStep, 3) as WorkspaceStep;
-        }
+        setWorkspaceCompositePreview(null);
       }
+      if (activeWorkspacePath.current !== workspace.workPath) return;
+      if (validRifeOutput) {
+        await refreshMotionOutputStatus(workspace, validRifeOutput);
+      } else {
+        setMotionProfileReady(false);
+      }
+      // checkpointより上へ物理ファイルだけで昇格させない。対応成果物が消えている時だけ
+      // 安全側へ下げる。完成済みRIFEが有効なら、後から上流素材を移動していてもSTEP7を維持する。
+      restoredStep = restoredWorkspaceStep(restoredStep, {
+        generatedReady: workspaceGeneratedReady,
+        extractedReady: !!validExtractedParts,
+        compositeReady,
+        rifeReady: !!validRifeOutput,
+      });
     } catch {
       // Not all workspaces are valid Codex jobs until Step 2 has been prepared.
     }
 
-    setWorkspaceStep(restoredStep);
-    await persistWorkspaceStep(restoredStep, workspace);
+    if (activeWorkspacePath.current === workspace.workPath) {
+      if (restoredStep < workspace.project.currentStep) {
+        const updated = await invoke<ExpressionWorkspaceResult>("regress_expression_workspace_step", {
+          workPath: workspace.workPath,
+          currentStep: restoredStep,
+        });
+        if (activeWorkspacePath.current !== workspace.workPath) return;
+        setExpressionWorkspace(updated);
+      }
+      setWorkspaceStep(restoredStep);
+    }
   }
 
-  async function refreshWorkspaceCompositePreview(workspaceOverride?: ExpressionWorkspaceResult) {
+  async function refreshWorkspaceCompositePreview(
+    workspaceOverride?: ExpressionWorkspaceResult,
+    baseOnly = false,
+    syncPositionSelection = true,
+  ) {
     const workspace = workspaceOverride ?? expressionWorkspace;
     if (!workspace) return;
     const preview = await invoke<PreviewCodexCompositeResult>("preview_codex_composite", {
       jobPath: workspace.workPath,
-      profile: "auto",
+      profile: baseOnly ? "base-only" : "auto",
     });
+    if (activeWorkspacePath.current !== workspace.workPath) return;
     setWorkspaceCompositePreview(preview);
-    setWorkspaceSelectedPreviewPart(prev => (
-      prev === "base" || preview.previews.some(item => item.part === prev) ? prev : "base"
-    ));
+    if (!baseOnly && preview.previews.length > 0) {
+      const available = preview.previews.map(item => item.part);
+      setWorkspaceOverviewPreviewPart(previous => (
+        available.includes(previous)
+          ? previous
+          : (available.includes("eyes-open") ? "eyes-open" : available[0])
+      ));
+      if (syncPositionSelection) {
+        const nextPart = available.includes(workspaceSelectedPreviewPart)
+          && WORKSPACE_ADJUST_PART_KEYS.includes(workspaceSelectedPreviewPart)
+          ? workspaceSelectedPreviewPart
+          : (available.includes("eyes-open") ? "eyes-open" : available.find(part => WORKSPACE_ADJUST_PART_KEYS.includes(part)));
+        if (nextPart) {
+          setWorkspaceSelectedPreviewPart(nextPart);
+          setWorkspaceAdjustTarget(nextPart);
+          setWorkspacePartDragMode(true);
+        }
+      }
+    }
+    return preview;
   }
 
-  async function refreshWorkspaceRifePreview(workspaceOverride?: ExpressionWorkspaceResult) {
-    const workspace = workspaceOverride ?? expressionWorkspace;
-    if (!workspace) return;
-    const preview = await invoke<PreviewCodexRifeResult>("preview_codex_rife_outputs", {
-      jobPath: workspace.workPath,
-    });
-    setWorkspaceRifePreview(preview);
-    setWorkspaceSelectedPreviewPart(prev => (
-      prev === "base" || preview.previews.some(item => workspacePreviewItemKey(item) === prev)
-        ? prev
-        : preview.previews[0] ? workspacePreviewItemKey(preview.previews[0]) : "base"
-    ));
-  }
-
-  async function updateWorkspaceCompositePreview() {
+  async function loadWorkspaceOverviewPreviews() {
+    if (!expressionWorkspace || workspaceBusy || workspaceOverviewPreviewLoadingRef.current || !workspaceCompositePreview?.basePreview) return;
     setError("");
+    workspaceOverviewPreviewLoadingRef.current = true;
+    setWorkspaceOverviewPreviewLoading(true);
     setWorkspaceBusy(true);
     try {
-      await refreshWorkspaceCompositePreview();
-      setStatus("合成プレビューを更新しました");
+      const preview = await refreshWorkspaceCompositePreview(expressionWorkspace, false, false);
+      if (!preview?.previews.length) throw new Error("表示できる表情プレビューがありません");
+      setStatus("表情プレビューを読み込みました");
     } catch (cause) {
-      setError(String(cause));
+      setError(`表情プレビューを読み込めませんでした: ${String(cause)}`);
     } finally {
+      workspaceOverviewPreviewLoadingRef.current = false;
+      setWorkspaceOverviewPreviewLoading(false);
       setWorkspaceBusy(false);
     }
   }
 
-  async function openWorkspaceBaseAdjustment() {
-    if (!expressionWorkspace || !workspaceFiles.source) {
+  async function openWorkspaceBaseAdjustment(
+    workspaceOverride?: ExpressionWorkspaceResult | null,
+    sourceOverride?: string | null,
+  ): Promise<boolean> {
+    const workspace = workspaceOverride ?? expressionWorkspace;
+    const source = sourceOverride ?? workspaceFiles.source;
+    if (!workspace || !source) {
       setError("立ち絵を読み込んでから素体調整を開いてください");
-      return;
+      return false;
     }
     setError("");
     setWorkspaceBusy(true);
     try {
       const base = await invoke<SeeThroughRunResult>("load_codex_source_see_through", {
-        jobPath: expressionWorkspace.workPath,
+        jobPath: workspace.workPath,
       });
       const defaultMapping = Object.fromEntries(base.slotLoad.adjustable_layers.map(layer => [layer.name, layer.default_target]));
       // 腕は原則分離出力（handwear-l/-r検出時は既定でarm_l/arm_rへ。bodyに戻したい場合はStep4のチェックをOFF）
@@ -1529,17 +1706,144 @@ function App() {
       const allPreview = await invoke<MappingPreviewResult>("get_all_layers_preview");
       setMappingPreview(allPreview);
       await openUnifiedBaseEditorWithPreview(allPreview);
+      return true;
     } catch (cause) {
       setError(String(cause));
+      return false;
     } finally {
       setWorkspaceBusy(false);
     }
   }
 
-  async function loadWorkspaceImagePreviews(files: Record<string, string>) {
+  async function startInlineBaseEditor() {
+    if (!expressionWorkspace) return;
+    setError("");
+    setWorkspaceInlineEditor("base");
+    setWorkspaceEditorPreparing(true);
+    try {
+      // 同じセッションでの再編集なら、保存前の並び順や表示状態を維持する。
+      if (!mappingPreview || !bodyPreview || !loadResult) {
+        const opened = await openWorkspaceBaseAdjustment();
+        if (!opened) {
+          setWorkspaceInlineEditor(null);
+          return;
+        }
+      }
+      setStatus("素体のレイヤー順・表示・分離を調整します");
+    } finally {
+      setWorkspaceEditorPreparing(false);
+    }
+  }
+
+  async function startInlinePositionEditor() {
+    if (!expressionWorkspace || !workspaceExtractResult || !workspaceCompositePreview?.basePreview) return;
+    setError("");
+    const initialDrafts = createWorkspacePartAdjustmentDrafts(workspaceExtractResult.partAdjustments);
+    workspacePartDraftsRef.current = initialDrafts;
+    workspacePartEditorBaseline.current = cloneWorkspacePartAdjustmentDrafts(initialDrafts);
+    setWorkspacePartDrafts(initialDrafts);
+    workspacePartPersistedDuringEditor.current = false;
+    setWorkspacePartSaving(false);
+    setWorkspaceInlineEditor("position");
+    setWorkspaceEditorPreparing(true);
+    try {
+      // 起動時はbase-onlyで高速復元する。表情サムネイルは編集開始時だけ展開する。
+      const preview = workspaceCompositePreview.previews.length === 0
+        ? await refreshWorkspaceCompositePreview(expressionWorkspace, false)
+        : workspaceCompositePreview;
+      const available = preview?.previews.map(item => item.part) ?? [];
+      const target = available.includes(workspaceAdjustTarget)
+        && WORKSPACE_ADJUST_PART_KEYS.includes(workspaceAdjustTarget)
+        ? workspaceAdjustTarget
+        : (available.includes("eyes-open") ? "eyes-open" : available.find(part => WORKSPACE_ADJUST_PART_KEYS.includes(part)));
+      if (!target) throw new Error("位置調整できる目・口パーツがありません");
+      setWorkspaceSelectedPreviewPart(target);
+      setWorkspaceAdjustTarget(target);
+      setWorkspacePartDragMode(true);
+      loadWorkspacePartAdjustmentFields(target);
+      setStatus("青い枠の目・口をドラッグして位置を調整できます");
+    } catch (cause) {
+      setError(String(cause));
+      setWorkspaceInlineEditor(null);
+    } finally {
+      setWorkspaceEditorPreparing(false);
+    }
+  }
+
+  function startInlineMotionEditor() {
+    if (!workspaceRifeResult) return;
+    setError("");
+    setMotionEditorDirty(false);
+    setMotionDraftSaveRequestId(0);
+    setMotionEditorDraftSaveBusy(false);
+    setMotionExportRequestId(0);
+    setMotionPostSaveDestination("overview");
+    setMotionEditorExportReady(false);
+    setMotionEditorExportBusy(false);
+    setWorkspaceInlineEditor("motion");
+    setStatus("モーション素材を読み込んでいます...");
+  }
+
+  function handleInlineMotionNotify(message: string) {
+    setStatus(message);
+    showToast(message);
+    if (message.startsWith("SpriTalk用アニメーション設定を出力しました:")) {
+      setMotionProfileReady(true);
+      setMotionEditorDirty(false);
+    }
+  }
+
+  function handleMotionExportStateChange(state: { ready: boolean; busy: boolean }) {
+    setMotionEditorExportReady(state.ready);
+    setMotionEditorExportBusy(state.busy);
+  }
+
+  function handleInlineMotionDirtyChange(dirty: boolean, scope: "settings" | "sequence" = "settings") {
+    setMotionEditorDirty(dirty);
+    if (!dirty) return;
+    // 調整値が変わった時点で、既存の書き出しは現在値と一致しなくなる。
+    if (scope === "settings") setMotionProfileReady(false);
+  }
+
+  function handleInlineMotionDraftSaved() {
+    const destination = motionPostSaveDestination;
+    setMotionEditorDirty(false);
+    setMotionDraftSaveRequestId(0);
+    setMotionEditorDraftSaveBusy(false);
+    setMotionExportRequestId(0);
+    setMotionPostSaveDestination("overview");
+    setMotionEditorExportReady(false);
+    setMotionEditorExportBusy(false);
+    setWorkspaceInlineEditor(null);
+    if (destination === "live") {
+      openLiveDisplayFromWorkspace();
+    } else {
+      setStatus("変更を保存して編集概要へ戻りました");
+    }
+  }
+
+  function handleInlineMotionExported(path: string) {
+    setMotionProfileReady(true);
+    setMotionEditorDirty(false);
+    setMotionDraftSaveRequestId(0);
+    setMotionEditorDraftSaveBusy(false);
+    setMotionExportRequestId(0);
+    setMotionPostSaveDestination("overview");
+    setMotionEditorExportReady(false);
+    setMotionEditorExportBusy(false);
+    setWorkspaceInlineEditor(null);
+    setStatus(`SpriTalk向けアニメーションを作成しました: ${path}`);
+  }
+
+  async function loadWorkspaceImagePreviews(
+    files: Record<string, string>,
+    expectedWorkPath = activeWorkspacePath.current,
+  ) {
     const entries = Object.entries(files).filter(([, path]) => !!path);
     if (entries.length === 0) {
-      setWorkspaceImagePreviews({});
+      if (activeWorkspacePath.current === expectedWorkPath) {
+        setWorkspaceImagePreviews({});
+      }
       return;
     }
     const next: Record<string, string> = {};
@@ -1550,7 +1854,9 @@ function App() {
         // Keep the path visible even when thumbnail decoding fails.
       }
     }));
-    setWorkspaceImagePreviews(next);
+    if (activeWorkspacePath.current === expectedWorkPath) {
+      setWorkspaceImagePreviews(next);
+    }
   }
 
   async function pickWorkspaceImage(key: "source" | "reference") {
@@ -1561,6 +1867,7 @@ function App() {
       void loadWorkspaceImagePreviews(next);
       return next;
     });
+    setWorkspaceCodexRequestDirty(true);
   }
 
   function clearWorkspaceImage(key: "source" | "reference") {
@@ -1570,6 +1877,7 @@ function App() {
       void loadWorkspaceImagePreviews(next);
       return next;
     });
+    setWorkspaceCodexRequestDirty(true);
   }
 
   function workspaceFileName(path: string | undefined): string {
@@ -1583,6 +1891,7 @@ function App() {
       return;
     }
     setError("");
+    workspaceGeneratedPollRequestId.current += 1;
     setWorkspaceBusy(true);
     try {
       const status = await invoke<WorkspaceGeneratedPartsStatus>("prepare_workspace_codex_request", {
@@ -1597,10 +1906,16 @@ function App() {
       });
       setWorkspaceGeneratedStatus(status);
       setWorkspaceCodexRequestDirty(false);
+      // 作成ガイドを更新した時点で、旧入力から作られた下流結果は画面上でも無効化する。
+      setWorkspaceExtractResult(null);
+      setWorkspaceCompositePreview(null);
+      setWorkspaceRifeResult(null);
+      setMotionProfileReady(false);
       await setWorkspaceStepAndPersist(2);
-      setStatus("Codex依頼ファイルを作成しました。依頼フォルダの内容をCodexへ渡してください");
+      setStatus("作成ガイドを出力しました。選んだ方法で7枚の表情素材を用意してください");
       showToast("依頼ファイルを作成しました");
     } catch (cause) {
+      await reloadWorkspaceAfterMutationFailure(expressionWorkspace.workPath);
       setError(String(cause));
     } finally {
       setWorkspaceBusy(false);
@@ -1610,13 +1925,25 @@ function App() {
   async function inspectWorkspaceGeneratedParts() {
     if (!expressionWorkspace) return;
     setError("");
+    workspaceGeneratedPollRequestId.current += 1;
     setWorkspaceBusy(true);
     try {
       const status = await invoke<WorkspaceGeneratedPartsStatus>("inspect_workspace_generated_parts", { workPath: expressionWorkspace.workPath });
       setWorkspaceGeneratedStatus(status);
+      if (status.downstreamStale) {
+        const synced = await reloadWorkspaceAfterMutationFailure(expressionWorkspace.workPath);
+        if (!synced) {
+          setError("表情素材の変更を検知しましたが、作業状態を再読込できませんでした。作業フォルダを開き直してください");
+          setStatus("作業状態の再読込が必要です");
+          return;
+        }
+        setStatus("表情素材の変更を検知しました。STEP3から再処理してください");
+        showToast("表情素材の変更を検知しました");
+        return;
+      }
       // 揃っていても自動でSTEP3へは進めない（進むのはユーザーの「次へ」だけ）
-      if (status.ready) showToast("Codex成果物が揃いました");
-      setStatus(status.ready ? "Codex成果物が揃いました。「次へ」でSee-Throughに進めます" : `Codex成果物に不足があります（残り${status.missingParts.length}ファイル）`);
+      if (status.ready) showToast("表情素材が揃いました");
+      setStatus(status.ready ? "表情素材が揃いました。「次へ」でSee-Throughに進めます" : `表情素材に不足があります（残り${status.missingParts.length}ファイル）`);
     } catch (cause) {
       setError(String(cause));
     } finally {
@@ -1817,7 +2144,7 @@ function App() {
 
   async function runWorkspaceSeeThroughBatch() {
     if (!expressionWorkspace || !workspaceFiles.source || !workspaceGeneratedStatus?.ready) {
-      setError("立ち絵とCodex成果物を先に揃えてください");
+      setError("立ち絵と7枚の表情素材を先に揃えてください");
       return;
     }
     if (!seeThroughRuntime?.ready || seeThroughRuntime.selectedProfile !== seeThroughProfile) {
@@ -1825,11 +2152,14 @@ function App() {
       return;
     }
     setError("");
+    workspaceGeneratedPollRequestId.current += 1;
     setWorkspaceBusy(true);
     setSeeThroughStartedAt(Date.now());
     setSeeThroughElapsedSeconds(0);
     setSeeThroughProgress({ stage: "inference", percent: 0, message: "See-Through一括分解中" });
     setSeeThroughPhase({ index: 1, total: 3, label: "立ち絵を分解しています" });
+    // 同じ案件で再分解した場合も、旧レイヤー順や切り出しを次のSTEP4へ持ち越さない。
+    resetWorkspaceBaseEditorState();
     try {
       // ユーザーが手動でプロファイルを選んでいなければ "auto" を渡し、実行時点のGPU検出
       // による判定（VRAM 16GB以上ならstandard等）をバックエンドに委ねる。
@@ -1878,8 +2208,8 @@ function App() {
       setLoadResult(base.slotLoad);
       setLayerMapping(defaultMapping);
       setMappingPreview(base.mappingPreview);
-      setSeeThroughProgress({ stage: "inference", percent: 50, message: "Codex成果物をSee-Throughで分解しています" });
-      setSeeThroughPhase({ index: 2, total: 3, label: "表情素材（Codex成果物）を分解しています" });
+      setSeeThroughProgress({ stage: "inference", percent: 50, message: "表情素材をSee-Throughで分解しています" });
+      setSeeThroughPhase({ index: 2, total: 3, label: "表情素材を分解しています" });
       const extracted = await invoke<ExtractCodexGeneratedPartsResult>("extract_codex_generated_parts", {
         jobPath: expressionWorkspace.workPath,
         // 1回目の呼び出しで確定した実際のプロファイルをそのまま使う（"auto"を再解決しない）
@@ -1908,22 +2238,28 @@ function App() {
       if (missingExpressions.length > 0) {
         const label = missingExpressions.join("・");
         pushWorkspaceLog("error", `表情が不足: ${label} を抽出できませんでした`);
-        setError(`一部の表情（${label}）を元画像から抽出できませんでした。これらはまばたきや口パクに使われます。\n\n対処: STEP2の「配置フォルダを開く」で該当画像を確認し、目や口がはっきり分かる素材に差し替えて（またはCodexで作り直して）STEP3を再実行してください。左右パーツ分解をOFFにすると改善する場合もあります。`);
+        setError(`一部の表情（${label}）を元画像から抽出できませんでした。これらはまばたきや口パクに使われます。\n\n対処: STEP2の「配置フォルダを開く」で該当画像を確認し、目や口がはっきり分かる素材へ差し替えてSTEP3を再実行してください。画像編集AIや手作業で作り直しても構いません。左右パーツ分解をOFFにすると改善する場合もあります。`);
       }
       setWorkspaceExtractResult(extracted);
       setWorkspaceCompositePreview(null);
       setWorkspaceRifeResult(null);
-      setWorkspaceRifePreview(null);
+      setMotionProfileReady(false);
+      if (missingExpressions.length > 0) {
+        await setWorkspaceStepAndPersist(3);
+        setSeeThroughProgress({ stage: "error", percent: 100, message: "必要な表情素材の抽出に失敗しました" });
+        setStatus("不足している表情素材を確認し、STEP2から差し替えてください");
+        return;
+      }
       await setWorkspaceStepAndPersist(4);
       setSeeThroughPhase({ index: 3, total: 3, label: "プレビューを準備しています" });
       const allPreview = await invoke<MappingPreviewResult>("get_all_layers_preview");
       setMappingPreview(allPreview);
-      await openUnifiedBaseEditorWithPreview(allPreview);
       setSeeThroughProgress({ stage: "complete", percent: 100, message: "See-Through一括分解が完了しました" });
       setStatus(`See-Through一括分解が完了しました: ${extracted.extractedParts.length}パーツ`);
       showToast("一括分解が完了しました");
     } catch (cause) {
       const message = String(cause);
+      await reloadWorkspaceAfterMutationFailure(expressionWorkspace.workPath);
       // 左右分割（耳・目などのL/R分離）のインデックスエラーはVRAM不足ではなく
       // 素材依存の検出失敗。回避方法を明示する
       if (seeThroughSplitParts && /(tag_lr_split|part_lr_split|lr_split|IndexError)/.test(message)) {
@@ -1938,55 +2274,40 @@ function App() {
     }
   }
 
-  async function applyWorkspacePartAdjustment(offsetOverride?: { x: number; y: number }) {
-    if (!expressionWorkspace || !workspaceExtractResult) return;
-    setWorkspaceBusy(true);
-    try {
-      const appliedOffsetX = offsetOverride?.x ?? workspacePartOffsetX;
-      const appliedOffsetY = offsetOverride?.y ?? workspacePartOffsetY;
-      const result = await invoke<AdjustCodexExtractedPartsResult>("adjust_codex_extracted_parts", {
-        request: {
-          jobPath: expressionWorkspace.workPath,
-          offsetX: appliedOffsetX,
-          offsetY: appliedOffsetY,
-          scalePercent: workspacePartScale,
-          // "all" 以外はそのパーツだけ調整（パーツごとのズレに個別対応）
-          part: workspaceAdjustTarget === "all" ? null : workspaceAdjustTarget,
-        },
-      });
-      setWorkspaceExtractResult({
-        ...workspaceExtractResult,
-        extractedPartsPath: result.extractedPartsPath,
-        // 個別適用時は対象1件しか返らないため、一覧は維持する
-        extractedParts: workspaceAdjustTarget === "all" ? result.adjustedParts : workspaceExtractResult.extractedParts,
-        warnings: workspaceExtractResult.warnings,
-        partAdjustments: result.partAdjustments,
-      });
-      // 適用済みの値をベースラインとして記録（同じ値のままでは再適用が走らないように）
-      workspaceAdjustBaseline.current = {
-        target: workspaceAdjustTarget,
-        offsetX: appliedOffsetX,
-        offsetY: appliedOffsetY,
-        scalePercent: workspacePartScale,
-      };
-      setWorkspaceRifeResult(null);
-      setWorkspaceRifePreview(null);
-      // 調整済みバッジ: バックエンドが実際に適用したパーツを記録
-      // （一括適用はeyes-open対象外のため、静的リストではなく戻り値を使う）
-      setWorkspaceAdjustedParts(prev => {
-        const next = { ...prev };
-        for (const part of result.adjustedParts) next[part] = true;
-        return next;
-      });
-      await refreshWorkspaceCompositePreview().catch(() => null);
-      await setWorkspaceStepAndPersist(5);
-      setStatus("差分位置を調整しました");
-      showToast("位置調整を適用しました");
-    } catch (cause) {
-      setError(String(cause));
-    } finally {
-      setWorkspaceBusy(false);
+  async function persistWorkspacePartDrafts(draftSnapshot: WorkspacePartAdjustmentDrafts) {
+    if (!expressionWorkspace || !workspaceExtractResult) {
+      throw new Error("差分パーツが読み込まれていません");
     }
+    const workspacePath = expressionWorkspace.workPath;
+    const changedParts = WORKSPACE_ADJUST_PART_KEYS.filter(part => !sameWorkspacePartAdjustment(
+      workspacePartEditorBaseline.current[part],
+      draftSnapshot[part],
+    ));
+    if (changedParts.length === 0) return;
+
+    const result = await invoke<AdjustCodexExtractedPartsResult>("adjust_codex_extracted_parts_batch", {
+      request: {
+        jobPath: workspacePath,
+        adjustments: changedParts.map(part => ({
+          part,
+          ...(draftSnapshot[part] ?? DEFAULT_PART_ADJUSTMENT),
+        })),
+      },
+    });
+    if (activeWorkspacePath.current !== workspacePath) {
+      throw new Error("作業フォルダが切り替わったため保存を中止しました");
+    }
+    // バッチ全体が成功した後だけ画面状態を更新する。失敗時はバックエンドが画像を
+    // ロールバックし、呼び出し元がproject.jsonの安全なcheckpointを再読込する。
+    setWorkspaceRifeResult(null);
+    setMotionProfileReady(false);
+    setWorkspaceExtractResult({
+      ...workspaceExtractResult,
+      extractedPartsPath: result.extractedPartsPath,
+      partAdjustments: result.partAdjustments,
+    });
+    workspacePartEditorBaseline.current = cloneWorkspacePartAdjustmentDrafts(draftSnapshot);
+    workspacePartPersistedDuringEditor.current = true;
   }
 
   async function generateWorkspaceRifeOutputs() {
@@ -1994,27 +2315,34 @@ function App() {
       setError("先にSee-Through一括分解を完了してください");
       return;
     }
+    setError("");
     // 出力先は毎回同じため、古いMotionTunePanelを先にアンマウントしてキャッシュを捨てる。
     // 成功後に結果を再設定すると、新しいPNGとlayer-order.jsonを必ず読み直す。
+    setWorkspaceInlineEditor(null);
     setWorkspaceRifeResult(null);
-    setWorkspaceRifePreview(null);
+    setMotionProfileReady(false);
+    setMotionEditorDirty(false);
+    setMotionDraftSaveRequestId(0);
+    setMotionEditorDraftSaveBusy(false);
+    setMotionExportRequestId(0);
+    setMotionPostSaveDestination("overview");
     setWorkspaceBusy(true);
     try {
-      await invoke<SaveCodexBasePartsResult>("save_codex_base_parts", {
-        jobPath: expressionWorkspace.workPath,
-      });
+      // STEP4で保存済みのbase_partsを正本として使う。
+      // ここで再保存すると、再起動後など揮発メモリが空の作業を再開した際に失敗する。
+      // RIFE側で保存済みbody.pngの存在確認と読み込みを行うため、事前保存は不要。
       const result = await invoke<GenerateCodexRifeOutputResult>("generate_codex_rife_outputs", {
         jobPath: expressionWorkspace.workPath,
         frameCount,
         profile: "auto",
       });
       setWorkspaceRifeResult(result);
-      await refreshWorkspaceRifePreview().catch(() => null);
       // RIFE完了後は自動でSTEP7（モーション調整）へ進む
       await setWorkspaceStepAndPersist(7);
       setStatus(`SpriTalk用フォルダへ出力しました: ${result.outputPath}。モーション調整に進みます`);
       showToast("RIFE補完が完了しました");
     } catch (cause) {
+      await reloadWorkspaceAfterMutationFailure(expressionWorkspace.workPath);
       setError(String(cause));
     } finally {
       setWorkspaceBusy(false);
@@ -2022,69 +2350,17 @@ function App() {
   }
 
   function returnToModeSelect() {
-    if (mode === "interp" && interpStep !== 4 && hasInterpWork) {
-      const ok = window.confirm("現在のフレーム補間作業を終了してモード選択へ戻ります。出力、口マスク、生成プレビューはこの画面から離れると失われます。戻りますか？");
-      if (!ok) return;
-    }
+    setWorkspaceInlineEditor(null);
+    setWorkspaceEditorPreparing(false);
+    setMotionEditorDirty(false);
+    setMotionDraftSaveRequestId(0);
+    setMotionEditorDraftSaveBusy(false);
     setMode("select");
-    setStatus("モードを選択してください");
+    setStatus("作業を選択してください");
     resetZoom();
   }
 
-  function returnFromInterpInput() {
-    if (hasInterpWork) {
-      const ok = window.confirm("現在の入力内容を破棄して戻ります。続けますか？");
-      if (!ok) return;
-    }
-    setMode("select");
-    setStatus("モードを選択してください");
-    resetZoom();
-  }
-
-  function returnFromBaseFlow() {
-    if (expressionWorkspace) {
-      setMode("workspace");
-      setWorkspaceStep(4);
-      setStatus("素体調整に戻りました。");
-      resetZoom();
-      return;
-    }
-    setMode("select");
-    setBaseStep(1);
-    setStatus("モードを選択してください");
-    resetZoom();
-  }
-
-  function goBaseStep(step: BaseStep) {
-    if (step === 1) {
-      setBaseStep(1);
-      setMode("base_input");
-      return;
-    }
-    if (step === 2 && mappingPreview) {
-      setBaseStep(2);
-      setMode("hair_edit");
-      return;
-    }
-    if (step === 3 && bodyPreview) {
-      setBaseStep(3);
-      setMode("base_edit");
-      return;
-    }
-    if (step === 4 && baseResult) {
-      setBaseStep(4);
-      setMode("base_edit");
-    }
-  }
-
-  function baseStepEnabled(step: BaseStep) {
-    if (step === 1) return true;
-    if (step === 2) return !!mappingPreview;
-    if (step === 3) return !!bodyPreview;
-    return !!baseResult;
-  }
-
-  const bodyCategory = mappingPreview?.categories.find(c => c.target === (mode === "correction" || !!expressionWorkspace ? "free" : "body"));
+  const bodyCategory = mappingPreview?.categories.find(c => c.target === "free");
   const selectedLayerOpacity = selectedBodyLayer ? (layerOpacities[selectedBodyLayer] ?? 1) : 1;
 
   function getBodyOrderItem(name: string): (LayerInfo & { isPatch?: boolean }) | null {
@@ -2228,37 +2504,10 @@ function App() {
     ctx.restore();
   }
 
-  async function sam3SelectAtPoint(e: React.PointerEvent<HTMLCanvasElement>) {
-    const canvas = maskCanvasRef.current;
-    const metrics = getPreviewImageMetrics();
-    if (!canvas || !metrics || !bodyPreview || sam3Selecting) return;
-    const rect = canvas.getBoundingClientRect();
-    const x = (e.clientX - rect.left) / metrics.displayScale;
-    const y = (e.clientY - rect.top) / metrics.displayScale;
-    setSam3Selecting(true);
-    try {
-      const result = await invoke<{ maskPng: string }>("sam3_select_region", {
-        imageDataUrl: bodyPreview,
-        points: [[x, y]],
-      });
-      const img = await loadMotionLabImage(result.maskPng);
-      const ctx = canvas.getContext("2d");
-      ctx?.drawImage(img, 0, 0, canvas.width, canvas.height);
-    } catch (cause) {
-      setError(String(cause));
-    } finally {
-      setSam3Selecting(false);
-    }
-  }
-
   function onPatchMaskPointerDown(e: React.PointerEvent<HTMLCanvasElement>) {
     if (!patchDraftSource) return;
     e.preventDefault();
     e.stopPropagation();
-    if (sam3SelectMode) {
-      void sam3SelectAtPoint(e);
-      return;
-    }
     e.currentTarget.setPointerCapture(e.pointerId);
     maskDrawingRef.current = true;
     drawPatchMask(e);
@@ -2310,12 +2559,12 @@ function App() {
     }
 
     if (patchDraftSource === CHEST_CUT_SENTINEL) {
-      // 胸を切出（852話式導線）: bodyから塗った範囲を chest.png として分離する。
-      // 実際の分離処理は create_base 実行時（保存して戻る）にまとめて行う
+      // 胸部範囲ガイドを保存する。body自体から画素は抜かない。
+      // 互換用chest.pngの作成はcreate_base実行時（保存して戻る）にまとめて行う。
       setChestMaskDataUrl(canvas.toDataURL("image/png"));
       setPatchDraftSource("");
       clearPatchMask();
-      setStatus("胸の切出範囲を設定しました。「保存して戻る」で chest.png に反映されます。");
+      setStatus("胸部の変形範囲を設定しました。「保存して戻る」で反映されます。");
       return;
     }
 
@@ -2334,7 +2583,7 @@ function App() {
     const nextOrder = [...layerOrderRef.current];
     nextOrder.splice(sourceIdx >= 0 ? sourceIdx : 0, 0, patch.id);
     const nextEnabled = { ...enabledLayers, [patch.id]: true };
-    const nextOpacities = { ...layerOpacitiesRef.current, [patch.id]: mode === "correction" ? 1 : 0.5 };
+    const nextOpacities = { ...layerOpacitiesRef.current, [patch.id]: 0.5 };
 
     setLayerPatches(nextPatches);
     setLayerOrder(nextOrder);
@@ -2361,56 +2610,266 @@ function App() {
     await renderBody(nextOrder, nextEnabled, nextPatches, nextOpacities);
   }
 
+  function renderPartPositionEditor() {
+    const activePreviewSet = workspaceCompositePreview;
+    const positionPreviews = activePreviewSet?.previews.filter(item => (
+      WORKSPACE_ADJUST_PART_KEYS.includes(workspacePreviewItemKey(item))
+    )) ?? [];
+    const selectedPreview = positionPreviews.find(
+      item => workspacePreviewItemKey(item) === workspaceSelectedPreviewPart,
+    ) ?? null;
+    const mainPreviewImage = selectedPreview?.preview ?? "";
+    const mainPreviewLabel = selectedPreview ? workspacePreviewItemLabel(selectedPreview) : "目・口を選択";
+    const directEditReady = !!selectedPreview
+      && workspacePartDragMode
+      && !workspaceBusy
+      && workspacePositionVisual?.part === workspaceAdjustTarget
+      && workspaceSelectedPreviewPart === workspaceAdjustTarget;
+
+    return (
+      <div className="part-position-editor">
+        <section className="part-position-parts">
+          <div className="workspace-panel-heading">
+            <span>PARTS</span>
+            <h3>目・口パーツ</h3>
+            <p>調整するパーツを選びます。変更は「編集を完了」でまとめて保存されます。</p>
+          </div>
+          <div className="workspace-position-part-list">
+            {positionPreviews.map(item => {
+              const key = workspacePreviewItemKey(item);
+              const adjusted = !isDefaultWorkspacePartAdjustment(workspacePartDrafts[key]);
+              return (
+                <button
+                  type="button"
+                  key={key}
+                  className={workspaceSelectedPreviewPart === key ? "active" : ""}
+                  aria-pressed={workspaceSelectedPreviewPart === key}
+                  disabled={workspaceBusy}
+                  onClick={() => selectWorkspacePositionPart(key)}
+                >
+                  <img src={item.preview} alt="" />
+                  <span>
+                    <strong>{workspacePreviewItemLabel(item)}</strong>
+                    <small>{key.startsWith("eyes-") ? "目パーツ" : "口パーツ"}</small>
+                  </span>
+                  {adjusted && <em className="workspace-adjusted-badge">調整済</em>}
+                </button>
+              );
+            })}
+            {positionPreviews.length === 0 && <p className="workspace-position-list-empty">調整できるパーツがありません</p>}
+          </div>
+        </section>
+
+        <aside className="workspace-hub-preview part-position-preview">
+          <div className="preview-card-heading"><span>PREVIEW</span><strong>{mainPreviewLabel}</strong></div>
+          <div className="workspace-preview-stage">
+            {mainPreviewImage ? (
+              <>
+                <div
+                  className={`workspace-preview-pan${directEditReady ? " position-direct" : ""}${workspacePreviewDragging ? " dragging" : ""}`}
+                  onWheel={handleWorkspacePreviewWheel}
+                  onPointerDown={directEditReady ? undefined : handleWorkspacePreviewPointerDown}
+                  onPointerMove={directEditReady ? undefined : handleWorkspacePreviewPointerMove}
+                  onPointerUp={directEditReady ? undefined : handleWorkspacePreviewPointerUp}
+                  onPointerCancel={directEditReady ? undefined : handleWorkspacePreviewPointerUp}
+                  onLostPointerCapture={directEditReady ? undefined : handleWorkspacePreviewLostPointerCapture}
+                >
+                  {directEditReady && workspacePositionVisual ? (
+                    <canvas
+                      ref={workspacePositionCanvasRef}
+                      className={`workspace-position-canvas${workspacePartHovered ? " part-hover" : ""}${workspacePreviewDragging ? ` dragging-${workspacePreviewDrag.current?.mode ?? "pan"}` : ""}`}
+                      width={workspacePositionVisual.width}
+                      height={workspacePositionVisual.height}
+                      aria-label={`${mainPreviewLabel} の目・口をドラッグして位置調整`}
+                      onPointerDown={handleWorkspacePositionPointerDown}
+                      onPointerMove={handleWorkspacePositionPointerMove}
+                      onPointerUp={handleWorkspacePositionPointerUp}
+                      onPointerCancel={handleWorkspacePositionPointerUp}
+                      onPointerLeave={() => {
+                        if (!workspacePreviewDragging) setWorkspacePartHovered(false);
+                      }}
+                      onLostPointerCapture={handleWorkspacePositionLostPointerCapture}
+                      style={{ transform: `translate(${workspacePreviewPan.x}px, ${workspacePreviewPan.y}px) scale(${workspacePreviewZoom})` }}
+                    />
+                  ) : (
+                    <img
+                      src={mainPreviewImage}
+                      alt={`${mainPreviewLabel} プレビュー`}
+                      draggable={false}
+                      style={{ transform: `translate(${workspacePreviewPan.x}px, ${workspacePreviewPan.y}px) scale(${workspacePreviewZoom})` }}
+                    />
+                  )}
+                </div>
+                <div className="workspace-preview-zoom-controls">
+                  <button className="btn-zoom" type="button" onClick={() => setWorkspacePreviewZoom(previous => Math.min(8, previous * 1.25))}>+</button>
+                  <span className="zoom-level">{Math.round(workspacePreviewZoom * 100)}%</span>
+                  <button className="btn-zoom" type="button" onClick={() => setWorkspacePreviewZoom(previous => Math.max(0.25, previous * 0.8))}>-</button>
+                  <button className="btn-zoom btn-zoom-reset" type="button" onClick={resetWorkspacePreviewZoom}>リセット</button>
+                </div>
+              </>
+            ) : <span>素体構成を保存するとプレビューできます</span>}
+          </div>
+          <div className="workspace-position-toolbar" aria-label="選択パーツの位置と大きさ">
+            <label><span>X offset</span>
+              <span className="workspace-nudge-row">
+                <button type="button" title="Xを10px左へ" disabled={workspaceBusy} onClick={() => updateSelectedWorkspacePartDraft({ offsetX: workspacePartOffsetX - 10 })}>≪</button>
+                <button type="button" title="Xを1px左へ" disabled={workspaceBusy} onClick={() => updateSelectedWorkspacePartDraft({ offsetX: workspacePartOffsetX - 1 })}>‹</button>
+                <input type="number" value={workspacePartOffsetX} disabled={workspaceBusy} onChange={event => updateSelectedWorkspacePartDraft({ offsetX: Number(event.target.value) })} />
+                <button type="button" title="Xを1px右へ" disabled={workspaceBusy} onClick={() => updateSelectedWorkspacePartDraft({ offsetX: workspacePartOffsetX + 1 })}>›</button>
+                <button type="button" title="Xを10px右へ" disabled={workspaceBusy} onClick={() => updateSelectedWorkspacePartDraft({ offsetX: workspacePartOffsetX + 10 })}>≫</button>
+              </span>
+            </label>
+            <label><span>Y offset</span>
+              <span className="workspace-nudge-row">
+                <button type="button" title="Yを10px上へ" disabled={workspaceBusy} onClick={() => updateSelectedWorkspacePartDraft({ offsetY: workspacePartOffsetY - 10 })}>≪</button>
+                <button type="button" title="Yを1px上へ" disabled={workspaceBusy} onClick={() => updateSelectedWorkspacePartDraft({ offsetY: workspacePartOffsetY - 1 })}>‹</button>
+                <input type="number" value={workspacePartOffsetY} disabled={workspaceBusy} onChange={event => updateSelectedWorkspacePartDraft({ offsetY: Number(event.target.value) })} />
+                <button type="button" title="Yを1px下へ" disabled={workspaceBusy} onClick={() => updateSelectedWorkspacePartDraft({ offsetY: workspacePartOffsetY + 1 })}>›</button>
+                <button type="button" title="Yを10px下へ" disabled={workspaceBusy} onClick={() => updateSelectedWorkspacePartDraft({ offsetY: workspacePartOffsetY + 10 })}>≫</button>
+              </span>
+            </label>
+            <label><span>Scale {workspacePartScale}%</span>
+              <span className="workspace-scale-row">
+                <input type="range" min={50} max={150} value={workspacePartScale} disabled={workspaceBusy} onChange={event => updateSelectedWorkspacePartDraft({ scalePercent: Number(event.target.value) })} />
+                <input type="number" min={50} max={150} value={workspacePartScale} disabled={workspaceBusy} onChange={event => updateSelectedWorkspacePartDraft({ scalePercent: Number(event.target.value) })} />
+              </span>
+            </label>
+            <button
+              type="button"
+              className="btn btn-secondary workspace-position-reset"
+              data-action-tone="edit"
+              disabled={workspaceBusy || isDefaultWorkspacePartAdjustment(workspacePartDrafts[workspaceAdjustTarget])}
+              onClick={() => setWorkspacePartDraft(workspaceAdjustTarget, DEFAULT_PART_ADJUSTMENT)}
+            >0に戻す</button>
+          </div>
+        </aside>
+      </div>
+    );
+  }
+
   function renderWorkspaceMode() {
     const workspace = expressionWorkspace;
     const steps = [
       [1, "画像選択", "立ち絵と参照画像"],
-      [2, "Codex依頼", "依頼作成と成果物確認"],
+      [2, "表情素材", "Codex・画像編集AI・手作業"],
       [3, "See-Through", "一括分解"],
       [4, "素体調整", "レイヤー確認"],
       [5, "差分位置調整", "合成確認"],
       [6, "RIFE補完", "SpriTalk出力"],
       [7, "モーション調整", "揺れ・口パクの仕上げ"],
     ] as Array<[WorkspaceStep, string, string]>;
+    if (!workspace) return null;
+
+    const expectedExpressionParts = [
+      "eyes-open", "eyes-closed", "mouth-closed", "mouth-a", "mouth-i", "mouth-u", "mouth-e", "mouth-o",
+    ];
+    const step2FilesPresent = !!workspaceGeneratedStatus
+      && workspaceGeneratedStatus.expectedParts.length > 0
+      && workspaceGeneratedStatus.missingParts.length === 0;
+    const step3ArtifactsPresent = !!workspaceExtractResult
+      && expectedExpressionParts.every(part => workspaceExtractResult.extractedParts.includes(part));
+    const {
+      step2Ready,
+      step3Complete,
+      step4Complete,
+      step5Complete: step5Confirmed,
+      step6Complete: step6Current,
+    } = workspaceArtifactReadiness({
+      currentStep: workspace.project.currentStep,
+      requestDirty: workspaceCodexRequestDirty,
+      generatedReady: !!workspaceGeneratedStatus?.ready,
+      extractedComplete: step3ArtifactsPresent,
+      basePreviewReady: !!workspaceCompositePreview?.basePreview,
+      rifeCurrent: !!workspaceRifeResult && workspaceRifeResult.frameCount === frameCount,
+    });
+    const step3HasMissingParts = !!workspaceExtractResult && !step3ArtifactsPresent;
+    const step2HasInvalidSize = (workspaceGeneratedStatus?.sizeMismatches.length ?? 0) > 0;
+    const phaseModel = buildWorkspacePhaseModel({
+      currentStep: workspaceStep,
+      finished: {
+        1: !!workspaceFiles.source,
+        2: step2FilesPresent,
+        3: step3Complete,
+        4: step4Complete,
+        5: step5Confirmed,
+        6: !!workspaceRifeResult,
+        7: motionProfileReady,
+      },
+      runningStep: workspaceBusy && (
+        (workspaceStep === 3 && seeThroughPhase !== null)
+        || (workspaceStep === 6 && progress.total > 0)
+      ) ? workspaceStep : null,
+      stale: {
+        2: workspaceCodexRequestDirty || (workspaceGeneratedStatus?.staleParts?.length ?? 0) > 0,
+        6: !!workspaceRifeResult && !step6Current,
+      },
+      error: {
+        2: step2HasInvalidSize,
+        3: step3HasMissingParts,
+      },
+    });
+    const currentStepModel = phaseModel.substeps.find(item => item.step === workspaceStep);
     const canOpenWorkspaceStep = (step: WorkspaceStep) => {
-      if (workspaceBusy) return false;
+      if (workspaceBusy || workspaceEditorPreparing) return false;
       if (step === 1) return true;
       if (step === 2) return !!workspaceFiles.source;
-      if (step === 3) return !!workspaceGeneratedStatus?.ready && !workspaceCodexRequestDirty;
-      if (step === 4) return !!mappingPreview || !!workspaceFiles.source;
-      if (step === 5) return !!workspaceExtractResult && !!workspaceCompositePreview?.basePreview;
-      if (step === 6) return !!workspaceExtractResult && !!workspaceCompositePreview?.basePreview;
-      return !!workspaceRifeResult;
+      if (step === 3) return step2Ready;
+      if (step === 4) return step3Complete;
+      if (step === 5) return step3Complete && step4Complete;
+      if (step === 6) return step5Confirmed;
+      return step6Current;
     };
     const canAdvanceWorkspaceStep = () => {
       if (workspaceBusy) return false;
       if (workspaceStep === 1) return !!workspaceFiles.source;
-      if (workspaceStep === 2) return !!workspaceGeneratedStatus?.ready && !workspaceCodexRequestDirty;
-      if (workspaceStep === 3) return !!mappingPreview;
-      if (workspaceStep === 4) return !!workspaceCompositePreview?.basePreview;
-      if (workspaceStep === 5) return !!workspaceExtractResult && !!workspaceCompositePreview?.basePreview;
-      if (workspaceStep === 6) return !!workspaceRifeResult;
+      if (workspaceStep === 2) return step2Ready;
+      if (workspaceStep === 3) return step3Complete;
+      if (workspaceStep === 4) return step4Complete;
+      if (workspaceStep === 5) return step5Confirmed;
+      if (workspaceStep === 6) return step6Current;
       return false;
     };
     const runtimeMatchesSelectedProfile = seeThroughRuntime?.selectedProfile === seeThroughProfile;
     const selectedProfileReady = !!seeThroughRuntime?.ready && runtimeMatchesSelectedProfile;
     const seeThroughRunning = workspaceBusy && !!seeThroughProgress && ["prepare", "inference", "load"].includes(seeThroughProgress.stage);
-    const activePreviewSet = workspaceStep >= 6 && workspaceRifePreview ? workspaceRifePreview : workspaceCompositePreview;
-    const selectedPreview = workspaceSelectedPreviewPart === "base"
-      ? null
-      : activePreviewSet?.previews.find(item => workspacePreviewItemKey(item) === workspaceSelectedPreviewPart) ?? null;
-    const mainPreviewImage = selectedPreview?.preview ?? activePreviewSet?.basePreview ?? "";
-    const mainPreviewLabel = selectedPreview ? workspacePreviewItemLabel(selectedPreview) : "base";
+    // 概要画面では目・口を合成した8表情だけを表示する。目口の無いbaseは内部の
+    // 合成下地として保持し、UIには出さない。RIFE全フレームはSTEP7編集開始まで読まない。
+    const overviewPreviewItems = workspaceCompositePreview?.previews.filter(item => item.part !== "base") ?? [];
+    const selectedOverviewPreview = overviewPreviewItems.find(item => item.part === workspaceOverviewPreviewPart)
+      ?? overviewPreviewItems.find(item => item.part === "eyes-open")
+      ?? overviewPreviewItems[0]
+      ?? null;
+    const sourcePreviewBeforeBaseSave = workspaceStep === 4 && !step4Complete
+      ? (workspaceImagePreviews.source ?? "")
+      : "";
+    const mainPreviewImage = selectedOverviewPreview?.preview ?? sourcePreviewBeforeBaseSave;
+    const mainPreviewLabel = selectedOverviewPreview
+      ? workspacePreviewItemLabel(selectedOverviewPreview)
+      : sourcePreviewBeforeBaseSave ? "元画像" : "表情プレビュー";
+    const selectWorkspaceStep = (step: WorkspaceStep) => {
+      if (step === workspaceStep || workspaceInlineEditor) return;
+      setError("");
+      setWorkspaceStep(step);
+      if (step === 2 && workspaceGeneratedStatus && !workspaceCodexRequestDirty) {
+        void inspectWorkspaceGeneratedParts();
+      }
+    };
     const goPreviousWorkspaceStep = () => {
+      if (workspaceInlineEditor) {
+        void closeInlineEditor();
+        return;
+      }
       if (workspaceStep === 1) {
         returnToModeSelect();
         return;
       }
-      void setWorkspaceStepAndPersist((workspaceStep - 1) as WorkspaceStep);
-    };
-    const goNextWorkspaceStep = () => {
-      if (workspaceStep >= 7 || !canAdvanceWorkspaceStep()) return;
-      void setWorkspaceStepAndPersist((workspaceStep + 1) as WorkspaceStep);
+      // 閲覧のために戻るだけでは、project.jsonの到達済みチェックポイントを巻き戻さない。
+      // 再生成・再保存を実行した場合は各処理側が適切なSTEPを永続化する。
+      const previousStep = (workspaceStep - 1) as WorkspaceStep;
+      setWorkspaceStep(previousStep);
+      if (previousStep === 2 && workspaceGeneratedStatus && !workspaceCodexRequestDirty) {
+        void inspectWorkspaceGeneratedParts();
+      }
     };
     // 「次へ」が押せない理由の提示（無効ボタンの理由が分からない問題への対応）
     const nextStepBlockReason = (): string | null => {
@@ -2419,50 +2878,167 @@ function App() {
       switch (workspaceStep) {
         case 1: return "立ち絵を選択すると次へ進めます";
         case 2: {
-          if (workspaceCodexRequestDirty) return "依頼設定を指示書へ反映すると進めます";
+          if (workspaceCodexRequestDirty) return "素材設定を作成ガイドへ反映すると進めます";
           const pending = (workspaceGeneratedStatus?.missingParts.length ?? 0)
             + (workspaceGeneratedStatus?.staleParts?.length ?? 0);
           return pending > 0
-            ? `Codex成果物が揃うと進めます（未生成・再生成が残り${pending}ファイル）`
-            : "「依頼ファイルを作成」してCodexの成果物を配置してください";
+            ? `表情素材が揃うと進めます（未生成・再生成が残り${pending}ファイル）`
+            : "作成ガイドを出力し、7枚の表情素材を配置してください";
         }
-        case 3: return "「一括分解を開始」が完了すると次へ進めます";
-        case 4: return "「素体調整を開く」で調整を保存すると次へ進めます";
-        case 5: return "差分の抽出結果と合成プレビューが揃うと次へ進めます";
-        case 6: return "「RIFE補完を開始」が完了すると自動でモーション調整へ進みます";
+        case 3: return step3HasMissingParts ? "不足している表情素材をSTEP2で差し替えて再実行してください" : "「一括分解を開始」が完了すると次へ進めます";
+        case 4: return "「編集を開始」で素体を保存すると次へ進めます";
+        case 5: return "「編集を開始」で差分位置を確認し、「編集を完了」を押すと進めます";
+        case 6: return null;
         default: return null;
       }
     };
-    const nextStepLabel = workspaceStep < 7 ? steps[workspaceStep]?.[1] ?? "" : "";
-    if (!workspace) return null;
+    const phaseStatusLabel = error
+      ? error
+      : workspaceBusy ? "処理を実行しています"
+        : status;
+
+    const renderPrimaryAction = () => {
+      if (workspaceStep === 1) {
+        return workspaceFiles.source ? (
+          <button className="btn btn-secondary" data-action-tone="navigate" data-nav-direction="forward" onClick={() => setWorkspaceStep(2)}>次へ: 表情素材 <span className="workspace-nav-icon" aria-hidden="true">→</span></button>
+        ) : (
+          <button className="btn btn-secondary" data-action-tone="edit" onClick={() => void pickWorkspaceImage("source")}>立ち絵を選択</button>
+        );
+      }
+      if (workspaceStep === 2) {
+        if (!workspaceGeneratedStatus || workspaceCodexRequestDirty) {
+          return <button className="btn btn-primary" disabled={workspaceBusy || !workspaceFiles.source} onClick={() => void prepareWorkspaceCodexRequest()}>{workspaceGeneratedStatus ? "作成ガイドを更新" : "作成ガイドを出力"}</button>;
+        }
+        if (!workspaceGeneratedStatus.ready) {
+          return <button className="btn btn-secondary" data-action-tone="edit" disabled={workspaceBusy} onClick={() => void inspectWorkspaceGeneratedParts()}>配置を再確認</button>;
+        }
+        return <button className="btn btn-secondary" data-action-tone="navigate" data-nav-direction="forward" disabled={workspaceBusy} onClick={() => setWorkspaceStep(3)}>次へ: 一括分解 <span className="workspace-nav-icon" aria-hidden="true">→</span></button>;
+      }
+      if (workspaceStep === 3) {
+        return step3Complete ? (
+          <button className="btn btn-secondary" data-action-tone="navigate" data-nav-direction="forward" disabled={workspaceBusy} onClick={() => setWorkspaceStep(4)}>次へ: パーツ編集 <span className="workspace-nav-icon" aria-hidden="true">→</span></button>
+        ) : (
+          <button className="btn btn-primary" disabled={workspaceBusy || !selectedProfileReady || !workspaceGeneratedStatus?.ready} onClick={() => void runWorkspaceSeeThroughBatch()}>{seeThroughRunning ? "分解処理中..." : "一括分解を開始"}</button>
+        );
+      }
+      if (workspaceStep === 4) {
+        if (workspaceInlineEditor === "base") {
+          return <button className="btn btn-primary" disabled={loading || workspaceBusy || !bodyPreview} onClick={() => void handleCreateBase()}>{loading ? "保存中..." : "保存して次へ"}</button>;
+        }
+        if (!step4Complete) {
+          return <button className="btn btn-secondary" data-action-tone="edit" disabled={workspaceBusy || workspaceOverviewPreviewLoading || workspaceEditorPreparing} onClick={() => void startInlineBaseEditor()}>{workspaceEditorPreparing ? "準備中..." : "編集を開始"}</button>;
+        }
+        return <button className="btn btn-secondary" data-action-tone="navigate" data-nav-direction="forward" disabled={workspaceBusy || workspaceOverviewPreviewLoading} onClick={() => setWorkspaceStep(5)}>次へ: 差分位置 <span className="workspace-nav-icon" aria-hidden="true">→</span></button>;
+      }
+      if (workspaceStep === 5) {
+        if (workspaceInlineEditor === "position") {
+          return <button className="btn btn-primary" disabled={workspaceBusy || workspaceEditorPreparing} onClick={() => void finishInlinePartEditor()}>{workspacePartSaving ? "変更を保存中..." : "編集を完了して次へ"}</button>;
+        }
+        if (!step5Confirmed) {
+          return <button className="btn btn-secondary" data-action-tone="edit" disabled={workspaceBusy || workspaceOverviewPreviewLoading || workspaceEditorPreparing || !step4Complete} onClick={() => void startInlinePositionEditor()}>{workspaceEditorPreparing ? "準備中..." : "編集を開始"}</button>;
+        }
+        return <button className="btn btn-secondary" data-action-tone="navigate" data-nav-direction="forward" disabled={workspaceBusy || workspaceOverviewPreviewLoading} onClick={() => setWorkspaceStep(6)}>次へ: フレーム生成 <span className="workspace-nav-icon" aria-hidden="true">→</span></button>;
+      }
+      if (workspaceStep === 6) {
+        return step6Current ? (
+          <button className="btn btn-secondary" data-action-tone="navigate" data-nav-direction="forward" disabled={workspaceBusy || workspaceOverviewPreviewLoading} onClick={() => setWorkspaceStep(7)}>次へ: モーション仕上げ <span className="workspace-nav-icon" aria-hidden="true">→</span></button>
+        ) : null;
+      }
+      if (workspaceInlineEditor === "motion") {
+        return (
+          <div className="workspace-motion-export-actions">
+            <button
+              className="btn btn-secondary"
+              data-action-tone="edit"
+              disabled={workspaceBusy || workspaceEditorPreparing || motionEditorDraftSaveBusy || motionEditorExportBusy || !motionEditorExportReady}
+              onClick={requestLiveDisplayFromMotionEditor}
+            >ライブ表示へ</button>
+            <button
+              className="btn btn-primary"
+              disabled={workspaceBusy || workspaceEditorPreparing || motionEditorDraftSaveBusy || motionEditorExportBusy || !motionEditorExportReady}
+              onClick={() => {
+                setMotionEditorExportBusy(true);
+                setMotionExportRequestId(previous => previous + 1);
+              }}
+            >
+              {motionEditorExportBusy ? "SpriTalk向け素材を保存中..." : "SpriTalk向けに保存"}
+            </button>
+          </div>
+        );
+      }
+      return motionProfileReady ? (
+        <button className="btn btn-secondary" data-action-tone="navigate" disabled={workspaceBusy || workspaceOverviewPreviewLoading} onClick={() => openPath(workspaceRifeResult?.outputPath || workspace.spritalkPartsPath).catch(() => {})}>素材フォルダを開く</button>
+      ) : null;
+    };
 
     return (
-      <div className="workspace-flow-screen">
-        <nav className="workspace-flow-stepper" aria-label="表情セット作成ステップ">
-          {steps.map(([step, label, note]) => (
+      <div className="workspace-hub">
+        <div className="workspace-commandbar">
+          <nav className="workspace-phase-stepper" aria-label="表情セット作成の7工程">
+            {steps.map(([step, label, note]) => {
+              const stepModel = phaseModel.substeps.find(item => item.step === step);
+              const stepStatus = stepModel?.status ?? "locked";
+              const isActive = workspaceStep === step;
+              return (
+                <button
+                  key={step}
+                  type="button"
+                  data-step={step}
+                  className={`workspace-phase-step ${stepStatus}${isActive ? " active" : ""}`}
+                  disabled={!canOpenWorkspaceStep(step) || (!!workspaceInlineEditor && !isActive)}
+                  aria-current={isActive ? "step" : undefined}
+                  title={`STEP ${step}: ${label} — ${note}`}
+                  onClick={() => selectWorkspaceStep(step)}
+                >
+                  <span>
+                    <small className="workspace-phase-step-label">STEP {step}</small>
+                    <strong>{label}</strong>
+                  </span>
+                </button>
+              );
+            })}
+          </nav>
+          <div className="workspace-toolbar" aria-label="ワークスペース操作">
             <button
-              key={step}
-              className={`workspace-flow-step${workspaceStep === step ? " active" : ""}${workspaceStep > step ? " done" : ""}`}
-              disabled={!canOpenWorkspaceStep(step)}
-              aria-current={workspaceStep === step ? "step" : undefined}
-              title={!canOpenWorkspaceStep(step) && !workspaceBusy ? "前の工程を完了すると開けます" : workspaceStep > step ? "クリックでこの工程へ戻れます" : undefined}
-              onClick={() => void setWorkspaceStepAndPersist(step)}
+              type="button"
+              className="workspace-icon-button"
+              title={themeMode === "dark" ? "ライトモードへ切り替え" : "ダークモードへ切り替え"}
+              aria-label={themeMode === "dark" ? "ライトモードへ切り替え" : "ダークモードへ切り替え"}
+              onClick={() => setThemeMode(previous => previous === "dark" ? "light" : "dark")}
             >
-              <b>{workspaceBusy && workspaceStep === step ? <span className="step-spinner" aria-label="処理中" /> : workspaceStep > step ? "✓" : step}</b>
-              <span><strong>{label}</strong><small>{note}</small></span>
+              <WorkspaceToolbarIcon name={themeMode === "dark" ? "sun" : "moon"} />
             </button>
-          ))}
-        </nav>
+            <button
+              type="button"
+              className="workspace-icon-button"
+              title="制作ホームへ戻る"
+              aria-label="制作ホームへ戻る"
+              disabled={workspaceBusy || workspaceEditorPreparing || !!workspaceInlineEditor}
+              onClick={returnToModeSelect}
+            >
+              <WorkspaceToolbarIcon name="home" />
+            </button>
+            <button
+              type="button"
+              className="workspace-icon-button"
+              title={`作業フォルダを開く: ${workspace.workPath}`}
+              aria-label="作業フォルダを開く"
+              onClick={() => openPath(workspace.workPath).catch(() => {})}
+            >
+              <WorkspaceToolbarIcon name="folder" />
+            </button>
+          </div>
+        </div>
 
         <div
-          className={`workspace-flow-layout${workspaceStep === 1 ? " step-one" : ""}${workspaceStep >= 2 && workspaceStep <= 4 ? " single-panel" : ""}`}
-          style={workspaceStep === 7 ? { display: "none" } : undefined}
+          className={`workspace-hub-body${workspaceStep <= 3 || workspaceInlineEditor ? " single-panel" : ""}`}
         >
-          <section className="workspace-flow-panel">
+          <section className="workspace-phase-card workspace-flow-panel">
+            <div className={`workspace-phase-content${workspaceInlineEditor ? " editing" : ""}`}>
             {workspaceStep === 1 && (
               <div className="workspace-step-one">
-                <div className="workspace-panel-heading">
-                  <span>STEP 1</span>
+                <div className="workspace-panel-heading workspace-step-heading">
+                  <span>STEP 1 / 7</span>
                   <h3>立ち絵と参照画像を選択</h3>
                   <p>立ち絵は必須です。参照画像は任意で、使うと目や口の中の色・質感が元絵に近づきます。</p>
                 </div>
@@ -2492,7 +3068,7 @@ function App() {
                       ) : (
                         <strong className="workspace-picker-empty">
                           <b>クリックして参照画像を選択</b>
-                          <em>同じキャラクターの別ポーズや口を開けた絵があると、<br />Codex生成の目・口内の色や質感が元絵に近づきます。<br />なければ空のままで進めます。</em>
+                          <em>同じキャラクターの別ポーズや口を開けた絵があると、<br />作成する目・口内の色や質感を元絵に近づけやすくなります。<br />なければ空のままで進めます。</em>
                         </strong>
                       )}
                       <small title={workspaceFiles.reference}>{workspaceFiles.reference ? workspaceFileName(workspaceFiles.reference) : "設定しない場合はそのまま次へ"}</small>
@@ -2506,15 +3082,58 @@ function App() {
             )}
 
             {workspaceStep === 2 && (() => {
-              // ①依頼作成 → ②Codexで生成（このアプリの外の作業）→ ③配置確認 の現在地
+              // ①作成ガイド出力 → ②任意の方法で素材作成 → ③配置確認 の現在地
               const codexPhase = workspaceCodexRequestDirty ? 1 : workspaceGeneratedStatus?.ready ? 3 : workspaceGeneratedStatus ? 2 : 1;
               const mouthCornerDescription = WORKSPACE_MOUTH_CORNER_OPTIONS.find(option => option.value === workspaceMouthCorner)?.description ?? "";
               return (
-              <>
-                <div className="workspace-panel-heading">
-                  <span>STEP 2</span>
-                  <h3>Codex依頼を作成</h3>
-                  <p>この工程の画像生成はアプリの外（Codex）で行います。</p>
+              <div className="workspace-step-two">
+                <div className="workspace-panel-heading workspace-step-heading">
+                  <span>STEP 2 / 7</span>
+                  <h3>表情素材を用意</h3>
+                  <p>Codex向けに最適化した作成ガイドを使いますが、画像編集AIや手作業で用意した素材でも進められます。</p>
+                </div>
+                <div className="workspace-material-routes" role="group" aria-label="表情素材の用意方法">
+                  <button
+                    type="button"
+                    className={workspaceAssetPreparationMethod === "codex" ? "active" : ""}
+                    aria-pressed={workspaceAssetPreparationMethod === "codex"}
+                    onClick={() => setWorkspaceAssetPreparationMethod("codex")}
+                  >
+                    <span>おすすめ</span>
+                    <strong>Codexでまとめて作る</strong>
+                    <small>作成ガイドと元画像をフォルダごと渡します。</small>
+                  </button>
+                  <button
+                    type="button"
+                    className={workspaceAssetPreparationMethod === "image-ai" ? "active" : ""}
+                    aria-pressed={workspaceAssetPreparationMethod === "image-ai"}
+                    onClick={() => setWorkspaceAssetPreparationMethod("image-ai")}
+                  >
+                    <span>画像編集AI</span>
+                    <strong>Nano Bananaなどで作る</strong>
+                    <small>7枚を個別に保存し、指定名で配置します。</small>
+                  </button>
+                  <button
+                    type="button"
+                    className={workspaceAssetPreparationMethod === "manual" ? "active" : ""}
+                    aria-pressed={workspaceAssetPreparationMethod === "manual"}
+                    onClick={() => setWorkspaceAssetPreparationMethod("manual")}
+                  >
+                    <span>手作業</span>
+                    <strong>自分で用意する</strong>
+                    <small>画像編集ソフト等で同じ仕様の7枚を作ります。</small>
+                  </button>
+                </div>
+                <div className="workspace-material-route-advice" role="status">
+                  {workspaceAssetPreparationMethod === "codex" && (
+                    <><strong>Codexを使う場合</strong><span><code>01_codex_request</code> をフォルダごと渡せば、指示と保存先をまとめて伝えられます。</span></>
+                  )}
+                  {workspaceAssetPreparationMethod === "image-ai" && (
+                    <><strong>画像編集AIを使う場合</strong><span>作成ガイドの共通ルールを使い、完成画像を立ち絵と同じ大きさ・指定ファイル名で <code>02_generated_parts</code> に保存してください。</span></>
+                  )}
+                  {workspaceAssetPreparationMethod === "manual" && (
+                    <><strong>手作業で用意する場合</strong><span>透過は不要です。立ち絵と同じ大きさで、閉じ口・あいうえお・閉じ目の7枚を <code>02_generated_parts</code> に保存してください。</span></>
+                  )}
                 </div>
                 <div className="workspace-mouth-corner-setting">
                   <label>
@@ -2536,9 +3155,9 @@ function App() {
                   <p>{mouthCornerDescription}<small>閉じ口＋あいうえおの6枚に共通適用。閉じ目画像の口は元画像のまま維持します。</small></p>
                 </div>
                 <details className="advanced-prompt">
-                  <summary>追加指示（任意）{workspaceCodexRequestDirty ? " — 依頼書へ未反映" : ""}</summary>
+                  <summary>素材作成への追加指示（任意）{workspaceCodexRequestDirty ? " — 作成ガイドへ未反映" : ""}</summary>
                   <textarea
-                    aria-label="Codexへの追加指示"
+                    aria-label="表情素材への追加指示"
                     value={workspaceCodexPrompt}
                     maxLength={2000}
                     disabled={workspaceBusy}
@@ -2549,7 +3168,7 @@ function App() {
                     }}
                   />
                   <p className="workspace-codex-prompt-note">
-                    入力内容は唯一の指示書の「追加指示」に入ります。共通の変更範囲や口形仕様と矛盾する場合は共通ルールが優先されます。
+                    入力内容は作成ガイドの「追加指示」に入ります。共通の変更範囲や口形仕様と矛盾する場合は共通ルールが優先されます。
                     <span>{workspaceCodexPrompt.length}/2000</span>
                   </p>
                 </details>
@@ -2557,22 +3176,25 @@ function App() {
                   <section className={`workspace-codex-card${codexPhase === 1 ? " current" : ""}`}>
                     <div>
                       <span>1</span>
-                      <strong>依頼ファイルを作成 {codexPhase === 1 && <em className="workspace-phase-badge">いまここ</em>}{codexPhase > 1 && <em className="workspace-phase-done">✓ 済み</em>}</strong>
-                      <p>PachiPakuGenがCodex向けの指示書と元画像を <code>01_codex_request</code> に書き出します。</p>
-                    </div>
-                    <div className="workspace-action-row">
-                      <button className="btn btn-primary" disabled={workspaceBusy || !workspaceFiles.source} onClick={() => void prepareWorkspaceCodexRequest()}>{workspaceGeneratedStatus && workspaceCodexRequestDirty ? "指示書を更新" : "依頼ファイルを作成"}</button>
+                      <strong>作成ガイドを出力 {codexPhase === 1 && <em className="workspace-phase-badge">いまここ</em>}{codexPhase > 1 && <em className="workspace-phase-done">✓ 済み</em>}</strong>
+                      <p>PachiPakuGenが共通仕様・Codex向け指示・元画像を <code>01_codex_request</code> に書き出します。</p>
                     </div>
                   </section>
                   <section className={`workspace-codex-card${codexPhase === 2 ? " current" : ""}`}>
                     <div>
                       <span>2</span>
-                      <strong>Codexで生成（アプリ外） {codexPhase === 2 && <em className="workspace-phase-badge">いまここ</em>}{codexPhase > 2 && <em className="workspace-phase-done">✓ 済み</em>}</strong>
-                      <p><code>01_codex_request</code> を<b>フォルダごと</b>Codexへ渡してください（指示は同梱済み）。生成物は通常Codexが <code>02_generated_parts</code> へ自動配置します。</p>
+                      <strong>表情素材を作成（アプリ外） {codexPhase === 2 && <em className="workspace-phase-badge">いまここ</em>}{codexPhase > 2 && <em className="workspace-phase-done">✓ 済み</em>}</strong>
+                      <p>
+                        {workspaceAssetPreparationMethod === "codex"
+                          ? <><code>01_codex_request</code> を<b>フォルダごと</b>Codexへ渡してください。生成物は通常 <code>02_generated_parts</code> へ自動配置されます。</>
+                          : workspaceAssetPreparationMethod === "image-ai"
+                            ? <>画像編集AIで7枚を作成し、ダウンロード後に指定名で <code>02_generated_parts</code> へ配置してください。</>
+                            : <>作成ガイドを確認して7枚を編集し、指定名で <code>02_generated_parts</code> へ配置してください。</>}
+                      </p>
                     </div>
                     <div className="workspace-action-row">
-                      <button className="btn btn-secondary" onClick={() => openPath(workspace.codexRequestPath).catch(() => {})}>依頼フォルダを開く</button>
-                      <button className="btn btn-secondary" onClick={() => openPath(workspace.generatedPartsPath).catch(() => {})}>配置フォルダを開く</button>
+                      <button className="btn btn-secondary" data-action-tone="navigate" onClick={() => openPath(workspace.codexRequestPath).catch(() => {})}>作成ガイドを開く</button>
+                      <button className="btn btn-secondary" data-action-tone="navigate" onClick={() => openPath(workspace.generatedPartsPath).catch(() => {})}>配置フォルダを開く</button>
                     </div>
                   </section>
                   <section className={`workspace-codex-card${codexPhase === 3 ? " current" : ""}`}>
@@ -2581,12 +3203,12 @@ function App() {
                       <strong>配置を確認 {codexPhase === 3 ? <em className="workspace-phase-done">✓ 揃いました</em> : codexPhase === 2 ? <em className="workspace-phase-badge">自動確認中</em> : null}</strong>
                       <p>
                         {workspaceCodexRequestDirty
-                          ? "口角設定または追加指示を反映するため、指示書を更新してください。"
+                          ? "口角設定または追加指示を反映するため、作成ガイドを更新してください。"
                           : workspaceGeneratedStatus?.ready
                           ? "すべて揃いました。「次へ」で進んでください。"
                           : codexPhase === 2
                             ? `5秒ごとに自動確認中（${workspaceGeneratedStatus?.presentParts.length ?? 0}/${workspaceGeneratedStatus?.expectedParts.length ?? 7}）`
-                            : "依頼ファイル作成後に一覧が表示されます。"}
+                            : "作成ガイド出力後に一覧が表示されます。"}
                       </p>
                       {workspaceGeneratedStatus && (
                         <div className="workspace-parts-checklist">
@@ -2603,22 +3225,19 @@ function App() {
                         </div>
                       )}
                     </div>
-                    <div className="workspace-action-row">
-                      <button className="btn btn-primary" disabled={workspaceBusy} onClick={() => void inspectWorkspaceGeneratedParts()}>いますぐ確認</button>
-                    </div>
                   </section>
                 </div>
-              </>
+              </div>
               );
             })()}
 
             {workspaceStep === 3 && (
               <>
                 <div className="workspace-step3-header">
-                  <div className="workspace-panel-heading">
-                    <span>STEP 3</span>
+                  <div className="workspace-panel-heading workspace-step-heading">
+                    <span>STEP 3 / 7</span>
                     <h3>See-Throughを一括実行</h3>
-                    <p>立ち絵とCodex成果物をSee-Throughで分解します。</p>
+                    <p>立ち絵と用意した表情素材をSee-Throughで分解します。</p>
                   </div>
                   <div className="workspace-step3-env">
                     <div className="workspace-action-row">
@@ -2636,58 +3255,61 @@ function App() {
                     </div>
                   </div>
                 </div>
-                <div className={`workspace-process-card${!seeThroughRuntime?.runtimeReady ? " primary" : ""}`}>
-                  <div>
-                    <span>準備 1/2</span>
-                    <strong>ランタイム初期セットアップ</strong>
-                    <p>See-Through本体、専用Python環境、CUDA依存関係だけをアプリ内で準備します。大容量モデルはまだ取得しません。</p>
+                <div className="workspace-step3-main">
+                  <div className="workspace-setup-steps" aria-label="See-Throughの事前準備">
+                    <div className={`workspace-process-card${!seeThroughRuntime?.runtimeReady ? " primary" : ""}`}>
+                      <div>
+                        <span>準備 1/2</span>
+                        <strong>ランタイム初期セットアップ</strong>
+                        <p>See-Through本体、専用Python環境、CUDA依存関係だけをアプリ内で準備します。大容量モデルはまだ取得しません。</p>
+                      </div>
+                      <div className="workspace-action-row">
+                        {seeThroughRuntime?.runtimeReady ? (
+                          <span className="workspace-action-done">準備済み</span>
+                        ) : (
+                          <button className="btn btn-secondary" disabled={workspaceBusy} onClick={() => void prepareWorkspaceSeeThroughRuntime()}>
+                            ランタイムをセットアップ
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    <div className={`workspace-process-card${seeThroughRuntime?.runtimeReady && !selectedProfileReady ? " primary" : ""}`}>
+                      <div>
+                        <span>準備 2/2</span>
+                        <strong>モデルを事前ダウンロード</strong>
+                        <p>
+                          選択中の{seeThroughProfile === "low-vram" ? "省VRAM" : "高VRAM"}モデル
+                          （約{seeThroughProfile === "low-vram" ? "5.7" : "13.4"}GB）を別コンソールで取得します。実バイト進捗を確認でき、ウィンドウを閉じても再実行時に途中から再開します。
+                        </p>
+                      </div>
+                      <div className="workspace-action-row">
+                        {selectedProfileReady ? (
+                          <span className="workspace-action-done">モデル準備済み</span>
+                        ) : seeThroughRuntime?.modelDownloadBusy ? (
+                          <span className="workspace-action-done">別コンソールで取得中</span>
+                        ) : (
+                          <button
+                            className="btn btn-secondary"
+                            disabled={workspaceBusy || seeThroughModelDownloadLaunching || !seeThroughRuntime?.runtimeReady}
+                            onClick={() => void startWorkspaceSeeThroughModelDownload()}
+                          >
+                            {seeThroughModelDownloadLaunching ? "コンソールを起動中..." : "モデルDL用コンソールを開く"}
+                          </button>
+                        )}
+                      </div>
+                    </div>
                   </div>
-                  <div className="workspace-action-row">
-                    {seeThroughRuntime?.runtimeReady ? (
-                      <span className="workspace-action-done">準備済み</span>
-                    ) : (
-                      <button className="btn btn-secondary" disabled={workspaceBusy} onClick={() => void prepareWorkspaceSeeThroughRuntime()}>
-                        ランタイムをセットアップ
-                      </button>
-                    )}
-                  </div>
-                </div>
-                <div className={`workspace-process-card${seeThroughRuntime?.runtimeReady && !selectedProfileReady ? " primary" : ""}`}>
-                  <div>
-                    <span>準備 2/2</span>
-                    <strong>モデルを事前ダウンロード</strong>
-                    <p>
-                      選択中の{seeThroughProfile === "low-vram" ? "省VRAM" : "高VRAM"}モデル
-                      （約{seeThroughProfile === "low-vram" ? "5.7" : "13.4"}GB）を別コンソールで取得します。実バイト進捗を確認でき、ウィンドウを閉じても再実行時に途中から再開します。
-                    </p>
-                  </div>
-                  <div className="workspace-action-row">
-                    {selectedProfileReady ? (
-                      <span className="workspace-action-done">モデル準備済み</span>
-                    ) : seeThroughRuntime?.modelDownloadBusy ? (
-                      <span className="workspace-action-done">別コンソールで取得中</span>
-                    ) : (
-                      <button
-                        className="btn btn-secondary"
-                        disabled={workspaceBusy || seeThroughModelDownloadLaunching || !seeThroughRuntime?.runtimeReady}
-                        onClick={() => void startWorkspaceSeeThroughModelDownload()}
-                      >
-                        {seeThroughModelDownloadLaunching ? "コンソールを起動中..." : "モデルDL用コンソールを開く"}
-                      </button>
-                    )}
-                  </div>
-                </div>
-                {seeThroughRuntime && !selectedProfileReady && (
-                  <div className={`motion-lab-note${seeThroughRuntime.runtimeReady ? " workspace-setup-error" : ""}`} role={seeThroughRuntime.runtimeReady ? "alert" : undefined}>
-                    <strong>{seeThroughRuntime.runtimeReady ? "モデル未準備:" : "ランタイム未準備:"}</strong> {seeThroughRuntime.message}
-                  </div>
-                )}
-                {hfTokenStatus?.configured === false && !selectedProfileReady && (
-                  <div className="motion-lab-note" role="status">
-                    別コンソールでの大容量モデル取得ではHuggingFaceトークンの設定を推奨します。匿名取得はレート制限で遅くなるため、下の「詳細設定」で無料のreadトークンを保存してから開始してください。
-                  </div>
-                )}
-                <div className="workspace-seethrough-options">
+                  {seeThroughRuntime && !selectedProfileReady && (
+                    <div className={`motion-lab-note${seeThroughRuntime.runtimeReady ? " workspace-setup-error" : ""}`} role={seeThroughRuntime.runtimeReady ? "alert" : undefined}>
+                      <strong>{seeThroughRuntime.runtimeReady ? "モデル未準備:" : "ランタイム未準備:"}</strong> {seeThroughRuntime.message}
+                    </div>
+                  )}
+                  {hfTokenStatus?.configured === false && !selectedProfileReady && (
+                    <div className="motion-lab-note" role="status">
+                      別コンソールでの大容量モデル取得ではHuggingFaceトークンの設定を推奨します。匿名取得はレート制限で遅くなるため、下の「詳細設定」で無料のreadトークンを保存してから開始してください。
+                    </div>
+                  )}
+                  <div className="workspace-seethrough-options">
                   <div className="workspace-option-card">
                     <span>実行プロファイル</span>
                     <div className="workspace-segmented">
@@ -2809,136 +3431,179 @@ function App() {
                       匿名取得も可能ですが、HuggingFace側のレート制限で低速になります。モデルDL用コンソールを開く前にhuggingface.co/settings/tokens で無料のreadトークンを発行して貼り付けてください。保存済みトークンはコンソールの環境変数にだけ渡され、コマンド行や画面には表示されません。
                     </div>
                   </details>
-                </div>
-                <div className="workspace-start-seethrough">
-                  <div><strong>分解処理を開始</strong><p>立ち絵、閉じ目、閉じ口、あいうえお口の素材をまとめて分解します。</p></div>
-                  <button className="btn btn-primary" disabled={workspaceBusy || !selectedProfileReady || !workspaceGeneratedStatus?.ready} onClick={() => void runWorkspaceSeeThroughBatch()}>{seeThroughRunning ? "分解処理中..." : "一括分解を開始"}</button>
+                  </div>
+                  <div className="workspace-start-seethrough">
+                    <div><strong>分解処理を開始</strong><p>立ち絵、閉じ目、閉じ口、あいうえお口の素材をまとめて分解します。</p></div>
+                  </div>
                 </div>
               </>
             )}
 
             {workspaceStep === 4 && (
-              <>
-                <div className="workspace-panel-heading"><span>STEP 4</span><h3>素体を調整</h3><p>分解済みレイヤーの前後関係を確認し、SpriTalkに渡す素体パーツを作成します。</p></div>
-                {workspaceCompositePreview?.basePreview ? (
-                  <div className="workspace-status-card">
-                    <strong>✓ 素体は保存済みです</strong>
-                    <span>直したい箇所があれば「再調整する」で調整画面を開き直せます。問題なければ「次へ」で差分位置調整に進んでください。</span>
+              workspaceInlineEditor === "base" ? (
+                workspaceEditorPreparing ? (
+                  <div className="workspace-editor-loading" role="status" aria-live="polite">
+                    <span className="step-spinner" aria-hidden="true" />
+                    <strong>素体編集を準備しています</strong>
+                    <small>{status}</small>
                   </div>
                 ) : (
-                  <div className="workspace-status-card">
-                    <strong>「素体調整を開く」で専用の調整画面が開きます</strong>
-                    <ul className="workspace-feature-list">
-                      <li>レイヤーの表示/非表示と前後関係（描画順）の入れ替え</li>
-                      <li>腕・獣耳の分離出力（腕揺れ・耳ピコピコ用）</li>
-                      <li>胸の切り出し（揺れ物理用の chest.png 分離）</li>
-                      <li>ブラシによるレイヤーの継ぎ足し・削り（SAM3補助つき）</li>
-                    </ul>
-                    <span>調整画面で「保存して戻る」と自動でSTEP5（差分位置調整）へ進みます。</span>
+                  <div className="workspace-inline-editor base-editor-inline">{renderLayerEditor()}</div>
+                )
+              ) : (
+                <div className="workspace-studio-overview">
+                  <div className="workspace-studio-overview-main copy-only">
+                    <div className="workspace-panel-heading workspace-step-heading">
+                      <span>STEP 4 / 7</span>
+                      <h3>素体のレイヤー構成を調整</h3>
+                      <p>レイヤー順・表示・腕や獣耳の分離・切り出しを、中央の編集領域でまとめて確認します。データは「編集を開始」を押してから読み込みます。</p>
+                      {step4Complete && <button className="btn btn-secondary workspace-wide-action" data-action-tone="edit" disabled={workspaceBusy || workspaceOverviewPreviewLoading} onClick={() => void startInlineBaseEditor()}>再編集する</button>}
+                    </div>
                   </div>
-                )}
-                <div className="workspace-action-row">
-                  <button className="btn btn-primary" disabled={workspaceBusy} onClick={() => void openWorkspaceBaseAdjustment()}>
-                    {workspaceBusy ? "読み込み中..." : workspaceCompositePreview?.basePreview ? "再調整する" : "素体調整を開く"}
-                  </button>
+                  <div className={`workspace-status-card${step4Complete ? " complete" : ""}`}>
+                    <strong>{step4Complete ? "✓ 素体は保存済みです" : "素体編集はまだ完了していません"}</strong>
+                    <span>{step4Complete ? "問題なければ下部の「次へ」で差分位置へ進めます。" : "下部の「編集を開始」から調整し、保存してください。"}</span>
+                  </div>
                 </div>
-              </>
+              )
             )}
 
             {workspaceStep === 5 && (
-              <>
-                <div className="workspace-panel-heading"><span>STEP 5</span><h3>差分位置を調整</h3><p>右のサムネイルか「対象」でパーツを選ぶと、そのパーツの現在の補正値が表示されます。プレビューを直接ドラッグ、矢印ボタン/矢印キー（Shiftで±10）、数値入力のいずれでも動かせ、少し待つと自動で保存されます。</p></div>
-                <div className="workspace-action-row">
-                  <div className="workspace-adjust-grid">
-                    <label><span>対象</span>
-                      <select
-                        value={workspaceAdjustTarget}
-                        onChange={e => {
-                          setWorkspaceAdjustTarget(e.target.value);
-                          // パーツ個別を選んだら即ドラッグで動かせるように自動ON（一括ではOFF）
-                          setWorkspacePartDragMode(e.target.value !== "all");
-                          // 前の対象の値が残らないよう、選んだパーツの実際の現在値を読み込む
-                          loadWorkspacePartAdjustmentFields(e.target.value);
-                        }}
-                      >
-                        <option value="all">全パーツ一括</option>
-                        {WORKSPACE_ADJUST_PART_KEYS.map(part => <option key={part} value={part}>{part}{workspaceAdjustedParts[part] ? " ✓" : ""}</option>)}
-                      </select>
-                    </label>
-                    <label><span>X offset</span>
-                      <span className="workspace-nudge-row">
-                        <button type="button" title="-10" onClick={() => setWorkspacePartOffsetX(v => v - 10)}>≪</button>
-                        <button type="button" title="-1" onClick={() => setWorkspacePartOffsetX(v => v - 1)}>‹</button>
-                        <input type="number" value={workspacePartOffsetX} onChange={e => setWorkspacePartOffsetX(Number(e.target.value))} />
-                        <button type="button" title="+1" onClick={() => setWorkspacePartOffsetX(v => v + 1)}>›</button>
-                        <button type="button" title="+10" onClick={() => setWorkspacePartOffsetX(v => v + 10)}>≫</button>
-                      </span>
-                    </label>
-                    <label><span>Y offset</span>
-                      <span className="workspace-nudge-row">
-                        <button type="button" title="-10" onClick={() => setWorkspacePartOffsetY(v => v - 10)}>≪</button>
-                        <button type="button" title="-1" onClick={() => setWorkspacePartOffsetY(v => v - 1)}>‹</button>
-                        <input type="number" value={workspacePartOffsetY} onChange={e => setWorkspacePartOffsetY(Number(e.target.value))} />
-                        <button type="button" title="+1" onClick={() => setWorkspacePartOffsetY(v => v + 1)}>›</button>
-                        <button type="button" title="+10" onClick={() => setWorkspacePartOffsetY(v => v + 10)}>≫</button>
-                      </span>
-                    </label>
-                    <label><span>Scale {workspacePartScale}%</span>
-                      <span className="workspace-scale-row">
-                        <input type="range" min={50} max={150} value={workspacePartScale} onChange={e => setWorkspacePartScale(Number(e.target.value))} />
-                        <input type="number" min={50} max={150} value={workspacePartScale} onChange={e => setWorkspacePartScale(Number(e.target.value))} />
-                      </span>
-                    </label>
+              workspaceInlineEditor === "position" ? (
+                workspaceEditorPreparing ? (
+                  <div className="workspace-editor-loading" role="status" aria-live="polite">
+                    <span className="step-spinner" aria-hidden="true" />
+                    <strong>表情プレビューを準備しています</strong>
+                    <small>この編集を開いた時だけ、全表情を合成して読み込みます。</small>
                   </div>
-                  <button
-                    className={`btn ${workspacePartDragMode ? "btn-primary" : "btn-secondary"}`}
-                    disabled={workspaceBusy || !workspaceExtractResult || workspaceAdjustTarget === "all"}
-                    title="ON中はプレビューのドラッグで選択パーツを移動（画面パンは無効化）"
-                    onClick={() => setWorkspacePartDragMode(prev => !prev)}
-                  >
-                    パーツ移動 {workspacePartDragMode ? "ON" : "OFF"}
-                  </button>
-                  <button
-                    className="btn btn-secondary"
-                    disabled={workspaceBusy}
-                    title="X/Y/Scaleを 0 / 0 / 100% に戻します（少し待つと自動で適用されます）"
-                    onClick={() => { setWorkspacePartOffsetX(0); setWorkspacePartOffsetY(0); setWorkspacePartScale(100); }}
-                  >0に戻す</button>
-                  <button className="btn btn-secondary" disabled={workspaceBusy || !workspaceExtractResult} onClick={() => void updateWorkspaceCompositePreview()}>合成プレビューを更新</button>
-                  <button className="btn btn-primary" disabled={workspaceBusy || !workspaceExtractResult} title="待たずにすぐ適用します（通常は自動で適用されるため押さなくてもOK）" onClick={() => void applyWorkspacePartAdjustment()}>今すぐ適用</button>
+                ) : (
+                  <div className="workspace-inline-editor position-editor-inline">{renderPartPositionEditor()}</div>
+                )
+              ) : (
+                <div className="workspace-studio-overview">
+                  <div className="workspace-studio-overview-main copy-only">
+                    <div className="workspace-panel-heading workspace-step-heading">
+                      <span>STEP 5 / 7</span>
+                      <h3>差分パーツの位置を確認</h3>
+                      <p>自動整列後の閉じ目と口を確認し、ずれがあるパーツだけ微調整します。全表情の合成は「編集を開始」を押した時だけ行います。</p>
+                      {step5Confirmed && <button className="btn btn-secondary workspace-wide-action" data-action-tone="edit" disabled={workspaceBusy || workspaceOverviewPreviewLoading} onClick={() => void startInlinePositionEditor()}>再編集する</button>}
+                    </div>
+                  </div>
+                  <div className={`workspace-status-card${step5Confirmed ? " complete" : ""}`}>
+                    <strong>{step5Confirmed ? "✓ 差分位置は確認済みです" : "差分位置の確認が必要です"}</strong>
+                    <span>{step5Confirmed ? "問題なければ下部の「次へ」でRIFE補完へ進めます。" : "下部の「編集を開始」から全表情を確認してください。"}</span>
+                  </div>
                 </div>
-                <div className="motion-lab-note">
-                  自動整列が効くので通常は微調整のみでOKです。変更（ドラッグ・矢印・数値入力）は自動で保存されます。補正値はパーツごとに元画像基準の絶対値で保存され（adjustment.json v2）、対象を切り替えるとそのパーツの現在値が表示されます。
-                  base は目・口を乗せない素体（のっぺらぼう）で、eyes-open は素体の目そのもの（他フレームと共通の平常時の目）なので調整対象外です。ズレうるのは閉じ目・口の差分だけです。「パーツ移動」ON中は矢印キーでも±1px（Shiftで±10px）動かせます。
-                </div>
-              </>
+              )
             )}
 
             {workspaceStep === 6 && (
               <>
-                <div className="workspace-panel-heading"><span>STEP 6</span><h3>RIFE補完してSpriTalk用に出力</h3><p>RIFEフレーム、素体、抽出差分を <code>04_spritalk_parts</code> にまとめます。完了すると自動でモーション調整（STEP7）へ進みます。</p></div>
+                <div className="workspace-panel-heading workspace-step-heading"><span>STEP 6 / 7</span><h3>RIFE補完してSpriTalk用に出力</h3><p>RIFEフレーム、素体、抽出差分を <code>04_spritalk_parts</code> にまとめます。完了するとモーション仕上げへ進めます。</p></div>
                 <div className="workspace-rife-panel">
                   <div className="workspace-frame-slider">
                     <label><span>補間枚数</span><strong>{frameCount}枚</strong></label>
                     <input type="range" min={RIFE_FRAME_MIN} max={RIFE_FRAME_MAX} value={frameCount} disabled={workspaceBusy} onChange={e => setFrameCount(Number(e.target.value))} />
                     <small>多いほど口パク・まばたきが滑らかになりますが、ファイル数と生成時間が増えます。SpriTalkでは {RIFE_FRAME_RECOMMENDED} 枚が扱いやすい目安です。</small>
                   </div>
-                  <button className="btn btn-primary" disabled={workspaceBusy || !workspaceExtractResult || !workspaceCompositePreview?.basePreview} onClick={() => void generateWorkspaceRifeOutputs()}>{workspaceBusy ? "RIFE補完中..." : "RIFE補完を開始"}</button>
-                  {!workspaceBusy && workspaceRifeResult && (
-                    <div className="workspace-status-card">
+                  {!step6Current && (
+                    <button
+                      className="btn btn-primary workspace-wide-action"
+                      disabled={workspaceBusy || workspaceOverviewPreviewLoading || !step5Confirmed}
+                      onClick={() => void generateWorkspaceRifeOutputs()}
+                    >
+                      {workspaceBusy ? "RIFE補完中..." : workspaceRifeResult ? "RIFE補完を再実行" : "RIFE補完を開始"}
+                    </button>
+                  )}
+                  {!workspaceBusy && step6Current && workspaceRifeResult && (
+                    <div className="workspace-status-card complete">
                       <strong>✓ RIFE補完は完了しています</strong>
                       <span>出力先: <code>{workspaceRifeResult.outputPath}</code></span>
                       <span>{workspaceRifeResult.directories.length}ディレクトリ / 各{workspaceRifeResult.frameCount}フレーム</span>
-                      <span>「次へ: モーション調整」で揺れ・口パクの仕上げに進めます。枚数を変えて再生成することもできます。</span>
+                      <span>「次へ: モーション仕上げ」で揺れ・口パクの調整へ進めます。枚数を変えて再生成することもできます。</span>
                     </div>
                   )}
                 </div>
               </>
             )}
+            {workspaceStep === 7 && (
+              workspaceInlineEditor === "motion" ? (
+                <div className="workspace-inline-editor motion-editor-inline workspace-motion-tune">
+                  <MotionTunePanel
+                    key={workspaceRifeResult?.outputPath || workspace.spritalkPartsPath}
+                    partsDir={workspaceRifeResult?.outputPath || workspace.spritalkPartsPath}
+                    active
+                    onNotify={handleInlineMotionNotify}
+                    onError={message => {
+                      setError(message);
+                      setMotionEditorDraftSaveBusy(false);
+                      setMotionEditorExportBusy(false);
+                    }}
+                    onDirtyChange={handleInlineMotionDirtyChange}
+                    draftSaveRequestId={motionDraftSaveRequestId}
+                    onDraftSaveStateChange={setMotionEditorDraftSaveBusy}
+                    onDraftSaved={handleInlineMotionDraftSaved}
+                    exportRequestId={motionExportRequestId}
+                    onExportStateChange={handleMotionExportStateChange}
+                    onExported={handleInlineMotionExported}
+                  />
+                </div>
+              ) : (
+                <div className="workspace-studio-overview motion-studio-overview">
+                  <div className="workspace-studio-overview-main copy-only">
+                    <div className="workspace-panel-heading workspace-step-heading">
+                      <span>STEP 7 / 7</span>
+                      <h3>モーションを仕上げる</h3>
+                      <p>揺れ・口パクを調整し、SpriTalk向け画像素材とPachiPakuGen用モーション設定を保存するか、そのままマイク連動のライブ表示で使用します。</p>
+                      <div className="workspace-step7-action-stack">
+                        <button
+                          className="btn btn-secondary workspace-wide-action"
+                          data-action-tone="edit"
+                          disabled={workspaceBusy || workspaceOverviewPreviewLoading || !workspaceRifeResult}
+                          onClick={startInlineMotionEditor}
+                        >
+                          {motionProfileReady ? "再編集する" : "編集を開始"}
+                        </button>
+                        <button
+                          className="btn btn-secondary workspace-wide-action"
+                          data-action-tone="navigate"
+                          disabled={workspaceBusy || workspaceOverviewPreviewLoading || !workspaceRifeResult}
+                          onClick={openLiveDisplayFromWorkspace}
+                        >ライブ表示へ</button>
+                      </div>
+                    </div>
+                  </div>
+                  <div className={`workspace-status-card${motionProfileReady ? " complete" : ""}`}>
+                    <strong>{motionProfileReady ? "✓ 素材とモーション設定を保存しました" : "モーション設定はまだ保存されていません"}</strong>
+                    <span>PachiPakuGen用モーション設定: {motionProfileReady ? "保存済み" : "未保存"}</span>
+                    <span className="workspace-spritalk-handoff-note">
+                      {motionProfileReady
+                        ? "SpriTalkへ基本画像を取り込むときは次のフォルダを使います。モーション設定v2はPachiPakuGenのライブ表示・将来連携用で、現行SpriTalkでは読み込みません。"
+                        : "編集画面で「SpriTalk向けに保存」すると、基本画像とPachiPakuGen用モーション設定を同じフォルダへまとめます。"}
+                    </span>
+                    {motionProfileReady && (
+                      <div className="workspace-spritalk-handoff">
+                        <code title={workspaceRifeResult?.outputPath || workspace.spritalkPartsPath}>
+                          {workspaceRifeResult?.outputPath || workspace.spritalkPartsPath}
+                        </code>
+                        <button
+                          type="button"
+                          className="btn btn-secondary"
+                          data-action-tone="navigate"
+                          onClick={() => openPath(workspaceRifeResult?.outputPath || workspace.spritalkPartsPath).catch(() => {})}
+                        >素材フォルダを開く</button>
+                      </div>
+                    )}
+                    <span>ライブ表示は保存の有無にかかわらず、現在のモーション設定を読み込んで使用できます。</span>
+                  </div>
+                </div>
+              )
+            )}
+            </div>
           </section>
 
-          {workspaceStep >= 5 && workspaceStep <= 6 && (
-            <aside className="workspace-flow-preview">
+          {!workspaceInlineEditor && workspaceStep >= 4 && (
+            <aside className="workspace-hub-preview workspace-flow-preview">
               <div className="preview-card-heading"><span>PREVIEW</span><strong>{mainPreviewLabel}</strong></div>
               <div className="workspace-preview-stage">
                 {mainPreviewImage ? (
@@ -2953,53 +3618,65 @@ function App() {
                       <button className="btn-zoom btn-zoom-reset" type="button" onClick={resetWorkspacePreviewZoom}>リセット</button>
                     </div>
                   </>
-                ) : <span>{workspaceStep >= 5 ? "素体作成後にプレビューできます" : "この工程では画像プレビューはありません"}</span>}
+                ) : (
+                  <div className="workspace-expression-preview-empty">
+                    {workspaceOverviewPreviewLoading ? (
+                      <>
+                        <span className="step-spinner" aria-hidden="true" />
+                        <strong>表情プレビューを読み込んでいます</strong>
+                      </>
+                    ) : step4Complete ? (
+                      <>
+                        <strong>目・口を合成した表情を確認できます</strong>
+                        <button className="btn btn-secondary" data-action-tone="edit" type="button" disabled={workspaceBusy || workspaceEditorPreparing} onClick={() => void loadWorkspaceOverviewPreviews()}>
+                          表情プレビューを読み込む
+                        </button>
+                      </>
+                    ) : (
+                      <strong>素体編集を保存すると表情を確認できます</strong>
+                    )}
+                  </div>
+                )}
               </div>
-              {activePreviewSet?.previews.length ? (
-                <div className="workspace-preview-list">
-                  <button type="button" className={workspaceSelectedPreviewPart === "base" ? "active" : ""} onClick={() => setWorkspaceSelectedPreviewPart("base")}><span>base</span><img src={activePreviewSet.basePreview} alt="base プレビュー" /></button>
-                  {activePreviewSet.previews.map(item => (
-                    <button type="button" key={workspacePreviewItemKey(item)} className={workspaceSelectedPreviewPart === workspacePreviewItemKey(item) ? "active" : ""} onClick={() => {
-                      const key = workspacePreviewItemKey(item);
-                      setWorkspaceSelectedPreviewPart(key);
-                      // Step5ではサムネイル選択＝調整対象の切替＋即ドラッグ可能に。
-                      // 前の対象の値が残らないよう、選んだパーツの実際の現在値を読み込む
-                      if (workspaceStep === 5 && WORKSPACE_ADJUST_PART_KEYS.includes(key)) {
-                        setWorkspaceAdjustTarget(key);
-                        setWorkspacePartDragMode(true);
-                        loadWorkspacePartAdjustmentFields(key);
-                      }
-                    }}>
-                      <span>
-                        {workspacePreviewItemLabel(item)}
-                        {workspaceStep === 5 && workspaceAdjustedParts[workspacePreviewItemKey(item)] && <em className="workspace-adjusted-badge">調整済</em>}
-                      </span>
-                      <img src={item.preview} alt={`${workspacePreviewItemLabel(item)} preview`} />
-                    </button>
-                  ))}
+              {overviewPreviewItems.length > 0 ? (
+                <div className="workspace-preview-list workspace-expression-preview-list" aria-label="表示する表情">
+                  {overviewPreviewItems.map(item => {
+                    const key = workspacePreviewItemKey(item);
+                    const active = selectedOverviewPreview?.part === key;
+                    return (
+                      <button
+                        type="button"
+                        key={key}
+                        className={active ? "active" : ""}
+                        aria-pressed={active}
+                        onClick={() => {
+                          setWorkspaceOverviewPreviewPart(key);
+                          resetWorkspacePreviewZoom();
+                        }}
+                      >
+                        <span>{workspacePreviewItemLabel(item)}</span>
+                        <img src={item.preview} alt="" />
+                      </button>
+                    );
+                  })}
                 </div>
-              ) : null}
+              ) : (
+                <div className="workspace-expression-preview-hint">
+                  {sourcePreviewBeforeBaseSave
+                    ? "保存後は、目・口を合成した8表情から選択できます。"
+                    : "目・口を合成した表情だけを表示します。"}
+                </div>
+              )}
             </aside>
           )}
         </div>
 
-        {workspaceRifeResult && (
-          <div className="workspace-motion-tune" style={workspaceStep === 7 ? undefined : { display: "none" }}>
-            <MotionTunePanel
-              partsDir={workspaceRifeResult.outputPath || workspace.spritalkPartsPath}
-              active={workspaceStep === 7}
-              onNotify={setStatus}
-              onError={setError}
-            />
-          </div>
-        )}
-
-        <div className="workspace-bottom-nav">
-          <button className="btn btn-secondary" onClick={goPreviousWorkspaceStep}>
-            {workspaceStep === 1 ? "制作ホームへ戻る" : `戻る: ${steps[workspaceStep - 2]?.[1] ?? ""}`}
+        <footer className="workspace-hub-footer">
+          <button className="btn btn-secondary" data-action-tone="navigate" data-nav-direction="back" disabled={workspaceBusy || workspaceEditorPreparing || motionEditorDraftSaveBusy || motionEditorExportBusy} onClick={goPreviousWorkspaceStep}>
+            <span className="workspace-nav-icon" aria-hidden="true">←</span>
+            {workspaceInlineEditor ? "編集概要へ戻る" : workspaceStep === 1 ? "制作ホームへ戻る" : `戻る: ${steps[workspaceStep - 2]?.[1] ?? ""}`}
           </button>
-          {/* 戻る/次への間の空きスペースに実行中の進捗を表示（パネル側のスクロールを増やさない） */}
-          <div className="workspace-nav-progress" aria-live="polite">
+          <div className={`workspace-hub-status${error ? " error" : workspaceBusy || workspaceEditorPreparing || motionEditorDraftSaveBusy || motionEditorExportBusy ? " running" : currentStepModel?.status === "complete" ? " complete" : ""}`} aria-live="polite">
             {seeThroughRunning && (
               <>
                 <span>
@@ -3017,23 +3694,19 @@ function App() {
                 <div className="workspace-progress-bar" aria-label="RIFE進捗"><div style={{ width: `${Math.max(3, Math.min(100, (progress.current / Math.max(1, progress.total)) * 100))}%` }} /></div>
               </>
             )}
+            {!seeThroughRunning && !(workspaceBusy && progress.total > 0) && (
+              <span>{motionEditorDraftSaveBusy
+                ? "変更を保存しています..."
+                : motionEditorExportBusy
+                  ? "SpriTalk向け素材を保存しています..."
+                  : phaseStatusLabel}</span>
+            )}
           </div>
           <div className="workspace-next-area">
             {nextStepBlockReason() && <small className="workspace-next-hint">{nextStepBlockReason()}</small>}
-            {workspaceStep >= 7 ? (
-              <button className="btn btn-primary" disabled={workspaceBusy} onClick={() => openPath(workspaceRifeResult?.outputPath || workspace.spritalkPartsPath).catch(() => {})}>出力フォルダを開く</button>
-            ) : (
-              <button
-                className="btn btn-primary"
-                disabled={!canAdvanceWorkspaceStep()}
-                title={nextStepBlockReason() ?? undefined}
-                onClick={goNextWorkspaceStep}
-              >次へ: {nextStepLabel}</button>
-            )}
+            {renderPrimaryAction()}
           </div>
-        </div>
-        <div className="workspace-log-console" aria-live="polite">
-          <details className="workspace-log-history">
+          <details className="workspace-hub-log workspace-log-history" aria-live="polite">
             <summary>
               <span className="workspace-log-title">LOG</span>
               <span className="workspace-log-latest">
@@ -3053,37 +3726,23 @@ function App() {
               ))}
             </div>
           </details>
-        </div>
+        </footer>
       </div>
     );
   }
-  void [
-    hairPreview, hairBackPreview, correctionOutputPath, baseStep, dragTarget,
-    frameCount, setFrameCount, outputPath, completedDiffs, diffPreviewTick, diffPreviewZoom, setDiffPreviewZoom,
-    interpPaths, interpOriginals, interpGenerating, interpStep, mouthMode, mouthMaskSettings, mouthMaskPreviews,
-    mouthMaskPreviewing, mouthPreviewZooms, mouthPreviewPans, activePreviewKey, canGenerate, anyMouthMaskPreviewing,
-    readyPairsForMask, missingMouthMaskCount, allReadyPairsHaveMasks, canOpenInterpStep, goInterpStep, activeMaskPair,
-    activeMaskSlot, activeMaskSetting, activeMaskPreview, activeMaskZoom, activeMaskPan, activeDiffPreview, hasInterpWork,
-    pingPongFrameIndex, pickInterpPsd, pickInterpOriginal, previewMouthMask, updateMouthMaskSetting, refreshMouthMaskPreview,
-    setMouthPreviewZoom, onMouthPreviewPointerDown, onMouthPreviewPointerMove, onMouthPreviewPointerUp,
-    resetMouthPreviewView, handleGenerateAll, openOutputFolder, handleCreateMouthMasks, discardMouthMask, returnFromInterpInput,
-    loadPsd, proceedToHairEdit, openHairEditorWithPreview, proceedToBodyEdit, loadCorrectionPsd,
-    setAllBodyOpacities, returnFromBaseFlow, goBaseStep, baseStepEnabled,
-  ];
-
   function renderModeSelect() {
     return (
       <main className="mode-select-screen">
         <section className="workspace-start-panel">
-          <button className="primary-workflow-card" onClick={() => void startExpressionWorkspace("new")}>
+          <button className="primary-workflow-card" disabled={workspaceBusy} onClick={() => void startExpressionWorkspace("new")}>
             <div className="primary-workflow-copy">
               <span className="workflow-kicker">NEW WORKSPACE</span>
               <strong>はじめから</strong>
-              <p>空のフォルダを作業フォルダとして選び、7つのSTEPを順に進めてSpriTalk用の素材一式を出力します。</p>
+              <p>空のフォルダを作業フォルダとして選び、7つのSTEPでSpriTalk向けの表情・モーション素材を作成します。</p>
             </div>
             <span className="primary-workflow-cta">作業フォルダを選択</span>
           </button>
-          <button className="primary-workflow-card secondary" onClick={() => void startExpressionWorkspace("resume")}>
+          <button className="primary-workflow-card secondary" disabled={workspaceBusy} onClick={() => void startExpressionWorkspace("resume")}>
             <div className="primary-workflow-copy">
               <span className="workflow-kicker">RESUME</span>
               <strong>つづきから</strong>
@@ -3091,26 +3750,15 @@ function App() {
             </div>
             <span className="primary-workflow-cta">作業フォルダを開く</span>
           </button>
+          <button className="primary-workflow-card live-entry" disabled={workspaceBusy} onClick={() => void startLiveDisplayFromMenu()}>
+            <div className="primary-workflow-copy">
+              <span className="workflow-kicker">LIVE DISPLAY</span>
+              <strong>ライブ表示</strong>
+              <p>完成した作業フォルダを読み込み、マイクに反応するキャラクターをOBS向けに表示します。</p>
+            </div>
+            <span className="primary-workflow-cta">作業フォルダを選択</span>
+          </button>
         </section>
-      </main>
-    );
-  }
-
-  function renderSimpleInput(title: string, description: string, action: () => void | Promise<void>) {
-    return (
-      <main className="mode-select-screen base-input-screen">
-        <div className="input-card-center">
-          <h2 className="input-card-title">{title}</h2>
-          <p className="input-hint">{description}</p>
-          <div className="file-input-row-large">
-            <button className="btn btn-primary" onClick={() => void action()} disabled={loading}>PSDを選択</button>
-            <span className="slot-path-inline-large">{loadResult ? `${loadResult.detected_layers.length}レイヤー 読み込み済み` : "未選択"}</span>
-          </div>
-          {loading && <div className="progress-bar indeterminate" style={{ marginTop: 12 }}><div className="fill" /></div>}
-          <div className="step-nav-actions base-input-actions">
-            <button className="btn btn-secondary" onClick={returnToModeSelect}>戻る</button>
-          </div>
-        </div>
       </main>
     );
   }
@@ -3161,7 +3809,7 @@ function App() {
       });
     };
     return (
-      <main className="panel-right base-edit-panel">
+      <div className="panel-right base-edit-panel">
         <div className="preview-and-layers">
           <div
             className="preview-viewport"
@@ -3197,7 +3845,6 @@ function App() {
                   <div className="layer-sidebar-header">レイヤー順序</div>
                   <div className="layer-sidebar-hint">上が手前</div>
                 </div>
-                {mode === "correction" && <button className="btn-layer-add" onClick={() => void addCorrectionLayerImage()} disabled={loading}>PNG追加</button>}
               </div>
               <div className="layer-bulk-section">
                 <small>表示</small>
@@ -3244,10 +3891,10 @@ function App() {
                   )}
                   <button
                     className={`btn-layer-bulk${chestMaskDataUrl ? " active" : ""}`}
-                    title="See-Throughにはchestレイヤーが無いため、bodyから胸部を塗って手動で切り出します（胸揺れ用）"
+                    title="胸部追従の変形範囲をbody上で指定します。未指定でも上半身から自動推定します"
                     onClick={initChestCut}
                   >
-                    胸を切出{chestMaskDataUrl ? "済" : ""}
+                    胸部範囲{chestMaskDataUrl ? "設定済" : ""}
                   </button>
                   {chestMaskDataUrl && (
                     <button className="btn-layer-bulk" onClick={() => setChestMaskDataUrl(null)}>取消</button>
@@ -3280,11 +3927,11 @@ function App() {
               {patchDraftSource && (
                 <div className="layer-adjust-panel patch-panel">
                   <div className="layer-adjust-title">
-                    {patchDraftSource === CHEST_CUT_SENTINEL ? "胸を切出" : `切り出し作成: ${patchDraftSource}`}
+                    {patchDraftSource === CHEST_CUT_SENTINEL ? "胸部の変形範囲" : `切り出し作成: ${patchDraftSource}`}
                   </div>
                   <div className="layer-adjust-values">
                     {patchDraftSource === CHEST_CUT_SENTINEL
-                      ? "bodyのプレビュー上で胸部を塗ってください。保存時に chest.png として分離されます。"
+                      ? "bodyのプレビュー上で、呼吸に合わせてやわらかく変形させる胸部を塗ってください。"
                       : "塗った範囲を別レイヤーとして切り出します。腕から切り出したパーツは腕の動きに追従したまま、一覧の前後関係を保持します。"}
                   </div>
                   <div className="patch-tool-row">
@@ -3301,7 +3948,7 @@ function App() {
                   </label>
                   <div className="patch-tool-row">
                     <button className="btn-nudge btn-nudge-reset" onClick={clearPatchMask}>クリア</button>
-                    <button className="btn-nudge btn-nudge-reset" onClick={() => { setPatchDraftSource(""); setSam3SelectMode(false); }}>取消</button>
+                    <button className="btn-nudge btn-nudge-reset" onClick={() => setPatchDraftSource("")}>取消</button>
                     <button className="btn-nudge btn-nudge-reset" onClick={commitPatchMask}>追加</button>
                   </div>
                 </div>
@@ -3342,73 +3989,191 @@ function App() {
             <button className="btn-zoom btn-zoom-reset" onClick={resetZoom}>リセット</button>
           </div>
         )}
-        <div className="base-flow-controls editing bottom-actions">
-          <div className="interp-action-panel base-flow-action body-action">
-            <div>
-              <div className="action-panel-title">{mode === "correction" ? "See-Through補正" : "素体レイヤー調整"}</div>
-              <div className="action-panel-hint">
-                {mode !== "correction" && expressionWorkspace
-                  ? "レイヤー順、ON/OFF、切り出しを確認して保存します。「保存して戻る」とSTEP5（差分位置調整）へ進みます。"
-                  : "レイヤー順、ON/OFF、切り出し、透明度を確認して保存します。"}
-              </div>
-            </div>
-            <div className="step-nav-actions base-output-actions">
-              <button
-                className="btn btn-secondary"
-                title={expressionWorkspace ? "保存せずにSTEP4へ戻ります" : undefined}
-                onClick={mode !== "correction" && expressionWorkspace ? returnFromBaseFlow : returnToModeSelect}
-              >{mode !== "correction" && expressionWorkspace ? "STEP4へ戻る（保存しない）" : "戻る"}</button>
-              {mode === "correction" ? (
-                <button className="btn btn-primary" onClick={handleExportCorrection} disabled={loading || !bodyPreview}>{loading ? "保存中..." : "PNG保存"}</button>
-              ) : (
-                <button className="btn btn-primary" onClick={handleCreateBase} disabled={loading || !bodyPreview}>{loading ? "出力中..." : "保存して戻る"}</button>
-              )}
-            </div>
-          </div>
-        </div>
-      </main>
+      </div>
     );
   }
 
   function renderMainContent() {
     if (mode === "select") return renderModeSelect();
     if (mode === "workspace") return renderWorkspaceMode();
-    if (mode === "base_input") return renderSimpleInput("素体出力", "See-Throughで分解したPSDを読み込みます。", loadPsd);
-    if (mode === "hair_edit") return renderSimpleInput("Hairレイヤー確認", "この旧画面はワークスペースフローへ統合中です。", proceedToBodyEdit);
-    if (mode === "base_edit") return renderLayerEditor();
-    if (mode === "correction") return mappingPreview ? renderLayerEditor() : renderSimpleInput("See-Through補正", "補正したいPSDを読み込みます。", loadCorrectionPsd);
-    if (mode === "interp") return renderSimpleInput("フレーム補間", "旧補間モードはワークスペースフローへ統合中です。", returnFromInterpInput);
+    if (mode === "live") return (
+      <MotionLiveView
+        partsDir={livePartsDir}
+        onBack={returnFromLiveDisplay}
+        onError={setError}
+        onNotify={setStatus}
+      />
+    );
     return null;
+  }
+
+  function hasPendingPartAdjustment() {
+    return workspacePartAdjustmentDraftsDiffer(
+      workspacePartEditorBaseline.current,
+      workspacePartDraftsRef.current,
+    );
+  }
+
+  async function finishInlinePartEditor() {
+    if (!expressionWorkspace || !workspaceCompositePreview?.basePreview) return;
+    const draftSnapshot = cloneWorkspacePartAdjustmentDrafts(workspacePartDraftsRef.current);
+    const editorChanged = workspacePartAdjustmentDraftsDiffer(
+      workspacePartEditorBaseline.current,
+      draftSnapshot,
+    );
+    const reachedStep = expressionWorkspace.project.currentStep;
+    setError("");
+    setWorkspaceBusy(true);
+    setWorkspacePartSaving(editorChanged);
+    try {
+      if (editorChanged) await persistWorkspacePartDrafts(draftSnapshot);
+      if (editorChanged || workspacePartPersistedDuringEditor.current) {
+        await refreshWorkspaceCompositePreview();
+      }
+      // 完了済み案件を確認しただけならSTEP7と既存RIFEを維持する。
+      // 初回確認または実際に位置を変更した場合だけSTEP6へ戻して再生成を要求する。
+      if (editorChanged || workspacePartPersistedDuringEditor.current || reachedStep < 6) {
+        await setWorkspaceStepAfterEdit(6);
+      } else {
+        setWorkspaceStep(Math.min(Math.max(reachedStep, 6), 7) as WorkspaceStep);
+      }
+      workspacePartEditorBaseline.current = cloneWorkspacePartAdjustmentDrafts(draftSnapshot);
+      workspacePartPersistedDuringEditor.current = false;
+      setWorkspaceInlineEditor(null);
+      setStatus("パーツ編集を完了しました。フレーム生成へ進めます");
+    } catch (cause) {
+      await reloadWorkspaceAfterMutationFailure(expressionWorkspace.workPath);
+      setError(String(cause));
+    } finally {
+      setWorkspacePartSaving(false);
+      setWorkspaceBusy(false);
+    }
+  }
+
+  function workspaceBaseEditorSignature() {
+    const sortedRecord = <T,>(record: Record<string, T>) => Object.fromEntries(
+      Object.entries(record).sort(([left], [right]) => left.localeCompare(right)),
+    );
+    return JSON.stringify({
+      mapping: sortedRecord(layerMapping),
+      order: layerOrder,
+      enabled: sortedRecord(enabledLayers),
+      opacities: sortedRecord(layerOpacities),
+      patches: layerPatches.map(patch => ({
+        id: patch.id,
+        name: patch.name,
+        sourceLayer: patch.sourceLayer,
+        cutSource: patch.cutSource,
+      })),
+      chestMask: chestMaskDataUrl
+        ? `${chestMaskDataUrl.length}:${chestMaskDataUrl.slice(-64)}`
+        : "",
+    });
+  }
+
+  function createWorkspaceBaseEditorSnapshot(): WorkspaceBaseEditorSnapshot {
+    return {
+      signature: workspaceBaseEditorSignature(),
+      layerMapping: { ...layerMapping },
+      bodyPreview,
+      enabledLayers: { ...enabledLayers },
+      layerOrder: [...layerOrder],
+      layerPatches: layerPatches.map(patch => ({ ...patch })),
+      layerOpacities: { ...layerOpacities },
+      chestMaskDataUrl,
+    };
+  }
+
+  function restoreWorkspaceBaseEditorSnapshot(snapshot: WorkspaceBaseEditorSnapshot) {
+    setLayerMapping(snapshot.layerMapping);
+    setBodyPreview(snapshot.bodyPreview);
+    setEnabledLayers(snapshot.enabledLayers);
+    enabledLayersRef.current = snapshot.enabledLayers;
+    setLayerOrder(snapshot.layerOrder);
+    layerOrderRef.current = snapshot.layerOrder;
+    setLayerPatches(snapshot.layerPatches);
+    layerPatchesRef.current = snapshot.layerPatches;
+    setLayerOpacities(snapshot.layerOpacities);
+    layerOpacitiesRef.current = snapshot.layerOpacities;
+    setChestMaskDataUrl(snapshot.chestMaskDataUrl);
+  }
+
+  async function closeInlineEditor() {
+    if (workspaceBusy) return;
+    if (workspaceInlineEditor === "base"
+      && baseEditorBaselineRef.current !== null
+      && baseEditorBaselineRef.current.signature !== workspaceBaseEditorSignature()) {
+      const leave = window.confirm("素体編集の変更はまだ保存されていません。変更を破棄して概要へ戻りますか？");
+      if (!leave) return;
+      restoreWorkspaceBaseEditorSnapshot(baseEditorBaselineRef.current);
+    }
+    if (workspaceInlineEditor === "position") {
+      if (hasPendingPartAdjustment()) {
+        const leave = window.confirm("差分位置の変更はまだ保存されていません。変更を破棄して概要へ戻りますか？");
+        if (!leave) return;
+      }
+      const restoredDrafts = cloneWorkspacePartAdjustmentDrafts(workspacePartEditorBaseline.current);
+      workspacePartDraftsRef.current = restoredDrafts;
+      setWorkspacePartDrafts(restoredDrafts);
+      loadWorkspacePartAdjustmentFields(workspaceAdjustTarget);
+      if (workspacePartPersistedDuringEditor.current) {
+        setWorkspaceBusy(true);
+        try {
+          await refreshWorkspaceCompositePreview();
+          workspacePartPersistedDuringEditor.current = false;
+        } catch (cause) {
+          setError(String(cause));
+          return;
+        } finally {
+          setWorkspaceBusy(false);
+        }
+      }
+    }
+    if (workspaceInlineEditor === "motion" && motionEditorDirty) {
+      const saveAndLeave = window.confirm("変更を保存して編集概要へ戻りますか？");
+      if (!saveAndLeave) return;
+      setError("");
+      setMotionPostSaveDestination("overview");
+      setMotionEditorDraftSaveBusy(true);
+      setStatus("変更を保存しています...");
+      setMotionDraftSaveRequestId(previous => previous + 1);
+      return;
+    }
+    setWorkspaceInlineEditor(null);
+    setMotionEditorDirty(false);
+    setMotionDraftSaveRequestId(0);
+    setMotionEditorDraftSaveBusy(false);
+    setMotionExportRequestId(0);
+    setMotionPostSaveDestination("overview");
+    setMotionEditorExportReady(false);
+    setMotionEditorExportBusy(false);
+    setStatus("");
   }
 
   return (
     <div className={`app theme-${themeMode}`}>
-      <div className="app-header">
-        <h1>PachiPakuGen</h1>
-        <span className="version">v0.3.0</span>
-        <div className="app-header-actions">
-          <button className="btn btn-secondary theme-toggle-button" onClick={() => setThemeMode(prev => prev === "dark" ? "light" : "dark")}>
-            {themeMode === "dark" ? "ライトmode" : "ダークmode"}
-          </button>
-          {mode !== "select" && <button className="btn btn-secondary" onClick={returnToModeSelect}>制作ホーム</button>}
-        </div>
-      </div>
-
-      {(mode === "base_input" || mode === "hair_edit" || mode === "base_edit") && (
-        <div className="interp-header base-flow-header">
-          <h2 className="interp-header-title">{expressionWorkspace ? "Step 4 素体調整" : "素体出力"}</h2>
-          <div className="interp-header-note">分解済みレイヤーを確認し、作業フォルダへ保存します。</div>
-        </div>
-      )}
-
-      {mode === "correction" && (
-        <div className="interp-header base-flow-header">
-          <h2 className="interp-header-title">See-Through補正</h2>
-          <div className="interp-header-note">See-Throughの分解結果を手動で切り出し、PNG保存します。</div>
+      {mode !== "workspace" && (
+        <div className="app-header app-header-minimal">
+          <div className="app-header-actions">
+            <button
+              type="button"
+              className="app-icon-button"
+              title={themeMode === "dark" ? "ライトモードへ切り替え" : "ダークモードへ切り替え"}
+              aria-label={themeMode === "dark" ? "ライトモードへ切り替え" : "ダークモードへ切り替え"}
+              onClick={() => setThemeMode(prev => prev === "dark" ? "light" : "dark")}
+            >
+              <WorkspaceToolbarIcon name={themeMode === "dark" ? "sun" : "moon"} />
+            </button>
+            {mode !== "select" && (
+              <button type="button" className="app-icon-button" title="制作ホームへ戻る" aria-label="制作ホームへ戻る" onClick={returnToModeSelect}>
+                <WorkspaceToolbarIcon name="home" />
+              </button>
+            )}
+          </div>
         </div>
       )}
 
-      <div className={`main-content${mode === "base_input" || mode === "hair_edit" || mode === "base_edit" || mode === "correction" ? " base-main-content" : ""}`}>
+      <div className="main-content">
         {renderMainContent()}
       </div>
 
