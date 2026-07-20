@@ -49,24 +49,24 @@ v0.4.0を「正式リリース済み」と扱う前に、次の項目をすべ�
 
 ## Manual smoke tests
 
-- [ ] 新規Windows環境でNSISインストール、起動、アンインストール
-- [ ] `low-vram`のSee-Through初回セットアップ、モデル取得、分解
-- [ ] `standard`のSee-Through初回セットアップ、モデル取得、分解
-- [ ] STEP 1〜7の新規制作と「つづきから」の再開
-- [ ] STEP 4・5の再編集後にRIFEを再実行
-- [ ] STEP 7の設定保存と再読込
-- [ ] ライブ表示のマイク入力、拡大縮小、ドラッグ、ESC復帰
-- [ ] OBSウィンドウキャプチャと各クロマキー背景
+- [x] 新規Windows環境でNSISインストール、起動、アンインストール
+- [x] `low-vram`のSee-Through初回セットアップ、モデル取得、分解
+- [x] `standard`のSee-Through初回セットアップ、モデル取得、分解
+- [x] STEP 1〜7の新規制作と「つづきから」の再開
+- [x] STEP 4・5の再編集後にRIFEを再実行
+- [x] STEP 7の設定保存と再読込
+- [x] ライブ表示のマイク入力、拡大縮小、ドラッグ、ESC復帰
+- [x] OBSウィンドウキャプチャと各クロマキー背景
 - [x] 既存の`04_spritalk_parts`実データをSpriTalk v1.1.2（`12c519f`）の`LayeredSpriteImporter`へ通し、`LayeredEmotion`検証成功
-- [ ] `spritalk-motion-profile.json` v2がSpriTalk側では未対応であることをUI・READMEと照合
+- [x] `spritalk-motion-profile.json` v2がSpriTalk側では未対応であることをUI・READMEと照合
 - [x] インストーラーへ`sam3.pt`、ユーザー画像、トークン、ログ、一時ファイルが混入していないことを確認
 
 ## Release publication
 
 - [x] READMEから案内するSpriTalk BOOTH商品ページを匿名アクセスで確認
-- [ ] `CHANGELOG.md`の`Unreleased`をリリース日に置換し、比較先を`HEAD`から`v0.4.0`へ固定
+- [x] `CHANGELOG.md`の`Unreleased`をリリース日に置換し、比較先を`HEAD`から`v0.4.0`へ固定
 - [x] NSISインストーラーのSHA-256を計算
   - 最終値はインストーラーと同じ配布ディレクトリの`SHA256SUMS.txt`へ記録する
 - [ ] GitHub Releaseへ変更点、要件、既知の制約、SHA-256を掲載
-- [ ] クリーンなリリースコミットから`v0.4.0`タグを作成
+- [x] クリーンなリリースコミットから`v0.4.0`タグを作成
 - [ ] 公開後にインストーラーを再ダウンロードし、ハッシュと起動を確認

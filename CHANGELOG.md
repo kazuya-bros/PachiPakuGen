@@ -2,7 +2,7 @@
 
 このプロジェクトの主要な変更を記録します。形式は[Keep a Changelog](https://keepachangelog.com/ja/1.1.0/)を参考にし、バージョン番号は[Semantic Versioning](https://semver.org/lang/ja/)に従います。
 
-## [0.4.0] - Unreleased
+## [0.4.0] - 2026-07-21
 
 ### Added
 
@@ -19,6 +19,9 @@
 - 瞬き、口パク、視線、瞳孔、目の潤み、眉、髪、腕、胸、獣耳のモーション調整
 - マイク連動ライブ表示、OBS向けクロマキー背景、拡大縮小・移動・キャプチャ表示
 - Hugging FaceトークンのWindows資格情報への保存
+- STEP 3で獣耳・眼鏡が別レイヤーとして抽出できるかを素早く確認できる「抽出ガチャ」
+- 生成した表情素材の解像度が元絵とずれていても、アスペクト比が近ければ自動フィットする機能
+- STEP 7からループ素材（PNG連番・APNG・AGIF、口パク指定あり/なし）を書き出す機能
 
 ### Changed
 
@@ -30,6 +33,8 @@
 - STEP 4〜7のプレビュー、操作位置、固定下部操作を統一
 - モーション調整を専用の別アプリではなく、中央編集領域とライブ表示へ統合
 - 実行時に適用するSee-Through互換パッチへ、変更元リビジョンと変更目的の通知を埋め込むよう変更
+- PachiPakuGen自身の再開用内部状態（RIFE出力・Motion Lab調整値）を、SpriTalkへ渡すフォルダではなく作業フォルダ直下へ移動
+- SpriTalkへ渡す成果物を`spritalk-motion-profile.json`1本へ統合（従来の`layer-order.json`・`README.txt`はSTEP 7書き出し時にこのファイルへ吸収）
 
 ### Fixed
 
@@ -38,6 +43,7 @@
 - 各工程のファイル更新前に進捗を安全側へ戻し、途中終了後に部分出力を完成品として扱わないよう修正
 - 7枚の表情素材を画像内容の指紋で検査し、手動差し替え後に古い抽出・RIFE結果を再利用しないよう修正
 - 画像更新処理が途中で失敗した場合、ディスク上の進捗を再読込して画面の古い完了状態を即座に無効化
+- STEP 3完了後のワークスペースを開き直すたびにSTEP3へ巻き戻る問題を修正
 
 ### Removed
 
@@ -54,6 +60,7 @@
 
 - Hugging Faceトークンを平文ファイルではなくWindows資格情報へ保存するようにしました。
 - モデル取得と推論を分離し、推論中の暗黙ダウンロードを無効化しました。
+- SpriTalk向け出力JSON（`manifest.json`／`spritalk-motion-profile.json`等）が、ユーザー名を含むローカルの絶対パスを書き出さないよう修正しました。
 
 ## [0.3.0] - 2026-05-21
 
@@ -63,6 +70,6 @@
 
 - 初期公開版。
 
-[0.4.0]: https://github.com/kazuya-bros/PachiPakuGen/compare/v0.3.0...HEAD
+[0.4.0]: https://github.com/kazuya-bros/PachiPakuGen/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/kazuya-bros/PachiPakuGen/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/kazuya-bros/PachiPakuGen/releases/tag/v0.2.0
