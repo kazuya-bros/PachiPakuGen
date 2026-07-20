@@ -19,6 +19,10 @@ src/App.tsx.corrupt-backup-*
 CLAUDE_SANDBOX_TEST.txt
 docs/*.patch
 
+# 設計検討時の履歴資料（現行仕様はREADME/AGENTS.mdへ集約済み）。
+# git履歴には残るが、以後はローカル専用の参考資料としてのみ保持する
+docs/_local-archive/
+
 # Model files (large binaries)
 src-tauri/models/*.onnx
 !src-tauri/models/rife.onnx
