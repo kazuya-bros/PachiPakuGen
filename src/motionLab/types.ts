@@ -356,12 +356,17 @@ export interface SpritalkMotionProfile {
   contentFingerprint: string;
   blink: {
     mode: "keepExisting";
+    /** 頻度倍率。実際の待ち時間 = (intervalMin〜intervalMax秒) ÷ rate。1=既定 */
+    rate: number;
     coordination: {
       strategy: "centerThenRife";
       centerMs: number;
       closeMs: number;
       openMs: number;
       settleMs: number;
+      /** rate適用前の基準まばたき間隔（秒） */
+      intervalMinSeconds: number;
+      intervalMaxSeconds: number;
       suppressGazeDuringRife: boolean;
       suppressHighlightDuringRife: boolean;
       resumeDynamicEyeAfterSettle: boolean;
@@ -412,8 +417,20 @@ export interface SpritalkMotionProfile {
   };
   // v2 additive: 検証済みバネ物理パラメータ（docs/motion-lab-integration.md §1）
   physics: {
+    /** モーション方式。現行の保存値は wave / springRig（旧版の値は読込時に正規化）。 */
+    engineFamily: MotionLabEngineFamily;
     hair: {
       mode: "chain";
+      /** 髪の揺れ方式。waveの場合、layerModeがmeshでも波ワープが優先される（render.ts参照） */
+      engine: "spring" | "wave";
+      /** engine === "wave" の利便フィールド（両フィールドは常に整合） */
+      waveMode: boolean;
+      /** 波揺れの強さ倍率（1=既定。engineがwaveの時だけ意味を持つ） */
+      waveStrength: number;
+      /** 後ろ髪の揺れ倍率（1=従来） */
+      backScale: number;
+      /** 髪の揺れ全般の強さ倍率（1=既定） */
+      motionStrength: number;
       segments: number;
       k: number;
       c: number;
@@ -427,11 +444,35 @@ export interface SpritalkMotionProfile {
       k: number;
       c: number;
       maxAngle: number;
+      /** 左右方向の腕揺れ幅倍率（1=既定） */
+      swayAmp: number;
+      /** 腕の回転軸Y位置（0=不透明bbox上端〜1=下端） */
+      pivotRatio: number;
+      /** 腕を体の後ろに描く */
+      behindBody: boolean;
       coupling: number;
       noise: number;
-      lift: { enabled: boolean; coupling: number; bounce: number; max: number };
+      lift: {
+        enabled: boolean;
+        coupling: number;
+        bounce: number;
+        max: number;
+        /** 肩リフトの強さ倍率（1=既定） */
+        strength: number;
+      };
     };
     chest: { k: number; c: number; max: number };
+    /** 発話ぴょこバウンス（PuruPuru pyoko参考、バネ平滑） */
+    pyoko: {
+      enabled: boolean;
+      /** 振幅（px） */
+      amplitudePx: number;
+    };
+    /** ランダムグランス（852話 auto.rand参考）: 数秒ごとに顔向き・視線がふっと変わる */
+    glance: {
+      enabled: boolean;
+      strength: number;
+    };
     sway: {
       k: number;
       c: number;
@@ -493,6 +534,11 @@ export interface SpritalkMotionProfile {
       response: "idleAndVoice" | "smoothedVoiceLiftAndAsymmetricTilt";
     };
   };
+  /**
+   * v3 additive: エフェクト単位ON/OFFの生値（ソロ確認・個別トグルUIとの1:1対応用）。
+   * physics以下の各enabled/strengthは既にこれを反映済みなので、通常の再生には不要。
+   */
+  effects: Record<MotionLabEffectKey, boolean>;
   // v2 additive: SpriTalk特性連動（設計書§8.6）
   presence: {
     entryBounce: number;
@@ -501,12 +547,20 @@ export interface SpritalkMotionProfile {
   };
   // v2 additive: パララックス係数（設計書§8.3）
   depth: Record<string, number>;
+  /**
+   * v3 additive: 「全体の強さ」スライダーの生値（0.5〜1.5）。
+   * physics以下の各振幅・強さには既に反映済みなので、再生には不要（表示・ログ用）。
+   * motionScale/bounceScaleはSpriTalk側が感情フォルダごとに独自に上書きする値のため、
+   * ここに intensity を書き込むと二重適用になる。混同しないこと。
+   */
+  uiIntensity: number;
   // v2 additive: 感情別倍率（感情フォルダごとのプロファイルで上書き）
   motionScale: number;
   bounceScale: number;
   runtimeRequirements: {
     lipSyncRenderer: "directLayerSwitch" | "smoothedFrameStepper" | "neutralBridgeOpacityBlend";
-    layerRenderer: "existingProceduralAnimator" | "stripWarpExtension";
+    /** waveWarpRenderer: hairEngine===waveの波ワープ描画。mesh layerModeより優先される */
+    layerRenderer: "existingProceduralAnimator" | "stripWarpExtension" | "waveWarpRenderer";
   };
   review: {
     verdict: MotionLabVerdict;

@@ -204,3 +204,87 @@ test("ear effect toggle gates rendering without losing its detailed motion setti
   assert.equal(enabledSettings.earTwitchMode, configured.earTwitchMode);
   assert.equal(enabledSettings.earTwitchScale, configured.earTwitchScale);
 });
+
+test("SpriTalk profile carries every previously preview-only field", () => {
+  const settings = {
+    ...MOTION_LAB_DEFAULT_SETTINGS,
+    hairEngine: "wave",
+    hairWaveStrength: 1.4,
+    hairBackScale: 0.72,
+    hairMotionStrength: 1.2,
+    pyokoBounce: 5,
+    engineFamily: "wave",
+    blinkRate: 2,
+    liftStrength: 1.6,
+    armSwayAmp: 1.3,
+    armPivotRatio: 0.25,
+    armBehindBody: true,
+    glanceStrength: 1.8,
+    intensity: 1.25,
+    effects: { ...MOTION_LAB_DEFAULT_SETTINGS.effects, lift: true, glance: true },
+  };
+  const profile = buildSpritalkMotionProfile(settings, "C:\\workspace\\04_spritalk_parts");
+
+  assert.equal(profile.physics.hair.engine, "wave");
+  assert.equal(profile.physics.hair.waveMode, true);
+  assert.equal(profile.physics.hair.waveStrength, 1.4);
+  assert.equal(profile.physics.hair.backScale, 0.72);
+  assert.equal(profile.physics.hair.motionStrength, 1.2);
+  assert.equal(profile.physics.engineFamily, "wave");
+  assert.equal(profile.physics.pyoko.enabled, true);
+  assert.equal(profile.physics.pyoko.amplitudePx, 5);
+  assert.equal(profile.physics.arm.swayAmp, 1.3);
+  assert.equal(profile.physics.arm.pivotRatio, 0.25);
+  assert.equal(profile.physics.arm.behindBody, true);
+  assert.equal(profile.physics.arm.lift.strength, 1.6);
+  assert.equal(profile.physics.glance.enabled, true);
+  assert.equal(profile.physics.glance.strength, 1.8);
+  assert.equal(profile.blink.rate, 2);
+  assert.equal(profile.uiIntensity, 1.25);
+  assert.deepEqual(profile.effects, settings.effects);
+  // waveエンジン＋髪の揺れONなら、layerModeがmeshでなくても波レンダラーを要求する
+  assert.equal(profile.runtimeRequirements.layerRenderer, "waveWarpRenderer");
+});
+
+test("SpriTalk profile zeroes strength fields when their effect toggle is off", () => {
+  const settings = {
+    ...MOTION_LAB_DEFAULT_SETTINGS,
+    pyokoBounce: 5,
+    liftStrength: 1.6,
+    armSwayAmp: 1.3,
+    glanceStrength: 1.8,
+    hairBackScale: 0.72,
+    hairMotionStrength: 1.2,
+    blinkRate: 2,
+    effects: {
+      ...MOTION_LAB_DEFAULT_SETTINGS.effects,
+      pyoko: false, lift: false, arm: false, glance: false,
+      hairBack: false, hairMotion: false, blink: false,
+    },
+  };
+  const profile = buildSpritalkMotionProfile(settings, "C:\\workspace\\04_spritalk_parts");
+
+  assert.equal(profile.physics.pyoko.enabled, false);
+  assert.equal(profile.physics.pyoko.amplitudePx, 0);
+  assert.equal(profile.physics.arm.lift.strength, 0);
+  assert.equal(profile.physics.arm.swayAmp, 0);
+  assert.equal(profile.physics.glance.enabled, false);
+  assert.equal(profile.physics.glance.strength, 0);
+  assert.equal(profile.physics.hair.backScale, 0);
+  assert.equal(profile.physics.hair.motionStrength, 0);
+  assert.equal(profile.blink.rate, 0);
+});
+
+test("SpriTalk profile keeps mesh layer renderer when hair engine is spring", () => {
+  const meshSpring = buildSpritalkMotionProfile(
+    { ...MOTION_LAB_DEFAULT_SETTINGS, layerMode: "mesh", hairEngine: "spring" },
+    "C:\\workspace\\04_spritalk_parts",
+  );
+  assert.equal(meshSpring.runtimeRequirements.layerRenderer, "stripWarpExtension");
+
+  const simpleSpring = buildSpritalkMotionProfile(
+    { ...MOTION_LAB_DEFAULT_SETTINGS, layerMode: "simple", hairEngine: "spring" },
+    "C:\\workspace\\04_spritalk_parts",
+  );
+  assert.equal(simpleSpring.runtimeRequirements.layerRenderer, "existingProceduralAnimator");
+});

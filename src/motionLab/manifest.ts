@@ -168,7 +168,12 @@ export function buildSpritalkMotionProfile(
     : settings.method === "bridge"
       ? "neutralBridgeOpacityBlend"
       : "smoothedFrameStepper";
-  const layerRenderer = settings.layerMode === "mesh" ? "stripWarpExtension" : "existingProceduralAnimator";
+  // render.tsの実際の優先順位と一致させる: waveエンジンはmesh layerModeより優先される
+  const layerRenderer = settings.hairEngine === "wave" && settings.effects.hairMotion
+    ? "waveWarpRenderer"
+    : settings.layerMode === "mesh"
+      ? "stripWarpExtension"
+      : "existingProceduralAnimator";
   return {
     schema: "spritalk.motionProfile.v2",
     // 素材と同じフォルダに置く自己完結プロファイル。絶対パスを埋め込まず、
@@ -179,12 +184,15 @@ export function buildSpritalkMotionProfile(
     contentFingerprint: buildMotionContentFingerprints(settings).spritalk,
     blink: {
       mode: "keepExisting",
+      rate: settings.effects.blink ? settings.blinkRate : 0,
       coordination: {
         strategy: "centerThenRife",
         centerMs: MOTION_LAB_BLINK_DEFAULTS.centerMs,
         closeMs: MOTION_LAB_BLINK_DEFAULTS.closeMs,
         openMs: MOTION_LAB_BLINK_DEFAULTS.openMs,
         settleMs: MOTION_LAB_BLINK_DEFAULTS.settleMs,
+        intervalMinSeconds: MOTION_LAB_BLINK_DEFAULTS.intervalMin,
+        intervalMaxSeconds: MOTION_LAB_BLINK_DEFAULTS.intervalMax,
         suppressGazeDuringRife: true,
         suppressHighlightDuringRife: true,
         resumeDynamicEyeAfterSettle: true,
@@ -235,8 +243,14 @@ export function buildSpritalkMotionProfile(
     },
     // ===== v2 additive フィールド（docs/motion-lab-integration.md §1） =====
     physics: {
+      engineFamily: settings.engineFamily,
       hair: {
         mode: "chain",
+        engine: settings.hairEngine,
+        waveMode: settings.hairEngine === "wave",
+        waveStrength: settings.hairWaveStrength,
+        backScale: settings.effects.hairBack ? settings.hairBackScale : 0,
+        motionStrength: settings.effects.hairMotion ? settings.hairMotionStrength : 0,
         segments: MOTION_LAB_HAIR_SEGMENTS,
         k: settings.hairK,
         c: settings.hairC,
@@ -249,6 +263,9 @@ export function buildSpritalkMotionProfile(
         k: MOTION_LAB_ARM_DEFAULTS.k,
         c: MOTION_LAB_ARM_DEFAULTS.c,
         maxAngle: settings.armMaxAngle,
+        swayAmp: settings.effects.arm ? settings.armSwayAmp : 0,
+        pivotRatio: settings.armPivotRatio,
+        behindBody: settings.armBehindBody,
         coupling: MOTION_LAB_ARM_DEFAULTS.coupling,
         noise: MOTION_LAB_ARM_DEFAULTS.noise,
         lift: {
@@ -256,12 +273,21 @@ export function buildSpritalkMotionProfile(
           coupling: MOTION_LAB_ARM_DEFAULTS.lift.coupling,
           bounce: MOTION_LAB_ARM_DEFAULTS.lift.bounce,
           max: MOTION_LAB_ARM_DEFAULTS.lift.max,
+          strength: settings.effects.lift ? settings.liftStrength : 0,
         },
       },
       chest: {
         k: MOTION_LAB_CHEST_DEFAULTS.k,
         c: MOTION_LAB_CHEST_DEFAULTS.c,
         max: settings.chestMax,
+      },
+      pyoko: {
+        enabled: settings.effects.pyoko,
+        amplitudePx: settings.effects.pyoko ? settings.pyokoBounce : 0,
+      },
+      glance: {
+        enabled: settings.effects.glance,
+        strength: settings.effects.glance ? settings.glanceStrength : 0,
       },
       sway: {
         k: MOTION_LAB_SWAY_DEFAULTS.k,
@@ -324,8 +350,10 @@ export function buildSpritalkMotionProfile(
         response: "smoothedVoiceLiftAndAsymmetricTilt",
       },
     },
+    effects: { ...settings.effects },
     presence: { ...MOTION_LAB_PRESENCE_DEFAULTS },
     depth: { ...MOTION_LAB_DEPTH_DEFAULTS },
+    uiIntensity: settings.intensity,
     motionScale: 1.0,
     bounceScale: 1.0,
     runtimeRequirements: {
