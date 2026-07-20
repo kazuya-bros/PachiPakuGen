@@ -81,6 +81,8 @@ pub struct WorkspaceGeneratedPartsStatus {
     pub missing_parts: Vec<String>,
     pub stale_parts: Vec<String>,
     pub size_mismatches: Vec<String>,
+    /// 立ち絵とサイズが異なるが、抽出時の自動リサイズで吸収できるため受け入れたパーツ
+    pub auto_fit_parts: Vec<String>,
     pub ready: bool,
     /// STEP3で記録した生成画像の視覚内容と現在の7枚が異なる。
     /// 完了済みワークスペースでは同時にproject.jsonをSTEP3へ戻す。
@@ -330,6 +332,7 @@ fn inspect_workspace_generated_parts_inner(
     let mut missing_parts = Vec::new();
     let mut stale_parts = Vec::new();
     let mut size_mismatches = Vec::new();
+    let mut auto_fit_parts = Vec::new();
     let mut current_fingerprints = BTreeMap::new();
 
     for part in &expected_parts {
@@ -355,12 +358,18 @@ fn inspect_workspace_generated_parts_inner(
             }
             Ok(image) => {
                 current_fingerprints.insert(part.clone(), visual_image_fingerprint(&image));
-                // 同アスペクト比なら抽出時に自動リサイズするため受け入れる
-                let source_aspect = source.width() as f64 / source.height() as f64;
-                let part_aspect = image.width() as f64 / image.height() as f64;
-                if (source_aspect - part_aspect).abs() > 0.01 {
+                // 抽出パイプラインは最終的に立ち絵サイズへ正規化するため、
+                // 縦横比の歪みが許容内なら別解像度でも受け入れる（自動調整として通知）
+                if crate::commands::expression::generated_part_size_is_auto_fittable(
+                    source.width(),
+                    source.height(),
+                    image.width(),
+                    image.height(),
+                ) {
+                    auto_fit_parts.push(part.clone());
+                } else {
                     size_mismatches.push(format!(
-                        "{}.png: {}x{} (expected {}x{} または同アスペクト比)",
+                        "{}.png: {}x{} — 縦横比が立ち絵({}x{})と大きく異なります。近い縦横比で再生成してください",
                         part,
                         image.width(),
                         image.height(),
@@ -404,15 +413,16 @@ fn inspect_workspace_generated_parts_inner(
         missing_parts,
         stale_parts,
         size_mismatches,
+        auto_fit_parts,
         downstream_stale,
     })
 }
 
 fn read_extracted_generated_part_fingerprints(root: &Path) -> Option<BTreeMap<String, String>> {
-    let manifest_path = root
-        .join(SEE_THROUGH_DIR)
-        .join("extracted_parts")
-        .join("manifest.json");
+    // extract_codex_generated_parts_inner（expression.rs）と同じ解決規則を使う。
+    // ここだけ別のパスを組み立てると、書き込み先と食い違って読み取りが常に失敗し、
+    // 完了済みワークスペースの再開が毎回STEP3へ巻き戻ってしまう
+    let manifest_path = crate::commands::expression::extracted_parts_dir(root).join("manifest.json");
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(manifest_path).ok()?).ok()?;
     let fingerprints = manifest.get("generatedPartFingerprints")?.as_object()?;
@@ -1099,9 +1109,7 @@ mod tests {
             "pachipakugen_workspace_legacy_extraction_manifest",
         );
         fs::write(
-            root.join(SEE_THROUGH_DIR)
-                .join("extracted_parts")
-                .join("manifest.json"),
+            crate::commands::expression::extracted_parts_dir(&root).join("manifest.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
                 "formatVersion": 2,
                 "alignment": {}
@@ -1154,7 +1162,9 @@ mod tests {
                 serde_json::json!(visual_image_fingerprint(&image)),
             );
         }
-        let extracted_dir = root.join(SEE_THROUGH_DIR).join("extracted_parts");
+        // 本番の書き込み経路（extracted_parts_dir）と同じ解決結果を使う。
+        // ここを独自パスにすると、実際には検出できないバグをテストが見逃す
+        let extracted_dir = crate::commands::expression::extracted_parts_dir(&root);
         fs::create_dir_all(&extracted_dir).unwrap();
         fs::write(
             extracted_dir.join("manifest.json"),

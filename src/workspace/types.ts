@@ -70,6 +70,15 @@ export interface SeeThroughRunResult {
   /** GPU/ネイティブ推論エラーで自動リトライされた場合、その内容の説明文 */
   oomRetryNote: string | null;
 }
+export interface SeeThroughLayerProbeLayer {
+  name: string;
+  thumbnail: string;
+  opaquePixels: number;
+}
+export interface SeeThroughLayerProbeResult {
+  selectedProfile: string;
+  layers: SeeThroughLayerProbeLayer[];
+}
 export interface WorkspaceProject {
   version: number;
   createdAt: number;
@@ -99,6 +108,8 @@ export interface WorkspaceGeneratedPartsStatus {
   /** 口角設定導入前のバックエンド応答やHMR中の保持状態では未定義。 */
   staleParts?: string[];
   sizeMismatches: string[];
+  /** 立ち絵とサイズが異なるが自動リサイズで吸収するパーツ（旧バックエンド応答では未定義） */
+  autoFitParts?: string[];
   /** 完了後に生成素材の差し替えを検知し、下流工程をSTEP3へ戻した場合にtrue。 */
   downstreamStale: boolean;
   ready: boolean;

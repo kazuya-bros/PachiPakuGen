@@ -2702,6 +2702,32 @@ fn ensure_eyes_open_part(
     Ok(())
 }
 
+/// 生成素材のサイズが立ち絵と異なる場合に、抽出時の自動リサイズで吸収可能か。
+/// 抽出結果は最終的にresize_exactで立ち絵サイズへ正規化されるため、アスペクト比の
+/// 歪みが1.25倍（25%）以内なら受け入れる。それを超える場合（縦横逆など）は
+/// パーツ形状の歪みが大きすぎるためブロックする
+pub(crate) fn generated_part_size_is_auto_fittable(
+    source_width: u32,
+    source_height: u32,
+    part_width: u32,
+    part_height: u32,
+) -> bool {
+    if source_height == 0 || part_height == 0 {
+        return false;
+    }
+    let source_aspect = source_width as f64 / source_height as f64;
+    let part_aspect = part_width as f64 / part_height as f64;
+    if source_aspect <= 0.0 || part_aspect <= 0.0 {
+        return false;
+    }
+    let ratio = if source_aspect > part_aspect {
+        source_aspect / part_aspect
+    } else {
+        part_aspect / source_aspect
+    };
+    ratio <= 1.25
+}
+
 fn inspect_generated_parts(
     job_dir: &Path,
     source_image: &DynamicImage,
@@ -2725,21 +2751,22 @@ fn inspect_generated_parts(
                 path.display()
             ))
         })?;
-        if image.width() != source_image.width() || image.height() != source_image.height() {
-            // 同アスペクト比なら抽出時に自動リサイズするため受け入れる。
-            // アスペクト比が異なる場合のみブロック（リサイズすると歪むため）
-            let source_aspect = source_image.width() as f64 / source_image.height() as f64;
-            let part_aspect = image.width() as f64 / image.height() as f64;
-            if (source_aspect - part_aspect).abs() > 0.01 {
-                size_mismatches.push(format!(
-                    "{}.png: {}x{} (expected {}x{} または同アスペクト比)",
-                    part,
-                    image.width(),
-                    image.height(),
-                    source_image.width(),
-                    source_image.height()
-                ));
-            }
+        if (image.width() != source_image.width() || image.height() != source_image.height())
+            && !generated_part_size_is_auto_fittable(
+                source_image.width(),
+                source_image.height(),
+                image.width(),
+                image.height(),
+            )
+        {
+            size_mismatches.push(format!(
+                "{}.png: {}x{} — 縦横比が立ち絵({}x{})と大きく異なります。近い縦横比で再生成してください",
+                part,
+                image.width(),
+                image.height(),
+                source_image.width(),
+                source_image.height()
+            ));
         }
         present_parts.push(part.clone());
     }
@@ -2802,7 +2829,12 @@ fn job_handoff_path(job_dir: &Path) -> PathBuf {
     job_dir.join("codex_handoff.md")
 }
 
-fn extracted_parts_dir(job_dir: &Path) -> PathBuf {
+/// 抽出済みパーツの実際の保存先。旧式の単体ジョブ（job_dir直下にextracted_partsを持つ）と
+/// 現行のワークスペース構成（job_dirが03_see_through配下へ直接保存）の両方を解決する。
+/// この関数を経由せずにパスを組み立てると、書き込み側と食い違って読み取りが常に失敗する
+/// （実際に発生したバグ: workspace.rsが独自に "03_see_through/extracted_parts/" を
+/// 組み立てていたが、ここが実際に書き込むのは "03_see_through/" 直下だった）
+pub(crate) fn extracted_parts_dir(job_dir: &Path) -> PathBuf {
     let primary = job_dir.join("extracted_parts");
     if primary.is_dir() {
         return primary;
@@ -4158,6 +4190,24 @@ fn composite_inside_mask(
 mod tests {
     use super::*;
     use image::{GrayImage, Luma, Rgba};
+
+    #[test]
+    fn generated_part_auto_fit_accepts_mild_aspect_difference() {
+        // 完全一致は当然OK
+        assert!(generated_part_size_is_auto_fittable(1792, 2392, 1792, 2392));
+        // 同アスペクト別解像度（従来から受け入れ）
+        assert!(generated_part_size_is_auto_fittable(1792, 2392, 896, 1196));
+        // 実例: Nano Banana立ち絵(1792x2392, 0.749) + Codex口差分(1024x1536, 0.667)
+        // → 歪み比1.124で許容内
+        assert!(generated_part_size_is_auto_fittable(1792, 2392, 1024, 1536));
+        // 縦横逆転（歪み比>2）はブロック
+        assert!(!generated_part_size_is_auto_fittable(1792, 2392, 1536, 1024));
+        // 正方形 vs 3:4級（歪み比1.33）もブロック
+        assert!(!generated_part_size_is_auto_fittable(1024, 1024, 768, 1024));
+        // ゼロサイズは安全側で拒否
+        assert!(!generated_part_size_is_auto_fittable(1792, 0, 1024, 1536));
+        assert!(!generated_part_size_is_auto_fittable(1792, 2392, 1024, 0));
+    }
 
     #[test]
     fn resolve_base_draw_order_inserts_missing_groups() {
