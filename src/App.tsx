@@ -24,6 +24,7 @@ import {
   type SeeThroughRuntimeStatus,
   type SeeThroughProgress,
   type SeeThroughRunResult,
+  type SeeThroughLayerProbeResult,
   type ExpressionWorkspaceResult,
   type WorkspaceGeneratedPartsStatus,
   type ExtractCodexGeneratedPartsResult,
@@ -364,6 +365,18 @@ function App() {
   const [seeThroughModelDownloadLaunching, setSeeThroughModelDownloadLaunching] = useState(false);
   const [seeThroughSplitParts, setSeeThroughSplitParts] = useState(true);
   const [seeThroughOptions, setSeeThroughOptions] = useState<SeeThroughOptions>(DEFAULT_SEE_THROUGH_OPTIONS);
+  const [seeThroughLayerProbe, setSeeThroughLayerProbe] = useState<SeeThroughLayerProbeResult | null>(null);
+  const [seeThroughLayerProbeRunning, setSeeThroughLayerProbeRunning] = useState(false);
+  /** 抽出ガチャのサムネイルをクリックした時の拡大表示対象 */
+  const [seeThroughProbeZoom, setSeeThroughProbeZoom] = useState<{ name: string; thumbnail: string } | null>(null);
+  useEffect(() => {
+    if (!seeThroughProbeZoom) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setSeeThroughProbeZoom(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [seeThroughProbeZoom]);
   const [workspacePartOffsetX, setWorkspacePartOffsetX] = useState(0);
   const [workspacePartOffsetY, setWorkspacePartOffsetY] = useState(0);
   const [workspacePartScale, setWorkspacePartScale] = useState(100);
@@ -2274,6 +2287,49 @@ function App() {
     }
   }
 
+  // 立ち絵1枚をLayerDiff（レイヤー分解）だけで処理し、獣耳・眼鏡などSeed依存で
+  // 抽出が不安定なパーツの取れ具合をサムネイルで確認する。深度推定・PSD組立・
+  // 表情素材7枚の分解をすべて省くため、一括分解より大幅に短時間で終わる。
+  // Seedを変えて結果が気に入るまで繰り返す（「ガチャ」）用途を想定
+  async function probeWorkspaceSeeThroughLayers(randomizeSeed: boolean) {
+    if (!expressionWorkspace || !workspaceFiles.source) {
+      setError("立ち絵を先に選択してください");
+      return;
+    }
+    if (!seeThroughRuntime?.ready || seeThroughRuntime.selectedProfile !== seeThroughProfile) {
+      setError(seeThroughRuntime?.message ?? "See-Throughの初回セットアップを先に完了してください");
+      return;
+    }
+    setError("");
+    let options = seeThroughOptions;
+    if (randomizeSeed) {
+      options = { ...seeThroughOptions, seed: Math.floor(Math.random() * 2_147_483_647) };
+      setSeeThroughOptions(options);
+    }
+    setWorkspaceBusy(true);
+    setSeeThroughLayerProbeRunning(true);
+    setSeeThroughProbeZoom(null);
+    try {
+      const result = await invoke<SeeThroughLayerProbeResult>("probe_see_through_layers", {
+        sourcePath: workspaceFiles.source,
+        profile: seeThroughProfileTouched.current ? seeThroughProfile : "auto",
+        options,
+      });
+      setSeeThroughProfile(result.selectedProfile as SeeThroughProfile);
+      seeThroughProfileTouched.current = true;
+      setSeeThroughLayerProbe(result);
+      const interesting = result.layers.filter(layer => /^(ears|earwear|headwear|eyewear)$/.test(layer.name));
+      showToast(interesting.length > 0
+        ? `${interesting.map(layer => layer.name).join("・")} を抽出しました`
+        : "獣耳・眼鏡系レイヤーは抽出されませんでした");
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setWorkspaceBusy(false);
+      setSeeThroughLayerProbeRunning(false);
+    }
+  }
+
   async function persistWorkspacePartDrafts(draftSnapshot: WorkspacePartAdjustmentDrafts) {
     if (!expressionWorkspace || !workspaceExtractResult) {
       throw new Error("差分パーツが読み込まれていません");
@@ -2906,27 +2962,22 @@ function App() {
         );
       }
       if (workspaceStep === 2) {
-        if (!workspaceGeneratedStatus || workspaceCodexRequestDirty) {
-          return <button className="btn btn-primary" disabled={workspaceBusy || !workspaceFiles.source} onClick={() => void prepareWorkspaceCodexRequest()}>{workspaceGeneratedStatus ? "作成ガイドを更新" : "作成ガイドを出力"}</button>;
-        }
-        if (!workspaceGeneratedStatus.ready) {
-          return <button className="btn btn-secondary" data-action-tone="edit" disabled={workspaceBusy} onClick={() => void inspectWorkspaceGeneratedParts()}>配置を再確認</button>;
+        if (!workspaceGeneratedStatus || workspaceCodexRequestDirty || !workspaceGeneratedStatus.ready) {
+          return null;
         }
         return <button className="btn btn-secondary" data-action-tone="navigate" data-nav-direction="forward" disabled={workspaceBusy} onClick={() => setWorkspaceStep(3)}>次へ: 一括分解 <span className="workspace-nav-icon" aria-hidden="true">→</span></button>;
       }
       if (workspaceStep === 3) {
         return step3Complete ? (
           <button className="btn btn-secondary" data-action-tone="navigate" data-nav-direction="forward" disabled={workspaceBusy} onClick={() => setWorkspaceStep(4)}>次へ: パーツ編集 <span className="workspace-nav-icon" aria-hidden="true">→</span></button>
-        ) : (
-          <button className="btn btn-primary" disabled={workspaceBusy || !selectedProfileReady || !workspaceGeneratedStatus?.ready} onClick={() => void runWorkspaceSeeThroughBatch()}>{seeThroughRunning ? "分解処理中..." : "一括分解を開始"}</button>
-        );
+        ) : null;
       }
       if (workspaceStep === 4) {
         if (workspaceInlineEditor === "base") {
           return <button className="btn btn-primary" disabled={loading || workspaceBusy || !bodyPreview} onClick={() => void handleCreateBase()}>{loading ? "保存中..." : "保存して次へ"}</button>;
         }
         if (!step4Complete) {
-          return <button className="btn btn-secondary" data-action-tone="edit" disabled={workspaceBusy || workspaceOverviewPreviewLoading || workspaceEditorPreparing} onClick={() => void startInlineBaseEditor()}>{workspaceEditorPreparing ? "準備中..." : "編集を開始"}</button>;
+          return null;
         }
         return <button className="btn btn-secondary" data-action-tone="navigate" data-nav-direction="forward" disabled={workspaceBusy || workspaceOverviewPreviewLoading} onClick={() => setWorkspaceStep(5)}>次へ: 差分位置 <span className="workspace-nav-icon" aria-hidden="true">→</span></button>;
       }
@@ -2935,7 +2986,7 @@ function App() {
           return <button className="btn btn-primary" disabled={workspaceBusy || workspaceEditorPreparing} onClick={() => void finishInlinePartEditor()}>{workspacePartSaving ? "変更を保存中..." : "編集を完了して次へ"}</button>;
         }
         if (!step5Confirmed) {
-          return <button className="btn btn-secondary" data-action-tone="edit" disabled={workspaceBusy || workspaceOverviewPreviewLoading || workspaceEditorPreparing || !step4Complete} onClick={() => void startInlinePositionEditor()}>{workspaceEditorPreparing ? "準備中..." : "編集を開始"}</button>;
+          return null;
         }
         return <button className="btn btn-secondary" data-action-tone="navigate" data-nav-direction="forward" disabled={workspaceBusy || workspaceOverviewPreviewLoading} onClick={() => setWorkspaceStep(6)}>次へ: フレーム生成 <span className="workspace-nav-icon" aria-hidden="true">→</span></button>;
       }
@@ -3129,10 +3180,10 @@ function App() {
                     <><strong>Codexを使う場合</strong><span><code>01_codex_request</code> をフォルダごと渡せば、指示と保存先をまとめて伝えられます。</span></>
                   )}
                   {workspaceAssetPreparationMethod === "image-ai" && (
-                    <><strong>画像編集AIを使う場合</strong><span>作成ガイドの共通ルールを使い、完成画像を立ち絵と同じ大きさ・指定ファイル名で <code>02_generated_parts</code> に保存してください。</span></>
+                    <><strong>画像編集AIを使う場合</strong><span>作成ガイドの共通ルールを使い、完成画像を指定ファイル名で <code>02_generated_parts</code> に保存してください。立ち絵とサイズが違っても縦横比が近ければ自動で合わせます。</span></>
                   )}
                   {workspaceAssetPreparationMethod === "manual" && (
-                    <><strong>手作業で用意する場合</strong><span>透過は不要です。立ち絵と同じ大きさで、閉じ口・あいうえお・閉じ目の7枚を <code>02_generated_parts</code> に保存してください。</span></>
+                    <><strong>手作業で用意する場合</strong><span>透過は不要です。閉じ口・あいうえお・閉じ目の7枚を <code>02_generated_parts</code> に保存してください。立ち絵とサイズが違っても縦横比が近ければ自動で合わせます。</span></>
                   )}
                 </div>
                 <div className="workspace-mouth-corner-setting">
@@ -3178,6 +3229,11 @@ function App() {
                       <span>1</span>
                       <strong>作成ガイドを出力 {codexPhase === 1 && <em className="workspace-phase-badge">いまここ</em>}{codexPhase > 1 && <em className="workspace-phase-done">✓ 済み</em>}</strong>
                       <p>PachiPakuGenが共通仕様・Codex向け指示・元画像を <code>01_codex_request</code> に書き出します。</p>
+                      {(!workspaceGeneratedStatus || workspaceCodexRequestDirty) && (
+                        <div className="workspace-action-row">
+                          <button className="btn btn-primary" disabled={workspaceBusy || !workspaceFiles.source} onClick={() => void prepareWorkspaceCodexRequest()}>{workspaceGeneratedStatus ? "作成ガイドを更新" : "作成ガイドを出力"}</button>
+                        </div>
+                      )}
                     </div>
                   </section>
                   <section className={`workspace-codex-card${codexPhase === 2 ? " current" : ""}`}>
@@ -3216,12 +3272,18 @@ function App() {
                             const present = workspaceGeneratedStatus.presentParts.includes(part);
                             const stale = workspaceGeneratedStatus.staleParts?.includes(part) ?? false;
                             const mismatch = workspaceGeneratedStatus.sizeMismatches.some(item => item.startsWith(`${part}.png:`));
+                            const autoFit = workspaceGeneratedStatus.autoFitParts?.includes(part) ?? false;
                             return (
-                              <span key={part} className={mismatch ? "mismatch" : stale ? "stale" : present ? "present" : "missing"} title={mismatch ? "サイズが立ち絵と一致していません。立ち絵と同じ縦横サイズで再生成してください" : stale ? "依頼書の設定変更後に再生成してください" : present ? "配置済み" : "未配置"}>
-                                <b>{mismatch ? "⚠" : stale ? "↻" : present ? "✓" : "・"}</b>{part}
+                              <span key={part} className={mismatch ? "mismatch" : stale ? "stale" : present ? "present" : "missing"} title={mismatch ? "縦横比が立ち絵と大きく異なります。立ち絵に近い縦横比で再生成してください" : stale ? "依頼書の設定変更後に再生成してください" : autoFit ? "サイズが立ち絵と異なるため、分解時に自動で立ち絵サイズへ合わせます" : present ? "配置済み" : "未配置"}>
+                                <b>{mismatch ? "⚠" : stale ? "↻" : autoFit ? "⤢" : present ? "✓" : "・"}</b>{part}
                               </span>
                             );
                           })}
+                        </div>
+                      )}
+                      {workspaceGeneratedStatus && !workspaceGeneratedStatus.ready && !workspaceCodexRequestDirty && (
+                        <div className="workspace-action-row">
+                          <button className="btn btn-secondary" data-action-tone="edit" disabled={workspaceBusy} onClick={() => void inspectWorkspaceGeneratedParts()}>配置を再確認</button>
                         </div>
                       )}
                     </div>
@@ -3389,51 +3451,120 @@ function App() {
                       <label title="モデルをブロック単位でCPUメモリへ退避してVRAMを節約します（少し低速）。「自動」はプロファイルの既定動作に任せます。VRAM不足エラーが出る時に有効化"><span>Group offload <i className="workspace-info-mark">?</i></span><select value={seeThroughOptions.groupOffload} disabled={workspaceBusy} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, groupOffload: event.target.value as SeeThroughOptionMode })}><option value="default">自動（推奨）</option><option value="on">有効</option><option value="off">無効</option></select></label>
                       <label title="大型UNetをCPUへ退避する互換設定（低速）。本家のカスタムVAEはGPUに残るため、処理条件によってはピークVRAMが減らないことがあります。有効時はGroup offloadより優先します。通常は自動を推奨します"><span>CPU offload <i className="workspace-info-mark">?</i></span><select value={seeThroughOptions.cpuOffload} disabled={workspaceBusy || seeThroughProfile === "standard"} onChange={(event) => setSeeThroughOptions({ ...seeThroughOptions, cpuOffload: event.target.value as SeeThroughOptionMode })}><option value="default">自動（推奨）</option><option value="on">有効（互換設定）</option><option value="off">無効</option></select></label>
                     </div>
-                    <div className="workspace-option-header">
-                      <span>インストール先（Python環境+選択モデル、省VRAM約14GB / 高VRAM約22GB）</span>
-                    </div>
-                    <div className="workspace-install-location">
-                      <small title={seeThroughInstallLocation?.path} className="workspace-install-location-path">
-                        {seeThroughInstallLocation?.path ?? "取得中..."}
-                        {seeThroughInstallLocation?.isDefault && <em className="workspace-recommend-badge">既定</em>}
-                      </small>
-                      <button className="btn btn-secondary" disabled={workspaceBusy || !!seeThroughRuntime?.modelDownloadBusy} onClick={() => void changeSeeThroughInstallLocation()}>変更...</button>
-                      {seeThroughInstallLocation && !seeThroughInstallLocation.isDefault && (
-                        <button className="btn btn-secondary" disabled={workspaceBusy || !!seeThroughRuntime?.modelDownloadBusy} onClick={() => void resetSeeThroughInstallLocation()}>既定に戻す</button>
-                      )}
-                    </div>
-                    <div className="motion-lab-note">
-                      C:ドライブの空き容量が少ない場合に、大きな空きのあるドライブへ変更できます。変更すると新しい場所でランタイム構築とモデル事前ダウンロードがそれぞれ必要です。別プロファイルへ切り替える場合は、そのモデルを追加取得します。既存のインストール先にあるデータは自動移動されません。
-                    </div>
-                    <div className="workspace-option-header">
-                      <span>HuggingFaceトークン（初回モデルDLで推奨）</span>
-                    </div>
-                    <div className="workspace-install-location">
-                      {hfTokenStatus?.configured ? (
-                        <>
-                          <small className="workspace-install-location-path">設定済み（huggingface.co/settings/tokens で発行したトークン）</small>
-                          <button className="btn btn-secondary" disabled={workspaceBusy} onClick={() => void deleteHfToken()}>削除</button>
-                        </>
-                      ) : (
-                        <>
-                          <input
-                            type="password"
-                            value={hfTokenInput}
-                            disabled={workspaceBusy}
-                            placeholder="hf_ から始まるトークンを貼り付け"
-                            onChange={(event) => setHfTokenInput(event.target.value)}
-                          />
-                          <button className="btn btn-secondary" disabled={workspaceBusy || !hfTokenInput.trim()} onClick={() => void saveHfToken()}>保存</button>
-                        </>
-                      )}
-                    </div>
-                    <div className="motion-lab-note">
-                      匿名取得も可能ですが、HuggingFace側のレート制限で低速になります。モデルDL用コンソールを開く前にhuggingface.co/settings/tokens で無料のreadトークンを発行して貼り付けてください。保存済みトークンはコンソールの環境変数にだけ渡され、コマンド行や画面には表示されません。
-                    </div>
+                    {/* インストール先とHFトークンはモデルセットアップ時の設定。
+                        セットアップ完了後は変更する場面がないため、未セットアップ時のみ表示する */}
+                    {!selectedProfileReady && (
+                      <>
+                        <div className="workspace-option-header">
+                          <span>インストール先（Python環境+選択モデル、省VRAM約14GB / 高VRAM約22GB）</span>
+                        </div>
+                        <div className="workspace-install-location">
+                          <small title={seeThroughInstallLocation?.path} className="workspace-install-location-path">
+                            {seeThroughInstallLocation?.path ?? "取得中..."}
+                            {seeThroughInstallLocation?.isDefault && <em className="workspace-recommend-badge">既定</em>}
+                          </small>
+                          <button className="btn btn-secondary" disabled={workspaceBusy || !!seeThroughRuntime?.modelDownloadBusy} onClick={() => void changeSeeThroughInstallLocation()}>変更...</button>
+                          {seeThroughInstallLocation && !seeThroughInstallLocation.isDefault && (
+                            <button className="btn btn-secondary" disabled={workspaceBusy || !!seeThroughRuntime?.modelDownloadBusy} onClick={() => void resetSeeThroughInstallLocation()}>既定に戻す</button>
+                          )}
+                        </div>
+                        <div className="motion-lab-note">
+                          そのままで良ければ変更不要です。C:ドライブの空き容量が少ない場合に、大きな空きのあるドライブへ変更できます。変更すると新しい場所でランタイム構築とモデル事前ダウンロードがそれぞれ必要です。
+                        </div>
+                        <div className="workspace-option-header">
+                          <span>HuggingFaceトークン（初回モデルDLで推奨・任意）</span>
+                        </div>
+                        <div className="workspace-install-location">
+                          {hfTokenStatus?.configured ? (
+                            <>
+                              <small className="workspace-install-location-path">設定済み（huggingface.co/settings/tokens で発行したトークン）</small>
+                              <button className="btn btn-secondary" disabled={workspaceBusy} onClick={() => void deleteHfToken()}>削除</button>
+                            </>
+                          ) : (
+                            <>
+                              <input
+                                type="password"
+                                value={hfTokenInput}
+                                disabled={workspaceBusy}
+                                placeholder="hf_ から始まるトークンを貼り付け（使わない場合は空のまま）"
+                                onChange={(event) => setHfTokenInput(event.target.value)}
+                              />
+                              <button className="btn btn-secondary" disabled={workspaceBusy || !hfTokenInput.trim()} onClick={() => void saveHfToken()}>保存</button>
+                            </>
+                          )}
+                        </div>
+                        <div className="motion-lab-note">
+                          設定しなくても進めます（スキップ可）。匿名取得はHuggingFace側のレート制限で低速になるため、huggingface.co/settings/tokens で無料のreadトークンを発行して貼り付けると高速になります。保存済みトークンはコンソールの環境変数にだけ渡され、コマンド行や画面には表示されません。
+                        </div>
+                      </>
+                    )}
                   </details>
                   </div>
+                  <div className="workspace-process-card workspace-probe-card">
+                    <div>
+                      <strong>抽出ガチャ（獣耳・眼鏡などの高速確認）</strong>
+                      <p>立ち絵1枚をレイヤー分解だけで処理し（深度推定・PSD組立・表情素材の分解を省略）、獣耳や眼鏡などSeedによって取れたり取れなかったりするパーツの抽出結果をサムネイルで確認します。良い結果が出たら、そのSeedのまま一括分解を開始してください。</p>
+                      {seeThroughLayerProbe && (
+                        <div className="workspace-probe-result">
+                          <small>Seed {seeThroughOptions.seed} で採れたパーツ:</small>
+                          <div className="workspace-probe-grid">
+                            {seeThroughLayerProbe.layers.map(layer => (
+                              <figure
+                                key={layer.name}
+                                className={/^(ears|earwear|headwear|eyewear)$/.test(layer.name) ? "probe-layer-highlight" : ""}
+                                role="button"
+                                tabIndex={0}
+                                title="クリックで拡大表示"
+                                onClick={() => setSeeThroughProbeZoom({ name: layer.name, thumbnail: layer.thumbnail })}
+                                onKeyDown={(event) => {
+                                  if (event.key === "Enter" || event.key === " ") {
+                                    event.preventDefault();
+                                    setSeeThroughProbeZoom({ name: layer.name, thumbnail: layer.thumbnail });
+                                  }
+                                }}
+                              >
+                                <img src={layer.thumbnail} alt={layer.name} loading="lazy" />
+                                <figcaption>{layer.name}</figcaption>
+                              </figure>
+                            ))}
+                          </div>
+                          {!seeThroughLayerProbe.layers.some(layer => /^(ears|earwear|headwear|eyewear)$/.test(layer.name)) && (
+                            <div className="motion-lab-note" role="status">獣耳・眼鏡系のレイヤーは抽出されませんでした。「Seedを変えて確認」で引き直せます。何度も出ない場合は、詳細設定でLayerDiff解像度やstep数を上げると取れやすくなることがあります。</div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                    <div className="workspace-action-row">
+                      <button className="btn btn-secondary" disabled={workspaceBusy || !selectedProfileReady || !workspaceFiles.source} onClick={() => void probeWorkspaceSeeThroughLayers(false)}>
+                        {seeThroughLayerProbeRunning ? "確認中..." : "このSeedで確認"}
+                      </button>
+                      <button className="btn btn-secondary" disabled={workspaceBusy || !selectedProfileReady || !workspaceFiles.source} onClick={() => void probeWorkspaceSeeThroughLayers(true)}>
+                        Seedを変えて確認
+                      </button>
+                    </div>
+                  </div>
+                  {seeThroughProbeZoom && (
+                    <div
+                      className="workspace-probe-zoom-overlay"
+                      role="dialog"
+                      aria-label={`${seeThroughProbeZoom.name} の拡大表示`}
+                      onClick={() => setSeeThroughProbeZoom(null)}
+                    >
+                      <figure onClick={(event) => event.stopPropagation()}>
+                        <img src={seeThroughProbeZoom.thumbnail} alt={seeThroughProbeZoom.name} />
+                        <figcaption>
+                          <strong>{seeThroughProbeZoom.name}</strong>
+                          <button className="btn btn-secondary" onClick={() => setSeeThroughProbeZoom(null)}>閉じる (Esc)</button>
+                        </figcaption>
+                      </figure>
+                    </div>
+                  )}
                   <div className="workspace-start-seethrough">
-                    <div><strong>分解処理を開始</strong><p>立ち絵、閉じ目、閉じ口、あいうえお口の素材をまとめて分解します。</p></div>
+                    <div>
+                      <strong>{step3Complete ? "✓ 一括分解は完了しています" : "分解処理を開始"}</strong>
+                      <p>{step3Complete ? "問題なければ下部の「次へ」でパーツ編集へ進めます。設定を変えて作り直すこともできます。" : "立ち絵、閉じ目、閉じ口、あいうえお口の素材をまとめて分解します。"}</p>
+                    </div>
+                    <button className="btn btn-primary" disabled={workspaceBusy || !selectedProfileReady || !workspaceGeneratedStatus?.ready} onClick={() => void runWorkspaceSeeThroughBatch()}>{seeThroughRunning ? "分解処理中..." : step3Complete ? "一括分解を再実行" : "一括分解を開始"}</button>
                   </div>
                 </div>
               </>
@@ -3457,12 +3588,12 @@ function App() {
                       <span>STEP 4 / 7</span>
                       <h3>素体のレイヤー構成を調整</h3>
                       <p>レイヤー順・表示・腕や獣耳の分離・切り出しを、中央の編集領域でまとめて確認します。データは「編集を開始」を押してから読み込みます。</p>
-                      {step4Complete && <button className="btn btn-secondary workspace-wide-action" data-action-tone="edit" disabled={workspaceBusy || workspaceOverviewPreviewLoading} onClick={() => void startInlineBaseEditor()}>再編集する</button>}
+                      <button className="btn btn-secondary workspace-wide-action" data-action-tone="edit" disabled={workspaceBusy || workspaceOverviewPreviewLoading || workspaceEditorPreparing} onClick={() => void startInlineBaseEditor()}>{workspaceEditorPreparing ? "準備中..." : step4Complete ? "再編集する" : "編集を開始"}</button>
                     </div>
                   </div>
                   <div className={`workspace-status-card${step4Complete ? " complete" : ""}`}>
                     <strong>{step4Complete ? "✓ 素体は保存済みです" : "素体編集はまだ完了していません"}</strong>
-                    <span>{step4Complete ? "問題なければ下部の「次へ」で差分位置へ進めます。" : "下部の「編集を開始」から調整し、保存してください。"}</span>
+                    <span>{step4Complete ? "問題なければ下部の「次へ」で差分位置へ進めます。" : "上部の「編集を開始」から調整し、保存してください。"}</span>
                   </div>
                 </div>
               )
@@ -3486,12 +3617,12 @@ function App() {
                       <span>STEP 5 / 7</span>
                       <h3>差分パーツの位置を確認</h3>
                       <p>自動整列後の閉じ目と口を確認し、ずれがあるパーツだけ微調整します。全表情の合成は「編集を開始」を押した時だけ行います。</p>
-                      {step5Confirmed && <button className="btn btn-secondary workspace-wide-action" data-action-tone="edit" disabled={workspaceBusy || workspaceOverviewPreviewLoading} onClick={() => void startInlinePositionEditor()}>再編集する</button>}
+                      <button className="btn btn-secondary workspace-wide-action" data-action-tone="edit" disabled={workspaceBusy || workspaceOverviewPreviewLoading || workspaceEditorPreparing || !step4Complete} onClick={() => void startInlinePositionEditor()}>{workspaceEditorPreparing ? "準備中..." : step5Confirmed ? "再編集する" : "編集を開始"}</button>
                     </div>
                   </div>
                   <div className={`workspace-status-card${step5Confirmed ? " complete" : ""}`}>
                     <strong>{step5Confirmed ? "✓ 差分位置は確認済みです" : "差分位置の確認が必要です"}</strong>
-                    <span>{step5Confirmed ? "問題なければ下部の「次へ」でRIFE補完へ進めます。" : "下部の「編集を開始」から全表情を確認してください。"}</span>
+                    <span>{step5Confirmed ? "問題なければ下部の「次へ」でRIFE補完へ進めます。" : "上部の「編集を開始」から全表情を確認してください。"}</span>
                   </div>
                 </div>
               )

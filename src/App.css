@@ -1108,6 +1108,118 @@ body {
   opacity: 0.55;
 }
 
+/* 抽出ガチャ（レイヤー分解のみの高速確認）カード。
+   サムネイルグリッドが入るため、横並びカードではなく縦積みにする */
+.workspace-probe-card {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.workspace-probe-card .workspace-action-row {
+  justify-content: flex-start;
+}
+
+.workspace-probe-result {
+  display: grid;
+  gap: 8px;
+}
+
+.workspace-probe-result > small {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.workspace-probe-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.workspace-probe-grid figure {
+  display: grid;
+  gap: 3px;
+  justify-items: center;
+  width: 88px;
+  margin: 0;
+  padding: 5px;
+  border: 1px solid var(--border-color);
+  background: var(--panel-bg);
+}
+
+.workspace-probe-grid figure.probe-layer-highlight {
+  border: 2px solid var(--accent-color);
+  background: rgba(45, 145, 255, 0.10);
+}
+
+.workspace-probe-grid img {
+  width: 76px;
+  height: 76px;
+  object-fit: contain;
+  /* 透過レイヤーの視認用の市松背景 */
+  background:
+    repeating-conic-gradient(rgba(128, 128, 128, 0.18) 0% 25%, transparent 0% 50%)
+    0 0 / 12px 12px;
+}
+
+.workspace-probe-grid figcaption {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.workspace-probe-grid figure {
+  cursor: zoom-in;
+}
+
+.workspace-probe-grid figure:hover {
+  border-color: var(--accent-color);
+}
+
+/* 抽出ガチャのサムネイル拡大表示（クリックで開き、背景クリック/Escで閉じる） */
+.workspace-probe-zoom-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.72);
+  cursor: zoom-out;
+}
+
+.workspace-probe-zoom-overlay figure {
+  display: grid;
+  gap: 10px;
+  justify-items: center;
+  max-width: min(640px, 92vw);
+  margin: 0;
+  padding: 14px;
+  border: 1px solid var(--border-color);
+  background: var(--panel-bg);
+  cursor: default;
+}
+
+.workspace-probe-zoom-overlay img {
+  width: min(560px, 84vw);
+  height: min(560px, 66vh);
+  object-fit: contain;
+  background:
+    repeating-conic-gradient(rgba(128, 128, 128, 0.18) 0% 25%, transparent 0% 50%)
+    0 0 / 16px 16px;
+}
+
+.workspace-probe-zoom-overlay figcaption {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 800;
+}
+
 .workspace-start-seethrough {
   display: grid;
   gap: 12px;

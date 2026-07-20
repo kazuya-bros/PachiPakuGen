@@ -1217,6 +1217,188 @@ pub(crate) fn run_inference(
     )
 }
 
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SeeThroughLayerProbeLayer {
+    pub name: String,
+    pub thumbnail: String,
+    pub opaque_pixels: u32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeeThroughLayerProbeResult {
+    pub selected_profile: String,
+    pub layers: Vec<SeeThroughLayerProbeLayer>,
+}
+
+#[tauri::command]
+pub async fn probe_see_through_layers(
+    app: AppHandle,
+    source_path: String,
+    profile: String,
+    options: Option<SeeThroughOptions>,
+) -> Result<SeeThroughLayerProbeResult, AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        run_layer_probe(&app, &source_path, &profile, options)
+    })
+    .await
+    .map_err(|error| AppError::General(format!("See-Throughレイヤー確認処理に失敗: {error}")))?
+}
+
+/// 立ち絵1枚をLayerDiff段だけで処理し（--layer_probe、深度推定・PSD組立なし）、
+/// 生成された各タグレイヤーのサムネイルを返す。獣耳・眼鏡などSeed依存の
+/// 抽出ガチャを一括分解より大幅に短い時間で回すための確認専用実行
+fn run_layer_probe(
+    app: &AppHandle,
+    source_path: &str,
+    requested_profile: &str,
+    options: Option<SeeThroughOptions>,
+) -> Result<SeeThroughLayerProbeResult, AppError> {
+    let state = app.state::<AppState>();
+    let _runtime_guard = state.see_through_runtime_lock.try_lock().map_err(|_| {
+        AppError::General(
+            "See-Throughのセットアップまたは推論を実行中です。完了後に再実行してください".into(),
+        )
+    })?;
+    if state
+        .see_through_model_download_pid
+        .lock()
+        .unwrap()
+        .is_some()
+    {
+        return Err(AppError::General(
+            "モデル事前ダウンロード中は確認を開始できません。完了後に再実行してください".into(),
+        ));
+    }
+    let source = Path::new(source_path);
+    if !source.is_file() {
+        return Err(AppError::General(format!(
+            "元画像が見つかりません: {}",
+            source.display()
+        )));
+    }
+    let status = runtime_status(app, requested_profile)?;
+    if !status.ready {
+        return Err(AppError::General(status.message));
+    }
+    let root = PathBuf::from(&status.runtime_root);
+    prune_stale_job_dirs(&root);
+    let repo = PathBuf::from(&status.repo_path);
+    let python = PathBuf::from(&status.python_path);
+    let gpu = resolve_gpu(app);
+    let selected_profile = select_profile(requested_profile, gpu.as_ref());
+    apply_runtime_compatibility_patches(&repo, selected_profile != "low-vram")?;
+    // 通常の推論ジョブと同じ expression-<unixミリ秒> 命名にして、間引き処理の
+    // 名前順ソート（新しい順）を壊さない
+    let job = root
+        .join("jobs")
+        .join(format!("expression-{}", unix_timestamp_millis()));
+    let input_dir = job.join("input");
+    let output_dir = job.join("output");
+    fs::create_dir_all(&input_dir)?;
+    fs::create_dir_all(&output_dir)?;
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("png");
+    let managed_source = input_dir.join(format!("source.{extension}"));
+    fs::copy(source, &managed_source)?;
+
+    let script_name = if selected_profile == "low-vram" {
+        "inference_psd_quantized.py"
+    } else {
+        "inference_psd.py"
+    };
+    let script = repo.join("inference/scripts").join(script_name);
+    let mut args = vec![
+        script.to_string_lossy().into_owned(),
+        "--srcp".into(),
+        managed_source.to_string_lossy().into_owned(),
+        "--save_dir".into(),
+        output_dir.to_string_lossy().into_owned(),
+        "--layer_probe".into(),
+    ];
+    append_inference_options(&mut args, &selected_profile, options.as_ref())?;
+    emit_progress(
+        app,
+        "inference",
+        2,
+        &format!("レイヤー分解のみ実行して抽出を確認します ({selected_profile})"),
+    );
+    run_managed_command(
+        app,
+        &python.to_string_lossy(),
+        args,
+        &repo,
+        "inference",
+        gpu.as_ref(),
+        &root.join("huggingface"),
+    )?;
+
+    let saved = output_dir.join("source");
+    let layers = collect_probe_layers(&saved)?;
+    emit_progress(app, "complete", 100, "レイヤー確認が完了しました");
+    Ok(SeeThroughLayerProbeResult {
+        selected_profile,
+        layers,
+    })
+}
+
+/// LayerDiffが保存した各タグPNGから、実内容のあるレイヤーだけをサムネイル化する。
+/// ears/earwear/headwear/eyewear（獣耳・眼鏡系）を先頭に並べる
+fn collect_probe_layers(saved: &Path) -> Result<Vec<SeeThroughLayerProbeLayer>, AppError> {
+    const PRIORITY_TAGS: [&str; 4] = ["ears", "earwear", "headwear", "eyewear"];
+    // アップストリームのhead切り出しと同じ閾値: alpha > 15 を実内容とみなす
+    const ALPHA_THRESHOLD: u8 = 15;
+    let entries = fs::read_dir(saved).map_err(|error| {
+        AppError::General(format!(
+            "レイヤー確認の出力フォルダを読み込めません: {} ({error})",
+            saved.display()
+        ))
+    })?;
+    let mut layers = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("png") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        // src_img / src_head は入力画像の作業コピーでレイヤーではない
+        if stem == "src_img" || stem == "src_head" {
+            continue;
+        }
+        let Ok(image) = image::open(&path) else {
+            continue;
+        };
+        let rgba = image.to_rgba8();
+        let opaque_pixels = rgba
+            .pixels()
+            .filter(|pixel| pixel.0[3] > ALPHA_THRESHOLD)
+            .count() as u32;
+        if opaque_pixels == 0 {
+            continue;
+        }
+        // グリッド表示は76px程度だが、クリックでの拡大プレビューにも使うため512pxで返す
+        let thumb = image.thumbnail(512, 512);
+        layers.push(SeeThroughLayerProbeLayer {
+            name: stem.to_string(),
+            thumbnail: image_utils::image_to_base64_png(&thumb),
+            opaque_pixels,
+        });
+    }
+    layers.sort_by_key(|layer| {
+        let priority = PRIORITY_TAGS
+            .iter()
+            .position(|tag| *tag == layer.name)
+            .unwrap_or(PRIORITY_TAGS.len());
+        (priority, layer.name.clone())
+    });
+    Ok(layers)
+}
+
 /// allow_oom_retry: VRAM不足での自動リトライを1回だけ許可するかどうか。
 /// リトライ呼び出し自身はfalseを渡し、再帰の無限ループを防ぐ
 fn run_inference_with_recovery(
@@ -1950,11 +2132,92 @@ fn apply_runtime_compatibility_patches(
     if require_standard_compatibility {
         apply_bf16_loading_compatibility_patch(repo)?;
         apply_standard_pipeline_cleanup_compatibility_patch(repo)?;
+        // 実行順序が重要: cleanupパッチがmarigold直前へ解放処理を挿入した後に
+        // probe早期終了を差し込むことで、「解放→probe打ち切り」の順になる
+        apply_layer_probe_compatibility_patch(
+            repo,
+            "inference/scripts/inference_psd.py",
+            STANDARD_PROBE_EXIT_ANCHOR,
+            STANDARD_PROBE_EXIT_BLOCK,
+        )?;
     } else {
         apply_quantized_cpu_offload_compatibility_patch(repo)?;
+        apply_layer_probe_compatibility_patch(
+            repo,
+            "inference/scripts/inference_psd_quantized.py",
+            QUANTIZED_PROBE_EXIT_ANCHOR,
+            QUANTIZED_PROBE_EXIT_BLOCK,
+        )?;
     }
     apply_scheduler_source_compatibility_patch(repo)?;
     Ok(())
+}
+
+/// レイヤー分解（LayerDiff）だけを実行して深度推定・PSD組立を省く --layer_probe フラグを
+/// 公式スクリプトへ追加する。獣耳・眼鏡などSeed依存で抽出が不安定なパーツを、
+/// 一括分解の1/2〜1/3程度の時間で確認（ガチャ）できるようにするための互換パッチ
+const PROBE_ARG_ANCHOR: &str = "    parser.add_argument('--save_to_psd', action='store_true')\n";
+const PROBE_ARG_LINE: &str = "    parser.add_argument('--layer_probe', action='store_true', help='PachiPakuGen: stop after the layerdiff stage')\n";
+const STANDARD_PROBE_EXIT_ANCHOR: &str = "        print('running marigold...')";
+const STANDARD_PROBE_EXIT_BLOCK: &str = "        # PachiPakuGen: layer probe stops before the depth stage.\n        if args.layer_probe:\n            print('PachiPakuGen layer probe finished')\n            continue\n";
+const QUANTIZED_PROBE_EXIT_ANCHOR: &str = "    # --- Marigold ---\n";
+const QUANTIZED_PROBE_EXIT_BLOCK: &str = "    # PachiPakuGen: layer probe stops before the depth stage.\n    if args.layer_probe:\n        print('PachiPakuGen layer probe finished')\n        sys.exit(0)\n";
+
+fn apply_layer_probe_compatibility_patch(
+    repo: &Path,
+    script_relative: &str,
+    exit_anchor: &str,
+    exit_block: &str,
+) -> Result<(), AppError> {
+    let path = repo.join(script_relative);
+    let original = fs::read_to_string(&path).map_err(|error| {
+        AppError::General(format!(
+            "See-Throughレイヤー確認設定の読み込みに失敗しました: {} ({error})",
+            path.display()
+        ))
+    })?;
+    let normalized = original.replace("\r\n", "\n");
+    let patched = patch_layer_probe(&normalized, exit_anchor, exit_block)?;
+    if patched != original {
+        fs::write(&path, patched).map_err(|error| {
+            AppError::General(format!(
+                "See-Throughレイヤー確認設定の保存に失敗しました: {} ({error})",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn patch_layer_probe(
+    source: &str,
+    exit_anchor: &str,
+    exit_block: &str,
+) -> Result<String, AppError> {
+    let normalized = source.replace("\r\n", "\n");
+    let arg_count = normalized.matches(PROBE_ARG_LINE).count();
+    let block_count = normalized.matches(exit_block).count();
+    if arg_count == 1 && block_count == 1 {
+        return Ok(normalized);
+    }
+    if arg_count != 0 || block_count != 0 || normalized.contains("--layer_probe") {
+        return Err(AppError::General(
+            "See-Throughレイヤー確認設定が部分適用されています。ランタイムを再セットアップしてください"
+                .into(),
+        ));
+    }
+    if normalized.matches(PROBE_ARG_ANCHOR).count() != 1
+        || normalized.matches(exit_anchor).count() != 1
+    {
+        return Err(AppError::General(
+            "See-Throughへレイヤー確認設定を適用できません。公式スクリプトの構造が変更されています"
+                .into(),
+        ));
+    }
+    let patched = normalized
+        .replacen(PROBE_ARG_ANCHOR, &format!("{PROBE_ARG_ANCHOR}{PROBE_ARG_LINE}"), 1)
+        .replacen(exit_anchor, &format!("{exit_block}\n{exit_anchor}"), 1);
+    Ok(patched)
 }
 
 /// 上流のscheduler fallbackはライセンス表記のない外部モデルrepoを参照する。
@@ -1982,9 +2245,9 @@ fn apply_scheduler_source_compatibility_patch(repo: &Path) -> Result<(), AppErro
 }
 
 fn patch_scheduler_model_source(source: &str) -> Result<String, AppError> {
-    const BEFORE: &str = "        model_id = \"frankjoshua/juggernautXL_version6Rundiffusion\"";
-    const AFTER: &str = "        # PachiPakuGen: use the Apache-2.0 See-Through scheduler already downloaded.\n        model_id = \"layerdifforg/seethroughv0.0.2_layerdiff3d\"";
-    const LOAD_ANCHOR: &str = "scheduler_configs[scheduler_config_name][0].from_pretrained(\n                model_id, subfolder=\"scheduler\",";
+    const BEFORE: &str = "            model_id = \"frankjoshua/juggernautXL_version6Rundiffusion\"";
+    const AFTER: &str = "            # PachiPakuGen: use the Apache-2.0 See-Through scheduler already downloaded.\n            model_id = \"layerdifforg/seethroughv0.0.2_layerdiff3d\"";
+    const LOAD_ANCHOR: &str = "scheduler_configs[scheduler_config_name][0].from_pretrained(\n                    model_id,\n                    subfolder=\"scheduler\",";
 
     let normalized = source.replace("\r\n", "\n");
     let before_count = normalized.matches(BEFORE).count();
@@ -2398,44 +2661,54 @@ fn patch_bf16_loading(source: &str) -> Result<String, AppError> {
     let modification_notice = format!(
         "{MODIFICATION_MARKER}\n# This file was modified from See-Through@{SEE_THROUGH_COMMIT}.\n# Changes add Windows BF16 model-loading compatibility and safe group-offload exclusions.\n"
     );
+    // UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet') はapply_layerdiffと
+    // apply_marigoldの両方で同一の呼び出しが使われており、上流スクリプトに2回登場する。
+    // それ以外は1回のみ登場する前提で件数を検証する。
     let replacements = [
         (
             "TransparentVAE.from_pretrained(pretrained, subfolder='trans_vae')",
             "TransparentVAE.from_pretrained(pretrained, subfolder='trans_vae', torch_dtype=torch.bfloat16)",
+            1,
         ),
         (
             "UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet')",
             "UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet', torch_dtype=torch.bfloat16)",
+            2,
         ),
         (
             "UNetFrameConditionModel.from_pretrained(unet_ckpt)",
             "UNetFrameConditionModel.from_pretrained(unet_ckpt, torch_dtype=torch.bfloat16)",
+            1,
         ),
         (
             "scheduler=None\n        )",
             "scheduler=None, torch_dtype=torch.bfloat16\n        )",
+            1,
         ),
         (
             "MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet)",
             "MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet, torch_dtype=torch.bfloat16)",
+            1,
         ),
         (
             "layerdiff_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)",
             "layerdiff_pipeline.enable_group_offload(\n                'cuda', num_blocks_per_group=1,\n                exclude_modules=['text_encoder', 'text_encoder_2'])",
+            1,
         ),
         (
             "marigold_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)",
             "marigold_pipeline.enable_group_offload(\n                'cuda', num_blocks_per_group=1,\n                exclude_modules=['text_encoder'])",
+            1,
         ),
     ];
     let mut patched = source.to_string();
-    for (before, after) in replacements {
+    for (before, after, expected) in replacements {
         match (
             patched.matches(before).count(),
             patched.matches(after).count(),
         ) {
-            (1, 0) => patched = patched.replacen(before, after, 1),
-            (0, 1) => {}
+            (n, 0) if n == expected => patched = patched.replace(before, after),
+            (0, n) if n == expected => {}
             _ => {
                 return Err(AppError::General(format!(
                     "See-Through互換設定を適用できません。公式スクリプトの構造が変更または部分適用されています: {before}"
@@ -2731,7 +3004,9 @@ for srcp in imglist:
     }
 
     fn quantized_marigold_fixture() -> &'static str {
-        r#"        pipeline.enable_group_offload('cuda', num_blocks_per_group=1)
+        r#"    parser.add_argument('--save_to_psd', action='store_true')
+    # --- Marigold ---
+        pipeline.enable_group_offload('cuda', num_blocks_per_group=1)
         marigold_pipe.enable_group_offload('cuda', num_blocks_per_group=1)
         if args.cpu_offload:
             # VAE + TransparentVAE to bf16; quantized components handled by bnb
@@ -3145,7 +3420,8 @@ scheduler=None
         )
 MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet)
 layerdiff_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)
-marigold_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)";
+marigold_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)
+UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet')";
         let patched = patch_bf16_loading(source).unwrap();
         assert!(patched.contains("torch_dtype=torch.bfloat16"));
         assert!(patched.contains("exclude_modules=['text_encoder', 'text_encoder_2']"));
@@ -3159,11 +3435,36 @@ marigold_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)";
                 .count(),
             1
         );
+        // apply_layerdiffとapply_marigoldの両方が同じUNetFrameConditionModel呼び出しを使うため、
+        // 上流スクリプトには2回登場する。両方にbf16が適用されていることを確認する
+        assert_eq!(
+            patched
+                .matches("UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet', torch_dtype=torch.bfloat16)")
+                .count(),
+            2
+        );
         assert_eq!(patch_bf16_loading(&patched).unwrap(), patched);
 
         let mixed =
             format!("{patched}\nTransparentVAE.from_pretrained(pretrained, subfolder='trans_vae')");
         assert!(patch_bf16_loading(&mixed).is_err());
+    }
+
+    #[test]
+    fn bf16_loading_patch_fails_closed_when_only_one_of_two_unet_calls_is_patched() {
+        let source = "\
+import os
+TransparentVAE.from_pretrained(pretrained, subfolder='trans_vae')
+UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet', torch_dtype=torch.bfloat16)
+UNetFrameConditionModel.from_pretrained(unet_ckpt)
+scheduler=None
+        )
+MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet)
+layerdiff_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)
+marigold_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)
+UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet')";
+        let error = patch_bf16_loading(source).unwrap_err();
+        assert!(error.to_string().contains("部分適用されています"));
     }
 
     #[test]
@@ -3181,7 +3482,8 @@ layerdiff_pipeline.enable_group_offload(
                 exclude_modules=['text_encoder', 'text_encoder_2'])
 marigold_pipeline.enable_group_offload(
                 'cuda', num_blocks_per_group=1,
-                exclude_modules=['text_encoder'])";
+                exclude_modules=['text_encoder'])
+UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet', torch_dtype=torch.bfloat16)";
 
         let patched = patch_bf16_loading(source).unwrap();
         assert!(patched.starts_with("# PachiPakuGen modification notice:\n"));
@@ -3205,7 +3507,8 @@ scheduler=None
         )
 MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet)
 layerdiff_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)
-marigold_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)";
+marigold_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)
+UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet')";
 
         let error = patch_bf16_loading(source).unwrap_err();
         assert!(error.to_string().contains("変更通知を安全に追加できません"));
@@ -3223,7 +3526,8 @@ scheduler=None
         )
 MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet)
 layerdiff_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)
-marigold_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)";
+marigold_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)
+UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet')";
 
         let error = patch_bf16_loading(source).unwrap_err();
         assert!(error.to_string().contains("変更通知を安全に追加できません"));
@@ -3274,6 +3578,73 @@ marigold_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)";
     }
 
     #[test]
+    fn scheduler_model_source_patch_matches_pinned_commit_and_is_idempotent() {
+        let fixture = "            model_id = \"frankjoshua/juggernautXL_version6Rundiffusion\"\n            scheduler_name = \"DPMPP_2M_SDE\"\n            scheduler_config_name = \"zero\"\n            scheduler_configs = schedulers[scheduler_name]\n            scheduler = scheduler_configs[scheduler_config_name][0].from_pretrained(\n                    model_id,\n                    subfolder=\"scheduler\",\n                    **scheduler_configs[scheduler_config_name][1],\n            )\n";
+        let patched = patch_scheduler_model_source(fixture).unwrap();
+        assert!(patched.contains("layerdifforg/seethroughv0.0.2_layerdiff3d"));
+        assert_eq!(patch_scheduler_model_source(&patched).unwrap(), patched);
+    }
+
+    #[test]
+    fn layer_probe_patch_is_idempotent_for_both_scripts() {
+        let standard = "    parser.add_argument('--save_to_psd', action='store_true')\n    parser.add_argument('--tblr_split', action='store_true')\n\n        print('running layerdiff...')\n        apply_layerdiff(srcp)\n\n        print('running marigold...')\n        apply_marigold(srcp)\n";
+        let patched =
+            patch_layer_probe(standard, STANDARD_PROBE_EXIT_ANCHOR, STANDARD_PROBE_EXIT_BLOCK)
+                .unwrap();
+        assert!(patched.contains("--layer_probe"));
+        assert!(patched.contains("continue"));
+        // 早期終了はmarigold実行より前に入る
+        assert!(
+            patched.find("if args.layer_probe:").unwrap()
+                < patched.find("print('running marigold...')").unwrap()
+        );
+        assert_eq!(
+            patch_layer_probe(&patched, STANDARD_PROBE_EXIT_ANCHOR, STANDARD_PROBE_EXIT_BLOCK)
+                .unwrap(),
+            patched
+        );
+
+        let quantized = "    parser.add_argument('--save_to_psd', action='store_true')\n    parser.add_argument('--num_inference_steps', type=int, default=30)\n\n    run_layerdiff(pipeline, srcp, save_dir, seed, num_inference_steps, resolution)\n\n    # --- Marigold ---\n    print('Building Marigold depth pipeline...')\n";
+        let patched =
+            patch_layer_probe(quantized, QUANTIZED_PROBE_EXIT_ANCHOR, QUANTIZED_PROBE_EXIT_BLOCK)
+                .unwrap();
+        assert!(patched.contains("--layer_probe"));
+        assert!(patched.contains("sys.exit(0)"));
+        assert!(
+            patched.find("if args.layer_probe:").unwrap()
+                < patched.find("# --- Marigold ---").unwrap()
+        );
+        assert_eq!(
+            patch_layer_probe(&patched, QUANTIZED_PROBE_EXIT_ANCHOR, QUANTIZED_PROBE_EXIT_BLOCK)
+                .unwrap(),
+            patched
+        );
+    }
+
+    #[test]
+    fn layer_probe_patch_fails_closed_on_upstream_change_or_partial_apply() {
+        // アンカー欠如（公式スクリプト構造の変更）
+        let changed = "print('nothing here')\n";
+        assert!(
+            patch_layer_probe(changed, STANDARD_PROBE_EXIT_ANCHOR, STANDARD_PROBE_EXIT_BLOCK)
+                .is_err()
+        );
+        // argparse行だけ存在する部分適用
+        let partial = "    parser.add_argument('--save_to_psd', action='store_true')\n    parser.add_argument('--layer_probe', action='store_true', help='PachiPakuGen: stop after the layerdiff stage')\n\n        print('running marigold...')\n";
+        let error =
+            patch_layer_probe(partial, STANDARD_PROBE_EXIT_ANCHOR, STANDARD_PROBE_EXIT_BLOCK)
+                .unwrap_err();
+        assert!(error.to_string().contains("部分適用"));
+    }
+
+    #[test]
+    fn scheduler_model_source_patch_fails_closed_on_upstream_change() {
+        let changed = "            model_id = \"someone-else/different-model\"\n";
+        let error = patch_scheduler_model_source(changed).unwrap_err();
+        assert!(error.to_string().contains("公式スクリプトの構造が変更"));
+    }
+
+    #[test]
     fn low_vram_profile_does_not_require_standard_runtime_files() {
         let repo = std::env::temp_dir().join(format!(
             "pachipakugen-missing-standard-runtime-{}",
@@ -3287,7 +3658,7 @@ marigold_pipeline.enable_group_offload('cuda', num_blocks_per_group=1)";
         fs::create_dir_all(layerdiff_module.parent().unwrap()).unwrap();
         fs::write(
             &layerdiff_module,
-            "        model_id = \"frankjoshua/juggernautXL_version6Rundiffusion\"\n            scheduler = scheduler_configs[scheduler_config_name][0].from_pretrained(\n                model_id, subfolder=\"scheduler\",\n        device = self.text_encoder.device\n    ):\n\n        device = self.unet.device\n        dtype = self.unet.dtype\n                    group_index=group_index\n                )[0]\n",
+            "            model_id = \"frankjoshua/juggernautXL_version6Rundiffusion\"\n            scheduler = scheduler_configs[scheduler_config_name][0].from_pretrained(\n                    model_id,\n                    subfolder=\"scheduler\",\n        device = self.text_encoder.device\n    ):\n\n        device = self.unet.device\n        dtype = self.unet.dtype\n                    group_index=group_index\n                )[0]\n",
         )
         .unwrap();
         let marigold_module = repo.join("common/modules/marigold/marigold_depth_pipeline.py");
