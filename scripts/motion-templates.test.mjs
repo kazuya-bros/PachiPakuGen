@@ -18,7 +18,7 @@ const {
   motionLabSettingsReducer,
   toRenderSettings,
 } = await vite.ssrLoadModule("/src/motionLab/useMotionLabSettings.ts");
-const { buildSpritalkMotionProfile } = await vite.ssrLoadModule("/src/motionLab/manifest.ts");
+const { buildSpritalkMotionProfile, buildMotionLabManifest } = await vite.ssrLoadModule("/src/motionLab/manifest.ts");
 
 const templateKeys = Object.values(MOTION_LAB_TEMPLATE_LAYOUT)
   .flatMap(rows => rows.flatMap(row => [row.small, row.large]));
@@ -29,6 +29,14 @@ test("SpriTalk profile keeps the parts directory portable", () => {
     "C:\\temporary\\04_spritalk_parts",
   );
   assert.equal(profile.sourcePartsDir, ".");
+});
+
+test("motion-preview-manifest keeps the parts directory portable (no local path leak)", () => {
+  const manifest = buildMotionLabManifest(
+    MOTION_LAB_DEFAULT_SETTINGS,
+    "C:\\Users\\someone\\Desktop\\新しいフォルダー (13)\\04_spritalk_parts",
+  );
+  assert.equal(manifest.sourcePartsDir, ".");
 });
 
 test("each motion engine exposes two movement styles in small and large sizes", () => {

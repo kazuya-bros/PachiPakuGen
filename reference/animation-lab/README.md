@@ -65,7 +65,7 @@ A4開度エンベロープ（attack/release）はA1〜A3の駆動信号。「矩
 **🎛 移植UI案**: A1＋B3＋腕揺れ採用前提の「キャラクター設定 › アニメーション」UI案を
 動くオーバーレイとして実装（値は比較セルに即時反映）。保存データ構造案
 （AnimationSettingsV2）も現在値から生成・コピーできる。
-仕様: [docs/animation-lab-tech.md](../../docs/animation-lab-tech.md)
+仕様: `docs/_local-archive/animation-lab-tech.md`（開発時のローカル参考資料、非トラッキング）
 
 ### 軸デモ
 

@@ -78,13 +78,16 @@ export function buildMotionContentFingerprints(
  */
 export function buildMotionLabManifest(
   settings: MotionLabSettings,
-  sourceDir: string,
+  _sourceDir: string,
   sequence: MotionLabSequenceDefinition = BUILT_IN_MOTION_SEQUENCE,
 ): MotionLabManifest {
   const contentFingerprints = buildMotionContentFingerprints(settings);
   return {
     schema: "pachipakugen.motionPreview.v1",
-    sourcePartsDir: sourceDir,
+    // 素材と同じフォルダに置く自己完結マニフェスト。spritalk-motion-profile.jsonと同様、
+    // 絶対パス（ユーザー名を含むローカルパス）を埋め込まない。読み戻す処理は無いため
+    // 常に"."で十分（フォルダごと共有・移動しても情報が漏れない）
+    sourcePartsDir: ".",
     createdAt: new Date().toISOString(),
     contentFingerprints,
     methods: {
@@ -241,7 +244,7 @@ export function buildSpritalkMotionProfile(
         rotationAmount: Number((0.007 * preset.hair).toFixed(4)),
       },
     },
-    // ===== v2 additive フィールド（docs/motion-lab-integration.md §1） =====
+    // ===== v2 additive フィールド（docs/_local-archive/motion-lab-integration.md §1） =====
     physics: {
       engineFamily: settings.engineFamily,
       hair: {

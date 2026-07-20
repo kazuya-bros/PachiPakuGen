@@ -28,6 +28,10 @@ src-tauri/models/*.onnx
 !src-tauri/models/rife.onnx
 src-tauri/models/*.pt
 
+# AIコーディングエージェント向けの内部資料（他者に見せる想定なし、ローカル専用）
+/AGENTS.md
+/CLAUDE.md
+
 # IDE
 .vscode/
 .idea/
