@@ -85,6 +85,25 @@ export function motionLabTimelineFromText(text: string): { timeline: MotionLabTi
   timeline.push({ timeMs: t, mouth: "closed", energy: 0 });
   return { timeline, durationMs: t + 600 };
 }
+
+/**
+ * 単一母音の開閉ループ（例: 「あ」パクパク）用タイムライン。1200ms周期で
+ * 閉600ms→該当母音600msを繰り返す。開度はA4エンベロープ（attack/release、
+ * 既定90/160ms）に加えA1 SmoothDamp（既定shapeSmoothing0.65→約98ms）が
+ * 直列に掛かるため、100%へ収束するまで実質300〜400ms必要。各状態を600ms
+ * 保持することで、閉じきる・開ききる時間を十分に確保しつつ静止して見える
+ * ホールドも作る。1200msはループ書き出しの候補周期（7.2/14.4/21.6秒）
+ * 全てを割り切るため、ループ境界で口の位相がずれない。
+ */
+export function motionLabVowelLoopTimeline(vowel: MotionLabMouthKey): { timeline: MotionLabTimelineEvent[]; durationMs: number } {
+  return {
+    timeline: [
+      { timeMs: 0, mouth: "closed", energy: 0 },
+      { timeMs: 600, mouth: vowel, energy: 1 },
+    ],
+    durationMs: 1200,
+  };
+}
 export const MOTION_LAB_PRESET_FACTORS: Record<MotionLabPreset, { breath: number; body: number; hair: number }> = {
   calm: { breath: 0.65, body: 0.55, hair: 0.55 },
   normal: { breath: 1, body: 1, hair: 1 },
@@ -218,7 +237,7 @@ export const MOTION_LAB_TEMPLATE_LAYOUT: Record<
   ],
 };
 
-// ===== 検証済み物理パラメータ既定値（docs/animation-lab-tech.md §3.4/§4.5/§8.5） =====
+// ===== 検証済み物理パラメータ既定値（docs/_local-archive/animation-lab-tech.md §3.4/§4.5/§8.5） =====
 export const MOTION_LAB_HAIR_SEGMENTS = 6;
 export const MOTION_LAB_HAIR_DEFAULTS = { k: 70, c: 7, wind: 0.012, drive: 0.03 };
 export const MOTION_LAB_ARM_DEFAULTS = {

@@ -19,6 +19,9 @@ PachiPakuGen v0.4.0は、表情差分の準備、[See-Through](https://github.co
 - RIFEで口パク・まばたき用の中間フレームを一括生成
 - 揺れ、口パク、瞬き、視線、瞳、眉、髪、腕、胸、獣耳などをSTEP 7で調整
 - マイク入力に反応するライブ表示とOBS向けクロマキー表示を追加
+- STEP 3に、立ち絵1枚だけをレイヤー分解して獣耳・眼鏡などの抽出結果を高速確認できる「抽出ガチャ」を追加
+- 表情素材が立ち絵と別解像度でも、縦横比が近ければ自動調整して受け付けるよう変更
+- STEP 7で、つなぎ目のないループアニメ素材（PNG連番／APNG／AGIF）を書き出し可能に
 - v0.4.0の7STEP制作フローではSAM3を使用せず、`sam3.pt`のダウンロードも不要
 
 ## 主な機能
@@ -50,6 +53,10 @@ PachiPakuGenはSee-Throughのソースコードや大型モデルをインスト
 
 初回セットアップとモデル取得は、ユーザーがボタンを押したときだけ開始します。推論中は事前取得済みモデルを使い、予期しないバックグラウンドダウンロードを行いません。
 
+### 抽出ガチャで獣耳・眼鏡の取れ具合を確認する
+
+獣耳や眼鏡は、Seedや解像度によってレイヤーとして抽出できたりできなかったりします。STEP 3の「抽出ガチャ」は、立ち絵1枚だけを深度推定・PSD組立を省いたレイヤー分解のみで処理し、抽出された各パーツをサムネイルで確認できる機能です。表情素材7枚を含む一括分解より大幅に短い時間で、Seedや詳細設定を変えながら納得のいく分解結果を探せます。気に入ったSeedのまま一括分解を開始すれば、その結果がそのまま使われます。
+
 ### SpriTalk向け素材を出力する
 
 RIFE補完後の画像とモーション設定は、作業フォルダ内の `04_spritalk_parts` に集約されます。SpriTalkへ渡すときは、作業フォルダ全体ではなく、このフォルダを選びます。
@@ -68,6 +75,16 @@ RIFE補完後の画像とモーション設定は、作業フォルダ内の `04
 - 表示倍率の変更、ドラッグ移動、マウスホイール拡大縮小
 - グリーン、ブルー、マゼンタ、ダークのOBS向け背景
 - OBSのウィンドウキャプチャとクロマキーで利用できるキャプチャ表示
+
+### ループアニメ素材を書き出す
+
+STEP 7の調整内容のまま、つなぎ目なく繰り返せる透過アニメ素材を書き出せます。呼吸・体揺れ・髪の物理演算・まばたき・獣耳ピコピコなどの駆動を書き出し時間ぴったりの周期へそろえ、数周分ウォームアップしてから記録することで、動画編集ソフトやOBSでのループ再生に使えるシームレスな素材になります。
+
+- ループ長（7.2 / 14.4 / 21.6秒）と、口の形（口パクなし、または「あ」〜「お」いずれか1つの開閉ループ）を選択
+- 出力形式は次の3つから必要な分だけ選択
+  - **PNG連番**: 最高画質。手元にffmpegがあれば案内するコマンドで透過付きWebMへ変換可能
+  - **APNG**: 単一ファイルで透過ループを再生（対応ビューアが必要。ブラウザでの再生を推奨）
+  - **AGIF**: 256色パレット・二値透過という制約はあるものの、最も軽量で対応ビューアが広い
 
 ## 動作要件
 
@@ -115,6 +132,8 @@ Hugging Faceのモデルは匿名でも取得できますが、レート制限�
 ```text
 <作業フォルダ>/
 ├─ project.json                 # 進捗と入力情報
+├─ manifest.json                # PachiPakuGen自身の再開用内部状態（STEP6生成）
+├─ motion-preview-manifest.json # PachiPakuGen自身の再開用内部状態（STEP7保存時に生成）
 ├─ 01_codex_request/            # 表情素材の作成ガイドと元画像
 ├─ 02_generated_parts/          # 用意した7枚の表情素材
 ├─ 03_see_through/              # See-ThroughのPSD・中間成果物
@@ -122,10 +141,16 @@ Hugging Faceのモデルは匿名でも取得できますが、レート制限�
    ├─ body.png / hair.png / ...
    ├─ eye/                      # まばたき用RIFEフレーム列
    ├─ mouth_a/ ... mouth_o/     # 口閉じから各母音へ補完したRIFEフレーム列
-   ├─ layer-order.json
-   ├─ spritalk-motion-profile.json  # STEP 7で保存した場合に生成
-   └─ motion-preview-manifest.json  # STEP 7で保存した場合に生成
+   ├─ layer-order.json          # STEP 7で書き出すとspritalk-motion-profile.jsonへ統合され消える
+   ├─ README.txt                # 同上（書き出し前のみ存在）
+   ├─ spritalk-motion-profile.json  # STEP 7で書き出した場合に生成。layerOrder/readmeを含む
+   └─ loop_export/                 # STEP 7でループ素材を書き出した場合に生成
+      ├─ frames/                   # PNG連番（「PNG連番」を選んだ場合のみ残る）
+      ├─ loop.png                  # APNG（「APNG」を選んだ場合）
+      └─ loop.gif                  # AGIF（「AGIF」を選んだ場合）
 ```
+
+`manifest.json`・`motion-preview-manifest.json`はPachiPakuGen自身が再開・再編集のために使う内部状態で、SpriTalkは読みません。STEP 7で「SpriTalk向けに保存」を実行すると、`04_spritalk_parts`内の`layer-order.json`と`README.txt`は`spritalk-motion-profile.json`へ統合されて削除され、SpriTalkへ渡すフォルダの成果物ファイルは`spritalk-motion-profile.json`1本（＋画像・フレーム列）になります。
 
 ファイルを個別に移動すると再編集や再開ができなくなる場合があります。制作中は作業フォルダをまとめて保持し、SpriTalkへの取り込み時だけ `04_spritalk_parts` を指定してください。
 
@@ -200,5 +225,5 @@ See-ThroughはApache License 2.0で公開されている公式実装を取得し
 
 - [変更履歴](CHANGELOG.md)
 - [第三者ソフトウェア・モデルの通知](THIRD_PARTY_NOTICES.md)
-- [SpriTalk向けモーション仕様](docs/motion-lab-integration.md)
-- [SpriTalk側の実装ハンドオフ](docs/handoff-spritalk.md)
+
+SpriTalk向けのモーション仕様・実装ハンドオフ資料は設計検討時の内部資料のため、`docs/_local-archive/`（非トラッキング）にのみ保管しています。

@@ -9,7 +9,10 @@ import {
   detectHairStrands,
   envelopeStep,
   noise1d,
+  noise1dLoop,
   smoothDamp,
+  snapAngularRateToPeriod,
+  snapCyclesToPeriod,
   springStep,
   stepHairStrandSpring,
   stepChain,
@@ -673,6 +676,8 @@ export function drawMotionLabWaveWarp(
     spatialFreq?: number;
     /** 時間倍率: 1=既定、小さいほどゆっくり */
     tempo?: number;
+    /** ループ書き出し用: 各波成分の周波数をこの周期（秒）の整数分の一へ量子化する */
+    loopPeriodSeconds?: number;
   },
 ) {
   const TAU = Math.PI * 2;
@@ -680,7 +685,14 @@ export function drawMotionLabWaveWarp(
   const pivotY = height * 0.58;
   const stripCount = options.stripCount ?? 24;
   const sf = options.spatialFreq ?? 1;
-  const beat = (options.timeMs / 1000) * (160 / 60) * (options.tempo ?? 1); // PuruPuruと同じBPM160基準
+  const seconds = options.timeMs / 1000;
+  // PuruPuruと同じBPM160基準。ループモードでは成分ごとの実周波数（cycles/s）を量子化する
+  const beatPerSecond = (160 / 60) * (options.tempo ?? 1);
+  const loopT = options.loopPeriodSeconds ?? 0;
+  const componentPhase = (rate: number) => {
+    const cyclesPerSecond = beatPerSecond * rate;
+    return seconds * (loopT > 0 ? snapCyclesToPeriod(cyclesPerSecond, loopT) : cyclesPerSecond);
+  };
   const px = (width / 1024) * options.strength;
   const voiceBoost = 1 + options.voice * 0.42;
   ctx.save();
@@ -696,10 +708,10 @@ export function drawMotionLabWaveWarp(
     const u = clamp((centerYRatio - options.rootYRatio) / Math.max(0.001, 1 - options.rootYRatio), 0, 1);
     // 根元固定マスク（maskFromY相当）: 根元0→毛先1へ滑らかに立ち上げ
     const mask = clamp(u * 1.25, 0, 1) * u;
-    const idleDrift = Math.sin(TAU * (beat * 0.42 + u * 0.82 * sf + options.seed));
-    const wave = Math.sin(TAU * (beat * 0.72 + u * 1.55 * sf + 0.16 + options.seed * 0.7));
-    const slow = Math.sin(TAU * (beat * 0.5 - 0.255 + options.seed * 0.3));
-    const idleFloat = Math.cos(TAU * (beat * 0.36 + u * 0.38 * sf + options.seed));
+    const idleDrift = Math.sin(TAU * (componentPhase(0.42) + u * 0.82 * sf + options.seed));
+    const wave = Math.sin(TAU * (componentPhase(0.72) + u * 1.55 * sf + 0.16 + options.seed * 0.7));
+    const slow = Math.sin(TAU * (componentPhase(0.5) - 0.255 + options.seed * 0.3));
+    const idleFloat = Math.cos(TAU * (componentPhase(0.36) + u * 0.38 * sf + options.seed));
     const dx = mask * px * voiceBoost * (5.2 * idleDrift + 2.8 * wave + 3.4 * options.voice * slow);
     const dy = mask * px * (1.5 * idleFloat);
     ctx.drawImage(
@@ -1031,6 +1043,16 @@ export function drawMotionLabScene(
   settings: MotionLabRenderSettings,
 ) {
   const random = settings.random ?? Math.random;
+  // ===== ループ書き出しモードの導出値 =====
+  // 全駆動を loopSeconds の整数分の一周期へ量子化する。減衰バネはウォームアップで
+  // 周期軌道へ収束するため、通常再生では決して戻らない「初期状態との一致」を
+  // 待つ必要がなく、収束後の任意の1周期がそのままシームレスなループになる。
+  const loopSeconds = settings.loopPeriodMs && settings.loopPeriodMs > 0
+    ? settings.loopPeriodMs / 1000
+    : 0;
+  const loopMsNow = loopSeconds > 0
+    ? ((elapsedMs % settings.loopPeriodMs!) + settings.loopPeriodMs!) % settings.loopPeriodMs!
+    : 0;
   const liveInput = settings.liveInput?.() ?? null;
   const timelineTarget = motionLabTimelineAt(elapsedMs, settings.timeline, settings.timelineDurationMs);
   const target = liveInput
@@ -1053,6 +1075,20 @@ export function drawMotionLabScene(
   const speaking = target.mouth !== "closed";
   const speechStarted = speaking && !ph.speaking;
   ph.speaking = speaking;
+  // ループモード: まばたきを乱数タイマーではなくループ位相の固定マークで発火させる。
+  // マークはシーム（ループ境界）を跨がない位置に置き、毎周同一のため境界では常にidle。
+  // blinkWaitをidle中に毎フレーム上書きするだけで、blinkState本体は変更不要
+  if (loopSeconds > 0 && ph.blinkPhase === "idle") {
+    const blinkCount = Math.max(1, Math.round((loopSeconds * settings.blinkRate) / 6));
+    const periodPerBlinkMs = settings.loopPeriodMs! / blinkCount;
+    // 各区間の35%位置で開始（シーケンス全長≈550msが区間内に収まる）
+    const markOffsetMs = periodPerBlinkMs * 0.35;
+    const posInSegment = loopMsNow % periodPerBlinkMs;
+    const untilMark = posInSegment <= markOffsetMs
+      ? markOffsetMs - posInSegment
+      : periodPerBlinkMs - posInSegment + markOffsetMs;
+    ph.blinkWait = untilMark / 1000;
+  }
   const blinkFrame = stepMotionLabBlink(
     ph,
     dt,
@@ -1113,8 +1149,14 @@ export function drawMotionLabScene(
     hairBackTransform = bodyTransform;
   } else {
     // B0移植: 位相積分の呼吸・アイドル揺れ＋rootX/Y速度計測（B1/B3/腕/胸の駆動源）
-    ph.breathPhase += dt * ((Math.PI * 2) / 3.6);
-    ph.swayPhase += dt * 1.35;
+    // ループモードでは両レートを書き出し周期の整数分の一へ量子化する
+    // （推奨ループ長は3.6秒の倍数なので呼吸は無変化、体揺れのみ数%変わる）
+    const breathRate = loopSeconds > 0
+      ? snapAngularRateToPeriod((Math.PI * 2) / 3.6, loopSeconds)
+      : (Math.PI * 2) / 3.6;
+    const swayRate = loopSeconds > 0 ? snapAngularRateToPeriod(1.35, loopSeconds) : 1.35;
+    ph.breathPhase += dt * breathRate;
+    ph.swayPhase += dt * swayRate;
     if (ph.breathPhase > Math.PI * 200) ph.breathPhase -= Math.PI * 200;
     if (ph.swayPhase > Math.PI * 200) ph.swayPhase -= Math.PI * 200;
     const breath = Math.sin(ph.breathPhase);
@@ -1144,7 +1186,11 @@ export function drawMotionLabScene(
     if (settings.layerMode === "mesh") {
       // B3: 角度チェーン（毛先ほど低剛性・風=sin＋1Dノイズ・頭のX速度カップリング）
       const windAmp = settings.hairWind * preset.hair * settings.hairMotionStrength;
-      const wind = Math.sin(ph.noiseT * 1.7) * windAmp + noise1d(ph.noiseT * 0.6) * windAmp * 0.6;
+      const windSinRate = loopSeconds > 0 ? snapAngularRateToPeriod(1.7, loopSeconds) : 1.7;
+      const windNoise = loopSeconds > 0
+        ? noise1dLoop(ph.noiseT * 0.6, 0.6 * loopSeconds)
+        : noise1d(ph.noiseT * 0.6);
+      const wind = Math.sin(ph.noiseT * windSinRate) * windAmp + windNoise * windAmp * 0.6;
       const drive = clamp(-settings.hairDrive * settings.hairMotionStrength * ph.rootVX * 0.05, -0.2, 0.2);
       stepChain(ph.hairChain, drive + wind, settings.hairK, settings.hairC, dt, 0.5);
       hairMeshAngles = ph.hairChain.angles;
@@ -1169,9 +1215,15 @@ export function drawMotionLabScene(
         }
         return strands.map((strand, index) => {
           const spring = springs[index];
+          const strandRateA = loopSeconds > 0
+            ? snapAngularRateToPeriod(windTempo * 1.7, loopSeconds)
+            : windTempo * 1.7;
+          const strandRateB = loopSeconds > 0
+            ? snapAngularRateToPeriod(windTempo * 1.9, loopSeconds)
+            : windTempo * 1.9;
           const strandWind =
-            (Math.sin(ph.noiseT * windTempo * 1.7 + spring.phase) * windAmp * 1.8 +
-              Math.sin(ph.noiseT * windTempo * 1.9 + spring.phase * 2.3) * windAmp) * 1.15;
+            (Math.sin(ph.noiseT * strandRateA + spring.phase) * windAmp * 1.8 +
+              Math.sin(ph.noiseT * strandRateB + spring.phase * 2.3) * windAmp) * 1.15;
           const span = Math.max(1, strand.tipY - strand.rootY);
           const target = clamp((drive + strandWind) * driveScale, -0.08, 0.08) * span;
           const displacement = stepHairStrandSpring(
@@ -1272,8 +1324,18 @@ export function drawMotionLabScene(
   // ランダムグランス: 1.4〜4秒ごとに顔向き・視線の目標が
   // ふっと変わり、SmoothDampで滑らかに移行する（連続ノイズだけより「意図」が出る）
   if (settings.randomGlance && settings.glanceStrength > 0 && settings.layerMode !== "simple") {
-    // 瞬き準備中は新しい視線目標を作らない。顔向きは維持し、目だけ中央へ戻す。
-    if (!blinkFrame.sequenceActive) {
+    if (loopSeconds > 0) {
+      // ループモード: 目標をループ位相のインデックスから決定的ハッシュで選ぶ。
+      // 目標系列が毎周同一なら、SmoothDamp状態はウォームアップで周期軌道へ収束する
+      const glanceCount = Math.max(1, Math.round(loopSeconds / 2.7));
+      const index = Math.min(
+        glanceCount - 1,
+        Math.floor((loopMsNow / settings.loopPeriodMs!) * glanceCount),
+      );
+      const hash = Math.sin((index + 1) * 12.9898) * 43758.5453;
+      ph.glanceHeadTarget = ((hash - Math.floor(hash)) * 2 - 1) * 0.45 * settings.glanceStrength;
+    } else if (!blinkFrame.sequenceActive) {
+      // 瞬き準備中は新しい視線目標を作らない。顔向きは維持し、目だけ中央へ戻す。
       ph.glanceWait -= dt;
       if (ph.glanceWait <= 0) {
         ph.glanceWait = 1.4 + random() * 2.6;
@@ -1289,7 +1351,10 @@ export function drawMotionLabScene(
   }
   if (settings.layerMode !== "simple" && settings.parallaxScale > 0) {
     ph.headTurnT += dt * MOTION_LAB_PARALLAX_DEFAULTS.driftSpeed;
-    const headTurn = clamp(noise1d(ph.headTurnT) * 0.56 + ph.glanceHead, -1, 1) * settings.parallaxScale;
+    const headDrift = loopSeconds > 0
+      ? noise1dLoop(ph.headTurnT, MOTION_LAB_PARALLAX_DEFAULTS.driftSpeed * loopSeconds)
+      : noise1d(ph.headTurnT);
+    const headTurn = clamp(headDrift * 0.56 + ph.glanceHead, -1, 1) * settings.parallaxScale;
     if (speechStarted) ph.nod.v += MOTION_LAB_NOD_DEFAULTS.impulse;
     springStep(ph.nod, 0, MOTION_LAB_NOD_DEFAULTS.k, MOTION_LAB_NOD_DEFAULTS.c, dt);
     const nodPx =
@@ -1336,6 +1401,7 @@ export function drawMotionLabScene(
         liftCoupling: MOTION_LAB_ARM_DEFAULTS.lift.coupling * (settings.pyokoBounce > 0 ? 2.8 : 1) * settings.liftStrength,
         liftBounce: MOTION_LAB_ARM_DEFAULTS.lift.bounce * (settings.pyokoBounce > 0 ? 0.25 : 1) * settings.liftStrength,
         liftMax: MOTION_LAB_ARM_DEFAULTS.lift.max,
+        loopPeriodSeconds: loopSeconds > 0 ? loopSeconds : undefined,
       },
       dt,
       bodyTransform.x,
@@ -1353,7 +1419,9 @@ export function drawMotionLabScene(
     if (speechStarted) ph.chest.v += pyokoActive ? 4 : 8;
     const chestNoise = pyokoActive
       ? 0
-      : noise1d(ph.noiseT * 0.8 + 13.7) * settings.chestMax * 0.08;
+      : (loopSeconds > 0
+        ? noise1dLoop(ph.noiseT * 0.8 + 13.7, 0.8 * loopSeconds)
+        : noise1d(ph.noiseT * 0.8 + 13.7)) * settings.chestMax * 0.08;
     const driveY = clamp(-0.16 * ph.rootVY + chestNoise, -settings.chestMax, settings.chestMax);
     springStep(ph.chest, driveY, MOTION_LAB_CHEST_DEFAULTS.k, MOTION_LAB_CHEST_DEFAULTS.c, dt);
     ph.chest.x = clamp(ph.chest.x, -settings.chestMax, settings.chestMax);
@@ -1416,6 +1484,7 @@ export function drawMotionLabScene(
         voice,
         spatialFreq: 0.42,
         tempo: 0.6,
+        loopPeriodSeconds: loopSeconds > 0 ? loopSeconds : undefined,
       });
     } else {
       drawWithOptionalPivot(images.hairBack, clampRotationDeg(hairBackTransform, "hair_back"), "hair_back");
@@ -1452,7 +1521,9 @@ export function drawMotionLabScene(
           ph.sways.set(name, chainState);
         }
         chainState.t += dt;
-        const noise = noise1d(chainState.t * 0.5) * MOTION_LAB_SWAY_DEFAULTS.noise;
+        const noise = (loopSeconds > 0
+          ? noise1dLoop(chainState.t * 0.5, 0.5 * loopSeconds)
+          : noise1d(chainState.t * 0.5)) * MOTION_LAB_SWAY_DEFAULTS.noise;
         const drive = clamp(
           -MOTION_LAB_ARM_DEFAULTS.coupling * ph.rootVX * 0.05,
           -MOTION_LAB_SWAY_DEFAULTS.maxAngle,
@@ -1476,6 +1547,17 @@ export function drawMotionLabScene(
             twitch.mode = earTwitchMode;
             twitch.queuedFollowUp = false;
             twitch.wait = motionLabInitialEarTwitchWait(random());
+          }
+          if (loopSeconds > 0 && twitch.queuedFollowUp !== true) {
+            // ループモード: 一次ツイッチをループ位相の固定マークで発火させる。
+            // 区間の30%位置なら、二連の追撃＋バネ減衰（計約1.5秒）がシーム前に収まる。
+            // 追撃（queuedFollowUp）はマーク相対の短い待ちなので上書きしない
+            const twitchCount = Math.max(1, Math.round(loopSeconds / 7));
+            const segmentMs = settings.loopPeriodMs! / twitchCount;
+            const markMs = segmentMs * 0.3;
+            const posMs = loopMsNow % segmentMs;
+            const untilMark = posMs <= markMs ? markMs - posMs : segmentMs - posMs + markMs;
+            twitch.wait = untilMark / 1000;
           }
           twitch.wait -= dt;
           if (twitch.wait <= 0) {
@@ -1566,7 +1648,8 @@ export function drawMotionLabScene(
       && settings.gazeStrength > 0
       && !!images.irides;
     if (!returningToCenter && gazeEnabled) {
-      ph.gazeT += dt * (Math.PI * 2 / MOTION_LAB_GAZE_DEFAULTS.periodSeconds);
+      const gazeRate = Math.PI * 2 / MOTION_LAB_GAZE_DEFAULTS.periodSeconds;
+      ph.gazeT += dt * (loopSeconds > 0 ? snapAngularRateToPeriod(gazeRate, loopSeconds) : gazeRate);
       const horizontalGaze = motionLabHorizontalGazeAt(
         ph.gazeT,
         motionLabEyeRegions(images.irides!, width, height),
@@ -1618,12 +1701,19 @@ export function drawMotionLabScene(
     const openEyeFrame = images.eyeFrames[0];
     if (openEyeFrame) drawMotionLabLayer(ctx, openEyeFrame, width, height, eyeMouthTransform);
     const dynamicEyeAlpha = clamp(blinkFrame.dynamicEyeAlpha, 0, 1);
+    // ループモード: うるみ・瞳の呼吸の固定周期(4600/5200ms)を書き出し周期の整数分の一へ
+    const wetnessPeriodMs = loopSeconds > 0
+      ? settings.loopPeriodMs! / Math.max(1, Math.round(settings.loopPeriodMs! / 4600))
+      : undefined;
+    const irisBreathPeriodMs = loopSeconds > 0
+      ? settings.loopPeriodMs! / Math.max(1, Math.round(settings.loopPeriodMs! / 5200))
+      : undefined;
     const wetnessOpacity = settings.wetnessEnabled
-      ? motionLabWetnessOpacity(elapsedMs, settings.wetnessStrength)
+      ? motionLabWetnessOpacity(elapsedMs, settings.wetnessStrength, wetnessPeriodMs)
       : 0;
     if (images.eyewhite && images.irides) {
       const rawIrisScale = settings.irisBreathEnabled
-        ? motionLabIrisBreathScale(elapsedMs, settings.irisBreathStrength)
+        ? motionLabIrisBreathScale(elapsedMs, settings.irisBreathStrength, irisBreathPeriodMs)
         : 1;
       const irisScale = 1 + (rawIrisScale - 1) * dynamicEyeAlpha;
       drawMotionLabGaze(
@@ -1726,6 +1816,7 @@ export function drawMotionLabScene(
         strength: settings.hairWaveStrength * preset.hair * settings.hairMotionStrength,
         seed: 0.35,
         voice,
+        loopPeriodSeconds: loopSeconds > 0 ? loopSeconds : undefined,
       });
     } else if (settings.layerMode === "mesh" && hairStrandRender) {
       // 房中心線へのガウシアン重みで複数のばね変位を滑らかに混合

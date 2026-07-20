@@ -3030,10 +3030,12 @@ name = "pachipakugen-app"
 version = "0.4.0"
 dependencies = [
  "base64 0.22.1",
+ "gif",
  "image",
  "keyring-core",
  "ndarray",
  "ort",
+ "png 0.18.1",
  "psd",
  "reqwest 0.12.28",
  "serde",

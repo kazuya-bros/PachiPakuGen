@@ -3007,12 +3007,9 @@ function App() {
             <button
               className="btn btn-primary"
               disabled={workspaceBusy || workspaceEditorPreparing || motionEditorDraftSaveBusy || motionEditorExportBusy || !motionEditorExportReady}
-              onClick={() => {
-                setMotionEditorExportBusy(true);
-                setMotionExportRequestId(previous => previous + 1);
-              }}
+              onClick={() => setMotionExportRequestId(previous => previous + 1)}
             >
-              {motionEditorExportBusy ? "SpriTalk向け素材を保存中..." : "SpriTalk向けに保存"}
+              {motionEditorExportBusy ? "SpriTalk向け素材を保存中..." : "書き出す"}
             </button>
           </div>
         );
@@ -3710,7 +3707,7 @@ function App() {
                     <span className="workspace-spritalk-handoff-note">
                       {motionProfileReady
                         ? "SpriTalkへ基本画像を取り込むときは次のフォルダを使います。モーション設定v2はPachiPakuGenのライブ表示・将来連携用で、現行SpriTalkでは読み込みません。"
-                        : "編集画面で「SpriTalk向けに保存」すると、基本画像とPachiPakuGen用モーション設定を同じフォルダへまとめます。"}
+                        : "編集画面の「書き出す」→「SpriTalk向けに保存」で、基本画像とPachiPakuGen用モーション設定を同じフォルダへまとめます。"}
                     </span>
                     {motionProfileReady && (
                       <div className="workspace-spritalk-handoff">

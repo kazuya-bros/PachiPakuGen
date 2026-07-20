@@ -43,6 +43,8 @@ export interface ArmSwayParams {
   liftCoupling: number;
   liftBounce: number;
   liftMax: number;
+  /** ループ書き出し用: ノイズ・アイドルスイングをこの周期（秒）で繰り返す。0/未指定=通常 */
+  loopPeriodSeconds?: number;
 }
 
 export interface ArmSwayOutput {
@@ -107,6 +109,40 @@ export function noise1d(x: number): number {
   const n0 = g0 * f;
   const n1 = g1 * (f - 1);
   return (n0 + (n1 - n0) * u) * 2;
+}
+
+// ===== ループ書き出し用の周期化ヘルパー =====
+// 通常再生の駆動は非周期（noise1d・無理数比の正弦波）のため決して初期状態へ戻らない。
+// ループ素材書き出しでは、全駆動を書き出し周期Tの整数分の一へ量子化し、
+// 減衰バネがT周期の定常軌道へ収束した後の1周期を記録することでシームレス化する。
+
+/**
+ * 周期版1Dノイズ。入力位相の[0,period)区間と[-period,0)区間を線形クロスフェードし、
+ * x=0とx=periodで同じ値・ほぼ同じ傾きになる（変位駆動用途では継ぎ目は知覚できない）。
+ * period<=0のときは通常のnoise1dへフォールバック。
+ */
+export function noise1dLoop(x: number, period: number): number {
+  if (!(period > 0)) return noise1d(x);
+  const base = ((x % period) + period) % period;
+  const u = base / period;
+  return noise1d(base) * (1 - u) + noise1d(base - period) * u;
+}
+
+/**
+ * 角速度（rad/s）を「periodSeconds内にちょうど整数周期」となる近傍値へ量子化する。
+ * sin(rate*t)型の駆動をT周期でつなげるために使う。誤差は最大±半周期分の比率で、
+ * Tが対象周期の3倍以上あれば±17%以内に収まる。
+ */
+export function snapAngularRateToPeriod(rate: number, periodSeconds: number): number {
+  if (!(periodSeconds > 0) || !(rate > 0)) return rate;
+  const cycles = Math.max(1, Math.round((rate * periodSeconds) / (Math.PI * 2)));
+  return (Math.PI * 2 * cycles) / periodSeconds;
+}
+
+/** 周波数（cycles/s）版。sin(TAU * cps * t)型の駆動（波モード髪のbeat等）に使う */
+export function snapCyclesToPeriod(cyclesPerSecond: number, periodSeconds: number): number {
+  if (!(periodSeconds > 0) || !(cyclesPerSecond > 0)) return cyclesPerSecond;
+  return Math.max(1, Math.round(cyclesPerSecond * periodSeconds)) / periodSeconds;
 }
 
 /** バネ-ダンパー1本（半陰的オイラー＋サブステップ）。dtは事前にclampDt推奨 */
@@ -251,16 +287,21 @@ export function updateArmSway(
 
   const dtc = clampDt(dt);
   const drive = clamp(-params.coupling * vx * 0.05, -params.maxAngle, params.maxAngle);
+  const loopSeconds = params.loopPeriodSeconds ?? 0;
+  const idleRate = loopSeconds > 0 ? snapAngularRateToPeriod(0.9, loopSeconds) : 0.9;
 
   const result = {} as Record<"left" | "right", { rigid: number; lift: number }>;
   for (const side of ["left", "right"] as const) {
     const chain = state[side];
     chain.t += dtc;
     // 左右で位相をずらした常時微揺れ（完全同期だと機械的に見える）
-    const noise = noise1d(chain.t * 0.5 + (side === "left" ? 0 : 37)) * params.noise;
+    const noisePhase = chain.t * 0.5 + (side === "left" ? 0 : 37);
+    const noise = (loopSeconds > 0
+      ? noise1dLoop(noisePhase, 0.5 * loopSeconds)
+      : noise1d(noisePhase)) * params.noise;
     // アイドルスイング: 振り子状のゆっくりした常時スイング（左右で位相ずらし）
     const idle = params.idleSwing > 0
-      ? Math.sin(chain.t * 0.9 + (side === "left" ? 0 : 2.1)) * params.idleSwing
+      ? Math.sin(chain.t * idleRate + (side === "left" ? 0 : 2.1)) * params.idleSwing
       : 0;
     stepChain(chain, drive + noise + idle, params.k, params.c, dtc, params.maxAngle);
     result[side] = { rigid: chainAverage(chain), lift: state.lift.x };

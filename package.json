@@ -20,6 +20,7 @@
     "test:ears": "node --test --experimental-strip-types scripts/ear-twitch.test.mjs",
     "test:templates": "node --test --experimental-strip-types scripts/motion-templates.test.mjs",
     "test:workspace": "node --test --experimental-strip-types scripts/workspace-checkpoint.test.mjs",
+    "test:loop": "node --test --experimental-strip-types scripts/motion-loop.test.mjs",
     "licenses:npm": "node scripts/generate_npm_licenses.mjs",
     "licenses:cargo": "node scripts/generate_cargo_licenses.mjs",
     "preview": "vite preview",

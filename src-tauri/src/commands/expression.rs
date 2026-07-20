@@ -580,8 +580,11 @@ fn read_rife_output_result(job_dir: &Path) -> Option<GenerateCodexRifeOutputResu
     if !output_dir.is_dir() {
         return None;
     }
-    let manifest = fs::read(output_dir.join("manifest.json"))
+    // manifest.jsonはジョブフォルダ直下が正だが、移行前の旧ワークスペースは
+    // SpriTalk受け渡しフォルダ内にまだ残っている場合があるため両方見る
+    let manifest = fs::read(job_dir.join("manifest.json"))
         .ok()
+        .or_else(|| fs::read(output_dir.join("manifest.json")).ok())
         .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
     let frame_count = manifest
         .as_ref()
@@ -2305,6 +2308,7 @@ fn generate_codex_rife_outputs_inner(
         .collect();
     let mut done = 0u32;
     let mut directories = Vec::new();
+    let mut manifest_directories = Vec::new();
     let state = app.state::<AppState>();
     let mut session_guard = state.rife_session.lock().unwrap();
     let session = session_guard.as_mut().unwrap();
@@ -2392,25 +2396,15 @@ fn generate_codex_rife_outputs_inner(
             frame.save(out_dir.join(format!("{:03}.png", index + 1)))?;
         }
         directories.push(out_dir.to_string_lossy().into_owned());
+        // manifest.jsonと同じフォルダの直下なので、ローカルの絶対パス（ユーザー名を含む）
+        // を書き出さずフォルダ名だけ記録する
+        manifest_directories.push(folder.to_string());
     }
 
     let spritalk_assets =
         materialize_spritalk_static_assets(&job_dir, &extracted_dir, &output_root)?;
-
-    let manifest = json!({
-        "formatVersion": 1,
-        "mode": "codex-rife-output",
-        "sourceJob": job_dir.to_string_lossy(),
-        "frameCount": frame_count,
-        "spritalkImportDirectory": output_root.to_string_lossy(),
-        "staticAssets": spritalk_assets,
-        "directories": directories,
-    });
-    fs::write(
-        output_root.join("manifest.json"),
-        serde_json::to_vec_pretty(&manifest)
-            .map_err(|error| AppError::General(format!("RIFE manifest作成失敗: {error}")))?,
-    )?;
+    let manifest = build_codex_rife_manifest(frame_count, spritalk_assets, manifest_directories);
+    write_codex_rife_manifest(&job_dir, &output_root, &manifest)?;
     complete_workspace_edit(&job_dir, 7)?;
 
     Ok(GenerateCodexRifeOutputResult {
@@ -2455,6 +2449,49 @@ fn codex_rife_jobs(extracted_dir: &Path) -> Vec<(&'static str, &'static str, &'s
     jobs
 }
 
+/// SpriTalk向け出力フォルダ(output_root)の内容を記述する内部manifestを組み立てる。
+/// このmanifest自身はPachiPakuGen自身の再開処理専用でSpriTalkには渡さないため
+/// job_dir直下に置く（`write_codex_rife_manifest`）。`sourceJob`/`spritalkImportDirectory`
+/// はどちらもアプリ内部で読み戻されない記録用の値で、常に同じ相対関係
+/// （job_dirはoutput_rootの親）を表す。絶対パス（ユーザー名を含むローカルパス）を
+/// 書き出すと、フォルダごと共有・移動した際に元の環境情報が漏れるため、固定の相対値にする。
+/// `directories`/`staticAssets`もoutput_root直下のファイル・フォルダ名のみを記録する。
+fn build_codex_rife_manifest(
+    frame_count: u32,
+    static_assets: Vec<String>,
+    directories: Vec<String>,
+) -> serde_json::Value {
+    json!({
+        "formatVersion": 1,
+        "mode": "codex-rife-output",
+        "sourceJob": "..",
+        "frameCount": frame_count,
+        "spritalkImportDirectory": ".",
+        "staticAssets": static_assets,
+        "directories": directories,
+    })
+}
+
+/// RIFE出力の内部manifestをジョブフォルダ直下(project.jsonと同階層)へ書く。
+/// SpriTalkへ渡すoutput_root側は素材のみにするため、移行前の旧配置に
+/// 残った同名ファイルがあれば削除する
+fn write_codex_rife_manifest(
+    job_dir: &Path,
+    output_root: &Path,
+    manifest: &serde_json::Value,
+) -> Result<(), AppError> {
+    let legacy_path = output_root.join("manifest.json");
+    if legacy_path.is_file() {
+        fs::remove_file(&legacy_path)?;
+    }
+    fs::write(
+        job_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(manifest)
+            .map_err(|error| AppError::General(format!("RIFE manifest作成失敗: {error}")))?,
+    )?;
+    Ok(())
+}
+
 fn materialize_spritalk_static_assets(
     job_dir: &Path,
     extracted_dir: &Path,
@@ -2478,7 +2515,7 @@ fn materialize_spritalk_static_assets(
     }
     fs::write(
         output_root.join("README.txt"),
-        "PachiPakuGen assets for SpriTalk\nUse the image assets in this folder with the layer-import flow supported by your SpriTalk version.\nRequired: body.png\nOptional: hair.png, hair_back.png, arm_l.png, arm_r.png, chest.png, sway_*.png, arm_l_overlay_*.png, arm_r_overlay_*.png\nDynamic eyes: eyebrow.png, eyewhite.png, irides.png, highlight.png (optional)\nLayer linkage and draw order: layer-order.json\nAnimation folders: eye, mouth_a, mouth_i, mouth_u, mouth_e, mouth_o\nNote: spritalk-motion-profile.json schema v2 is used by PachiPakuGen live view and reserved for future SpriTalk integration; current SpriTalk does not import it.\n",
+        "PachiPakuGen assets for SpriTalk\nUse the image assets in this folder with the layer-import flow supported by your SpriTalk version.\nRequired: body.png\nOptional: hair.png, hair_back.png, arm_l.png, arm_r.png, chest.png, sway_*.png, arm_l_overlay_*.png, arm_r_overlay_*.png\nDynamic eyes: eyebrow.png, eyewhite.png, irides.png, highlight.png (optional)\nLayer linkage and draw order: layer-order.json (folded into spritalk-motion-profile.json's layerOrder field once STEP7 export runs)\nAnimation folders: eye, mouth_a, mouth_i, mouth_u, mouth_e, mouth_o\nNote: spritalk-motion-profile.json schema v2 is used by PachiPakuGen live view and reserved for future SpriTalk integration; current SpriTalk does not import it. Once STEP7 export runs, this README and layer-order.json are removed and folded into spritalk-motion-profile.json (readme/layerOrder fields) so this folder's only PachiPakuGen-authored metadata file is spritalk-motion-profile.json.\n",
     )?;
     Ok(copied)
 }
@@ -2516,7 +2553,9 @@ fn copy_spritalk_root_assets(
         if source_path.is_file() {
             let dest_path = output_root.join(file_name);
             fs::copy(&source_path, &dest_path)?;
-            copied.push(dest_path.to_string_lossy().into_owned());
+            // manifest.jsonと同じフォルダの直下なので、ローカルの絶対パス（ユーザー名を含む）
+            // を書き出さずファイル名だけ記録する。フォルダごと移動・共有しても破綻しない
+            copied.push(file_name.to_string());
         } else {
             let stale_path = output_root.join(file_name);
             if stale_path.exists() {
@@ -2602,7 +2641,7 @@ fn sync_dynamic_eye_assets(
         } else {
             fs::copy(&source_path, &dest_path)?;
         }
-        synced.push(dest_path.to_string_lossy().into_owned());
+        synced.push(file_name.to_string());
     }
     let eyebrow_path = output_root.join("eyebrow.png");
     if eyebrow_path.is_file() {
@@ -4190,6 +4229,54 @@ fn composite_inside_mask(
 mod tests {
     use super::*;
     use image::{GrayImage, Luma, Rgba};
+
+    #[test]
+    fn codex_rife_manifest_never_embeds_local_absolute_paths() {
+        let manifest = build_codex_rife_manifest(
+            8,
+            vec!["body.png".into(), "hair.png".into()],
+            vec!["eye".into(), "mouth_a".into()],
+        );
+        // sourceJob/spritalkImportDirectoryは常に相対値（ユーザー名を含むローカルパスを含まない）
+        assert_eq!(manifest["sourceJob"], "..");
+        assert_eq!(manifest["spritalkImportDirectory"], ".");
+        assert_eq!(manifest["frameCount"], 8);
+        // staticAssets/directoriesはファイル名・フォルダ名のみで、区切り文字（パス）を含まない
+        for entry in manifest["staticAssets"].as_array().unwrap() {
+            let value = entry.as_str().unwrap();
+            assert!(!value.contains('\\') && !value.contains('/'), "{value} looks like a path");
+        }
+        for entry in manifest["directories"].as_array().unwrap() {
+            let value = entry.as_str().unwrap();
+            assert!(!value.contains('\\') && !value.contains('/'), "{value} looks like a path");
+        }
+    }
+
+    #[test]
+    fn codex_rife_manifest_is_written_at_job_root_and_migrated_away_from_output_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "pachipakugen_rife_manifest_location_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let output_root = root.join(WORKSPACE_SPRITALK_PARTS_DIR);
+        fs::create_dir_all(&output_root).unwrap();
+        // 移行前の旧配置（output_root直下）に残骸が残っているケースを再現
+        fs::write(output_root.join("manifest.json"), b"{\"mode\":\"codex-rife-output\"}").unwrap();
+
+        let manifest = build_codex_rife_manifest(8, vec!["body.png".into()], vec!["eye".into()]);
+        write_codex_rife_manifest(&root, &output_root, &manifest).unwrap();
+
+        assert!(root.join("manifest.json").is_file(), "job直下に書かれること");
+        assert!(
+            !output_root.join("manifest.json").is_file(),
+            "SpriTalk受け渡しフォルダに残骸が残らないこと"
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn generated_part_auto_fit_accepts_mild_aspect_difference() {

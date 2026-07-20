@@ -13,9 +13,12 @@ import type {
 import {
   MOTION_LAB_EFFECT_DEFS,
   MOTION_LAB_MOUTH_KEYS,
+  MOTION_LAB_MOUTH_LABELS,
   MOTION_LAB_TEMPLATE_LAYOUT,
   MOTION_LAB_TEMPLATES,
+  MOTION_LAB_VOWEL_KEYS,
   motionLabTimelineFromText,
+  motionLabVowelLoopTimeline,
 } from "./constants";
 import {
   createMotionLabPhysics,
@@ -110,6 +113,36 @@ export function MotionTunePanel({
   const [previewZoom, setPreviewZoom] = useState(1);
   const [previewPan, setPreviewPan] = useState({ x: 0, y: 0 });
   const [previewPanning, setPreviewPanning] = useState(false);
+  /** ループ素材書き出しの設定。周期は呼吸(3.6s)と内蔵あいうえお(3600ms)の公倍数 */
+  const [loopExportConfig, setLoopExportConfig] = useState({
+    periodMs: 14400,
+    // "silent"=口パクなし（閉じたまま）。それ以外は該当母音のみを開閉ループする
+    mouth: "a" as "silent" | MotionLabMouthKey,
+    frames: true,
+    apng: true,
+    gif: false,
+  });
+  const [loopExportProgress, setLoopExportProgress] = useState<{
+    phase: string;
+    current: number;
+    total: number;
+    /** 所要フレーム数が未確定な段階（形式の組み立て中など）。進捗バーを不確定表示にする */
+    indeterminate?: boolean;
+  } | null>(null);
+  const loopExportCancelRef = useRef(false);
+  /** フッターの「書き出す」を押した時に、SpriTalk保存/ループ素材のどちらかを選ぶモーダル */
+  const [exportChoiceOpen, setExportChoiceOpen] = useState(false);
+  const [loopExportPanelOpen, setLoopExportPanelOpen] = useState(false);
+  const [spritalkSaving, setSpritalkSaving] = useState(false);
+
+  useEffect(() => {
+    if (!exportChoiceOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !busy) setExportChoiceOpen(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [exportChoiceOpen, busy]);
   const [, setManifestPath] = useState("");
   const [settings, settingsDispatch] = useMotionLabSettings();
   const previewStageRef = useRef<HTMLDivElement>(null);
@@ -334,10 +367,15 @@ export function MotionTunePanel({
   function clampPreviewPan(next: { x: number; y: number }, zoom: number) {
     const stage = previewStageRef.current;
     const canvas = canvasRef.current;
-    if (!stage || !canvas || zoom <= 1) return { x: 0, y: 0 };
+    if (!stage || !canvas) return { x: 0, y: 0 };
 
-    const maxX = Math.max(0, (canvas.offsetWidth * zoom - stage.clientWidth) / 2);
-    const maxY = Math.max(0, (canvas.offsetHeight * zoom - stage.clientHeight) / 2);
+    // ステージの約35%分は「はみ出し」を許容し、ズーム1でもある程度パンできるようにする
+    const slackX = stage.clientWidth * 0.35;
+    const slackY = stage.clientHeight * 0.35;
+    const contentW = canvas.offsetWidth * zoom;
+    const contentH = canvas.offsetHeight * zoom;
+    const maxX = Math.max(slackX, (contentW - stage.clientWidth) / 2 + slackX);
+    const maxY = Math.max(slackY, (contentH - stage.clientHeight) / 2 + slackY);
     return {
       x: Math.max(-maxX, Math.min(maxX, next.x)),
       y: Math.max(-maxY, Math.min(maxY, next.y)),
@@ -397,9 +435,134 @@ export function MotionTunePanel({
     }
   }
 
-  async function exportSpritalkProfile() {
-    if (!parts) return;
+  // ===== ループ素材書き出し =====
+  // 全駆動をループ長の整数分の一へ量子化（render.tsのloopPeriodMs）し、
+  // 減衰バネが周期軌道へ収束するまで2周ウォームアップしてから1周期分を記録する。
+  // 通常再生と違い「最初の状態に戻る瞬間」を待つ必要がない
+  const LOOP_EXPORT_FPS = 30;
+
+  /** 決定的PRNG（mulberry32）。ループ書き出しの毎回同じ結果を保証する */
+  function createSeededRandom(seed: number): () => number {
+    let state = seed >>> 0;
+    return () => {
+      state = (state + 0x6d2b79f5) >>> 0;
+      let t = state;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  async function exportMotionLoop() {
+    if (!parts || !images) return;
+    const config = loopExportConfig;
+    if (!config.frames && !config.apng && !config.gif) {
+      onError?.("出力形式（PNG連番 / APNG / AGIF）を1つ以上選択してください");
+      return;
+    }
+    loopExportCancelRef.current = false;
+    setBusy(true);
+    const exportSettings = latestSettingsRef.current;
+    try {
+      const periodMs = config.periodMs;
+      const framesPerLoop = Math.round((periodMs / 1000) * LOOP_EXPORT_FPS);
+      const warmupFrames = framesPerLoop * 2;
+      const frameMs = 1000 / LOOP_EXPORT_FPS;
+      const vowelLoop = config.mouth !== "silent" ? motionLabVowelLoopTimeline(config.mouth) : null;
+      const timeline: MotionLabTimelineEvent[] = vowelLoop?.timeline ?? [{ timeMs: 0, mouth: "closed", energy: 0 }];
+      const timelineDurationMs = vowelLoop?.durationMs ?? periodMs;
+      const renderSettings = {
+        ...toRenderSettings(exportSettings, {
+          pivotEditPart: null,
+          timeline,
+          timelineDurationMs,
+        }),
+        loopPeriodMs: periodMs,
+        random: createSeededRandom(0x9e3779b9),
+      };
+      // 位相ゼロ・登場撃力なしの専用ランタイム（プレビューの状態に影響させない）
+      const runtime: MotionLabMouthRuntime = {
+        openY: 0,
+        activeTarget: "closed",
+        previousTarget: "closed",
+        transitionStartMs: 0,
+        lastMs: 0,
+        browVoice: 0,
+        physics: createMotionLabPhysics(false),
+      };
+      // 素材の実寸そのままで書き出す（縮小はOBS等の利用側に任せる）
+      const fullCanvas = document.createElement("canvas");
+      fullCanvas.width = parts.width;
+      fullCanvas.height = parts.height;
+      const fullCtx = fullCanvas.getContext("2d");
+      if (!fullCtx) throw new Error("書き出し用キャンバスを作成できません");
+      fullCtx.imageSmoothingEnabled = true;
+      fullCtx.imageSmoothingQuality = "high";
+
+      // ウォームアップ: 描画のみ（記録なし）。UIを固めないよう定期的にyieldする
+      for (let frame = 0; frame < warmupFrames; frame += 1) {
+        if (loopExportCancelRef.current) throw new Error("書き出しをキャンセルしました");
+        drawMotionLabScene(fullCtx, parts, images, runtime, frame * frameMs, renderSettings);
+        if (frame % 30 === 29) {
+          setLoopExportProgress({ phase: "収束待ち", current: frame + 1, total: warmupFrames });
+          await new Promise(resolve => window.setTimeout(resolve, 0));
+        }
+      }
+
+      // 記録: ウォームアップ直後の1周期（開始時点でループ位相はちょうど0）
+      for (let frame = 0; frame < framesPerLoop; frame += 1) {
+        if (loopExportCancelRef.current) throw new Error("書き出しをキャンセルしました");
+        const elapsedMs = (warmupFrames + frame) * frameMs;
+        drawMotionLabScene(fullCtx, parts, images, runtime, elapsedMs, renderSettings);
+        const blob = await new Promise<Blob>((resolve, reject) => {
+          fullCanvas.toBlob(
+            value => (value ? resolve(value) : reject(new Error("フレームのPNG化に失敗しました"))),
+            "image/png",
+          );
+        });
+        const pngBase64 = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.onerror = () => reject(reader.error ?? new Error("フレームの読み出しに失敗しました"));
+          reader.readAsDataURL(blob);
+        });
+        await invoke("save_motion_loop_frame", {
+          request: { sourceDir: parts.sourceDir, frameIndex: frame, pngBase64 },
+        });
+        setLoopExportProgress({ phase: "フレーム保存", current: frame + 1, total: framesPerLoop });
+      }
+
+      setLoopExportProgress({ phase: "書き出し形式を組み立て中", current: 0, total: 1, indeterminate: true });
+      const result = await invoke<{
+        exportDir: string;
+        framesDir: string | null;
+        apngPath: string | null;
+        gifPath: string | null;
+        frameCount: number;
+        fps: number;
+      }>("finalize_motion_loop_export", {
+        request: {
+          sourceDir: parts.sourceDir,
+          fps: LOOP_EXPORT_FPS,
+          frameCount: framesPerLoop,
+          makeApng: config.apng,
+          makeGif: config.gif,
+          keepFrames: config.frames,
+        },
+      });
+      notify(`ループ素材を書き出しました（${framesPerLoop}フレーム/${LOOP_EXPORT_FPS}fps）: ${result.exportDir}`);
+    } catch (cause) {
+      fail(cause);
+    } finally {
+      setBusy(false);
+      setLoopExportProgress(null);
+    }
+  }
+
+  async function exportSpritalkProfile(): Promise<boolean> {
+    if (!parts) return false;
     let exportedPath = "";
+    let succeeded = false;
     const exportSettings = latestSettingsRef.current;
     setBusy(true);
     onExportStateChange?.({ ready: false, busy: true });
@@ -413,6 +576,7 @@ export function MotionTunePanel({
         request: { sourceDir: parts.sourceDir, profile },
       });
       exportedPath = result.path;
+      succeeded = true;
       onDirtyChange?.(false);
       notify(`SpriTalk用アニメーション設定を出力しました: ${result.path}`);
     } catch (cause) {
@@ -422,6 +586,7 @@ export function MotionTunePanel({
       onExportStateChange?.({ ready: true, busy: false });
     }
     if (exportedPath) onExported?.(exportedPath);
+    return succeeded;
   }
 
   useEffect(() => {
@@ -435,10 +600,20 @@ export function MotionTunePanel({
   useEffect(() => {
     if (exportRequestId <= 0 || exportRequestId === lastExportRequestRef.current) return;
     lastExportRequestRef.current = exportRequestId;
-    void exportSpritalkProfile();
-    // exportRequestIdの更新時点のparts・settingsを確定値として出力する。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // フッターの「書き出す」は直接保存せず、SpriTalk保存/ループ素材書き出しの
+    // どちらを行うか選ぶモーダルを開く。
+    setExportChoiceOpen(true);
   }, [exportRequestId]);
+
+  async function chooseSpritalkExport() {
+    setSpritalkSaving(true);
+    try {
+      const succeeded = await exportSpritalkProfile();
+      if (succeeded) setExportChoiceOpen(false);
+    } finally {
+      setSpritalkSaving(false);
+    }
+  }
 
   const percentFormat = (value: number) => `${Math.round(value * 100)}%`;
   const effectSliders: Partial<Record<MotionLabEffectKey, {
@@ -554,14 +729,12 @@ export function MotionTunePanel({
                 ref={canvasRef}
                 className={pivotEditPart
                   ? "is-pivot-editing"
-                  : previewZoom > 1
-                    ? previewPanning ? "is-panning" : "is-pannable"
-                    : undefined}
+                  : previewPanning ? "is-panning" : "is-pannable"}
                 style={{
                   transform: `translate3d(${previewPan.x}px, ${previewPan.y}px, 0) scale(${previewZoom})`,
                 }}
                 onPointerDown={(event) => {
-                  if (pivotEditPart || previewZoom <= 1 || event.button !== 0) return;
+                  if (pivotEditPart || event.button !== 0) return;
                   previewPanDragRef.current = {
                     pointerId: event.pointerId,
                     startClientX: event.clientX,
@@ -612,7 +785,7 @@ export function MotionTunePanel({
               {imagesLoading && <span className="motion-lab-placeholder">画像読込中...</span>}
               <div
                 className="motion-tune-zoom-controls"
-                title="ホイールで拡大・縮小。拡大中はプレビューをドラッグして移動できます"
+                title="ホイールで拡大・縮小。ドラッグでプレビューを移動できます"
                 onWheel={(event) => event.stopPropagation()}
               >
                 <button
@@ -941,6 +1114,188 @@ export function MotionTunePanel({
 
         </section>
       </div>
+
+      {exportChoiceOpen && (
+        <div
+          className="motion-lab-export-choice-overlay"
+          role="dialog"
+          aria-label="書き出す形式を選択"
+          onClick={() => { if (!busy) setExportChoiceOpen(false); }}
+        >
+          <div className="motion-lab-export-choice-modal" onClick={event => event.stopPropagation()}>
+            <div className="motion-lab-export-choice-header">
+              <strong>書き出す形式を選択</strong>
+              <button
+                className="motion-lab-export-choice-close"
+                disabled={busy}
+                onClick={() => setExportChoiceOpen(false)}
+                aria-label="閉じる"
+              >×</button>
+            </div>
+
+            <div className="motion-lab-export-choice-option">
+              <div className="motion-lab-export-choice-option-heading">
+                <strong>SpriTalk向けに保存</strong>
+                <span className="motion-lab-export-choice-tag">通常はこちら</span>
+              </div>
+              <p>基本画像とPachiPakuGen用モーション設定をSpriTalkの読み込み用フォルダへ保存します。</p>
+              <button
+                className="btn btn-primary"
+                disabled={busy || !parts}
+                onClick={() => void chooseSpritalkExport()}
+              >
+                {spritalkSaving ? "保存中..." : "SpriTalk向けに保存"}
+              </button>
+            </div>
+
+            <div className="motion-lab-export-choice-option">
+              <div
+                className="motion-lab-export-choice-option-heading motion-lab-export-choice-option-toggle"
+                role="button"
+                tabIndex={0}
+                onClick={() => setLoopExportPanelOpen(open => !open)}
+                onKeyDown={event => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    setLoopExportPanelOpen(open => !open);
+                  }
+                }}
+              >
+                <strong>ループ素材を書き出す</strong>
+                <span className="motion-lab-export-choice-chevron">{loopExportPanelOpen ? "▲" : "▼"}</span>
+              </div>
+              <p>つなぎ目なく繰り返せるアニメ素材（PNG連番/APNG）を出力します。動画編集やOBSでのループ再生向けです。</p>
+              {loopExportPanelOpen && (
+                <div className="motion-lab-loop-export-panel">
+                  <div className="motion-lab-loop-export-grid">
+                    <label>
+                      <span>ループ長</span>
+                      <select
+                        value={loopExportConfig.periodMs}
+                        disabled={busy}
+                        onChange={event => setLoopExportConfig({ ...loopExportConfig, periodMs: Number(event.target.value) })}
+                      >
+                        <option value={7200}>7.2秒（軽量）</option>
+                        <option value={14400}>14.4秒（推奨）</option>
+                        <option value={21600}>21.6秒（変化が多い）</option>
+                      </select>
+                    </label>
+                    <label>
+                      <span>口</span>
+                      <select
+                        value={loopExportConfig.mouth}
+                        disabled={busy}
+                        onChange={event => setLoopExportConfig({ ...loopExportConfig, mouth: event.target.value as "silent" | MotionLabMouthKey })}
+                      >
+                        <option value="silent">口パクなし（待機）</option>
+                        {MOTION_LAB_VOWEL_KEYS.map(vowel => (
+                          <option key={vowel} value={vowel}>「{MOTION_LAB_MOUTH_LABELS[vowel]}」開閉ループ</option>
+                        ))}
+                      </select>
+                    </label>
+                    <div className="motion-lab-loop-export-formats">
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={loopExportConfig.frames}
+                          disabled={busy}
+                          onChange={event => setLoopExportConfig({ ...loopExportConfig, frames: event.target.checked })}
+                        />
+                        <span>PNG連番</span>
+                      </label>
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={loopExportConfig.apng}
+                          disabled={busy}
+                          onChange={event => setLoopExportConfig({ ...loopExportConfig, apng: event.target.checked })}
+                        />
+                        <span>APNG</span>
+                      </label>
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={loopExportConfig.gif}
+                          disabled={busy}
+                          onChange={event => setLoopExportConfig({ ...loopExportConfig, gif: event.target.checked })}
+                        />
+                        <span>AGIF</span>
+                      </label>
+                    </div>
+                    <div className="motion-lab-loop-export-hints">
+                      {loopExportConfig.frames && (
+                        <details className="motion-lab-loop-export-hint">
+                          <summary>PNG連番→WebMへの変換方法</summary>
+                          <p>
+                            PNG連番は最も画質が良く、そのままではファイル数が多いだけですが、
+                            お手元にffmpegがあれば1コマンドで透過付きWebMへ変換できます
+                            (OBS等の透過ループ素材として一番軽くて扱いやすい形式です)。
+                          </p>
+                          <code>ffmpeg -framerate 30 -i frames/%04d.png -c:v libvpx-vp9 -pix_fmt yuva420p loop.webm</code>
+                        </details>
+                      )}
+                      {loopExportConfig.apng && (
+                        <p className="motion-lab-loop-export-hint-note">
+                          APNGは画質・透過とも最良ですが、揺れが画面全体に広がる素材では差分圧縮の効きが弱く、ファイルサイズが大きくなりがちです。
+                        </p>
+                      )}
+                      {loopExportConfig.gif && (
+                        <p className="motion-lab-loop-export-hint-note">
+                          AGIFはAPNGよりかなり軽くなりますが、256色までの制限で陰影にバンディングが出たり、透過が完全な0/100%のみのため輪郭がやや硬くなります。
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                  {loopExportProgress ? (
+                    <div className="motion-lab-loop-export-progress">
+                      <div className="motion-lab-loop-export-progress-main">
+                        <span>
+                          {loopExportProgress.phase}
+                          {!loopExportProgress.indeterminate && loopExportProgress.total > 0
+                            ? `: ${loopExportProgress.current}/${loopExportProgress.total}`
+                            : ""}
+                        </span>
+                        <div
+                          className={
+                            loopExportProgress.indeterminate
+                              ? "motion-lab-loop-export-bar is-indeterminate"
+                              : "motion-lab-loop-export-bar"
+                          }
+                          role="progressbar"
+                          aria-valuemin={0}
+                          aria-valuemax={loopExportProgress.total || 100}
+                          aria-valuenow={loopExportProgress.indeterminate ? undefined : loopExportProgress.current}
+                          aria-label={loopExportProgress.phase}
+                        >
+                          <div
+                            className="motion-lab-loop-export-bar-fill"
+                            style={{
+                              width: loopExportProgress.indeterminate
+                                ? undefined
+                                : `${Math.min(100, (loopExportProgress.current / Math.max(1, loopExportProgress.total)) * 100)}%`,
+                            }}
+                          />
+                        </div>
+                      </div>
+                      <button className="btn btn-secondary" onClick={() => { loopExportCancelRef.current = true; }}>キャンセル</button>
+                    </div>
+                  ) : (
+                    <div className="motion-lab-loop-export-actions">
+                      <button
+                        className="btn btn-secondary"
+                        disabled={busy || !parts || !images}
+                        onClick={() => void exportMotionLoop()}
+                      >
+                        ループ素材を書き出す（30fps）
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }

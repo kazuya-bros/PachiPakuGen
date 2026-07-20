@@ -25,6 +25,10 @@ serde_json = "1"
 ort = { version = "2.0.0-rc.11", features = ["directml"] }
 ndarray = "0.17"
 image = "0.25"
+# imageが内部で使うものと同版。APNG（acTL/fcTL）組み立てに直接使用
+png = "0.18"
+# imageのgif featureが内部で使うものと同版。テストでのGIFデコード検証に使用
+gif = "0.14"
 psd = "0.3"
 base64 = "0.22"
 thiserror = "2"

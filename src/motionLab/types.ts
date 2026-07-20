@@ -256,6 +256,13 @@ export interface MotionLabRenderSettings {
   } | null;
   /** オフライン描画用の乱数源。未指定時は通常プレビューと同じ Math.random。 */
   random?: () => number;
+  /**
+   * ループ素材書き出しモード。指定すると全ての駆動（正弦波・ノイズ・
+   * まばたき/グランス/獣耳のイベント）をこの周期の整数分の一へ量子化し、
+   * ウォームアップ後の1周期がシームレスに繋がるようにする。
+   * 内蔵タイムライン(3600ms)と呼吸(3.6s)が割り切る値（7200/14400/21600等）を推奨。
+   */
+  loopPeriodMs?: number;
 }
 
 export interface MotionLabManifest {
@@ -415,7 +422,7 @@ export interface SpritalkMotionProfile {
       rotationAmount: number;
     };
   };
-  // v2 additive: 検証済みバネ物理パラメータ（docs/motion-lab-integration.md §1）
+  // v2 additive: 検証済みバネ物理パラメータ（docs/_local-archive/motion-lab-integration.md §1）
   physics: {
     /** モーション方式。現行の保存値は wave / springRig（旧版の値は読込時に正規化）。 */
     engineFamily: MotionLabEngineFamily;

@@ -3455,6 +3455,247 @@ body {
   font-size: 12px;
 }
 
+/* 書き出し選択モーダル（STEP7、フッターの「書き出す」から開く） */
+.motion-lab-export-choice-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.55);
+}
+
+.motion-lab-export-choice-modal {
+  display: grid;
+  gap: 14px;
+  width: min(640px, 92vw);
+  max-height: 85vh;
+  overflow-y: auto;
+  padding: 18px;
+  border: 1px solid var(--border-color);
+  background: var(--panel-bg);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+}
+
+.motion-lab-export-choice-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.motion-lab-export-choice-header strong {
+  color: var(--text-primary);
+  font-size: 15px;
+}
+
+.motion-lab-export-choice-close {
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 4px 8px;
+}
+
+.motion-lab-export-choice-close:hover {
+  color: var(--text-primary);
+}
+
+.motion-lab-export-choice-option {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--border-color);
+  background: var(--surface-bg);
+}
+
+.motion-lab-export-choice-option-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.motion-lab-export-choice-option-heading strong {
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.motion-lab-export-choice-option-toggle {
+  cursor: pointer;
+}
+
+.motion-lab-export-choice-chevron {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.motion-lab-export-choice-tag {
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: rgba(45, 145, 255, 0.16);
+  color: var(--accent-color);
+  font-size: 10px;
+  font-weight: 900;
+}
+
+.motion-lab-export-choice-option p {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.motion-lab-loop-export-panel {
+  display: grid;
+  gap: 10px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border-color);
+}
+
+/* ループ素材書き出し（STEP7） */
+.motion-lab-loop-export-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.motion-lab-loop-export-grid > label {
+  display: grid;
+  gap: 4px;
+}
+
+.motion-lab-loop-export-grid > label > span {
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.motion-lab-loop-export-grid select {
+  width: 100%;
+  height: 30px;
+  border: 1px solid var(--border-color);
+  background: var(--panel-bg);
+  color: var(--text-primary);
+  padding: 0 6px;
+  font: inherit;
+  font-size: 12px;
+}
+
+.motion-lab-loop-export-formats {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 16px;
+}
+
+.motion-lab-loop-export-formats label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-primary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.motion-lab-loop-export-hints {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 6px;
+}
+
+.motion-lab-loop-export-hint {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.motion-lab-loop-export-hint summary {
+  color: var(--accent-color);
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.motion-lab-loop-export-hint p {
+  margin: 6px 0;
+  line-height: 1.5;
+}
+
+.motion-lab-loop-export-hint code {
+  display: block;
+  overflow-x: auto;
+  padding: 6px 8px;
+  border: 1px solid var(--border-color);
+  background: var(--surface-bg);
+  color: var(--text-primary);
+  font-size: 10px;
+  white-space: pre;
+}
+
+.motion-lab-loop-export-hint-note {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.motion-lab-loop-export-progress,
+.motion-lab-loop-export-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  min-width: 0;
+}
+
+.motion-lab-loop-export-progress-main {
+  display: grid;
+  flex: 1;
+  gap: 6px;
+  min-width: 0;
+}
+
+.motion-lab-loop-export-progress span {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.motion-lab-loop-export-bar {
+  position: relative;
+  overflow: hidden;
+  width: 100%;
+  height: 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  background: var(--surface-sunken);
+}
+
+.motion-lab-loop-export-bar-fill {
+  height: 100%;
+  border-radius: inherit;
+  background: var(--detect, #6ea8fe);
+  transition: width 0.15s ease-out;
+}
+
+.motion-lab-loop-export-bar.is-indeterminate .motion-lab-loop-export-bar-fill {
+  width: 36%;
+  animation: motion-lab-loop-export-indeterminate 1.1s ease-in-out infinite;
+}
+
+@keyframes motion-lab-loop-export-indeterminate {
+  0% { transform: translateX(-120%); }
+  100% { transform: translateX(320%); }
+}
+
+.motion-lab-loop-export-actions {
+  flex-wrap: wrap;
+}
+
+.motion-lab-loop-export-path {
+  display: none;
+}
+
 .motion-lab-segmented {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -5155,7 +5396,8 @@ body {
   min-height: 320px;
   overflow: hidden;
   border: 1px solid var(--border-color);
-  background: var(--surface-bg);
+  background: var(--checker), var(--surface-sunken);
+  background-size: 16px 16px;
 }
 
 .motion-tune-stage canvas {

@@ -146,11 +146,16 @@ export function motionLabHorizontalGazeAt(
 }
 
 /** 虹彩全体を各目の中心で伸縮する「瞳の呼吸」。中間値は抑え、最大で±4%。 */
-export function motionLabIrisBreathScale(timeMs: number, strength: number): number {
+export function motionLabIrisBreathScale(
+  timeMs: number,
+  strength: number,
+  periodMsOverride?: number,
+): number {
   const normalized = clamp(Number.isFinite(strength) ? strength : 0, 0, 1);
   const amount = normalized * normalized;
   if (amount <= 0) return 1;
-  const phase = (Math.max(0, timeMs) / 5200) * TAU + 0.65;
+  const periodMs = periodMsOverride && periodMsOverride > 0 ? periodMsOverride : 5200;
+  const phase = (Math.max(0, timeMs) / periodMs) * TAU + 0.65;
   return 1 + Math.sin(phase) * MOTION_LAB_IRIS_BREATH_MAX_SCALE_DELTA * amount;
 }
 
@@ -158,11 +163,16 @@ export function motionLabIrisBreathScale(timeMs: number, strength: number): numb
  * 下まぶた側の濡れ反射。
  * 中間値は自然な薄さに保ち、最大値では縮小表示でも見失わない34〜52%。
  */
-export function motionLabWetnessOpacity(timeMs: number, strength: number): number {
+export function motionLabWetnessOpacity(
+  timeMs: number,
+  strength: number,
+  periodMsOverride?: number,
+): number {
   const normalized = clamp(Number.isFinite(strength) ? strength : 0, 0, 1);
   const amount = Math.pow(normalized, 2.2);
   if (amount <= 0) return 0;
-  const phase = (Math.max(0, timeMs) / 4600) * TAU + 1.1;
+  const periodMs = periodMsOverride && periodMsOverride > 0 ? periodMsOverride : 4600;
+  const phase = (Math.max(0, timeMs) / periodMs) * TAU + 1.1;
   return amount * (0.43 + Math.sin(phase) * 0.09);
 }
 
