@@ -6,6 +6,11 @@ SpriTalkリポジトリでの実装作業者（AIモデル含む）向けの自�
 参照実装は本リポジトリ `reference/animation-lab/`（SpriTalkリポジトリの
 `samples/animation-lab/` と同一。ブランチ `claude/busy-haibt-144d8f` 参照）。
 
+**実機比較で見た目が一致しない場合は先に
+[handoff-spritalk-motion-algorithm.md](handoff-spritalk-motion-algorithm.md) を参照。**
+プロファイルJSONの数値だけでは再現できない計算式（視線振幅の実測方式、腕の
+アイドルスイング式、entryBounceの適用範囲等）を、Gen実装から厳密に転記しています。
+
 ## 採用決定事項（2026-07-04〜05 比較検証済み）
 
 | 項目 | 決定 |
