@@ -23,6 +23,10 @@ docs/*.patch
 # git履歴には残るが、以後はローカル専用の参考資料としてのみ保持する
 docs/_local-archive/
 
+# 852話/rotejin作品と比較するための独自検証ツール（第三者コードの同梱ではない）。
+# SpriTalk側の移植作業(Phase A/B/C、未着手)向けのローカル専用参考資料
+reference/
+
 # Model files (large binaries)
 src-tauri/models/*.onnx
 !src-tauri/models/rife.onnx

@@ -42,7 +42,6 @@
       "../licenses/NPM_DEPENDENCIES.html": "licenses/NPM_DEPENDENCIES.html",
       "../licenses/CARGO_DEPENDENCIES.html": "licenses/CARGO_DEPENDENCIES.html",
       "../licenses/SEE_THROUGH_PYTHON_DEPENDENCIES.html": "licenses/SEE_THROUGH_PYTHON_DEPENDENCIES.html",
-      "../docs/rife-model-provenance.md": "docs/rife-model-provenance.md",
       "../scripts/export_rife_v492_onnx.py": "scripts/export_rife_v492_onnx.py"
     },
     "icon": [

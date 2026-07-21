@@ -1,5 +1,5 @@
 /**
- * Motion Lab 物理エンジン — reference/animation-lab/js からの検証済み移植
+ * Motion Lab 物理エンジン — reference/animation-lab/js（ローカル専用、非トラッキング）からの検証済み移植
  *
  * 移植元:
  * - 02-utils.js        smoothDamp / 1D Perlinノイズ / alphaBBox（肩ピボット自動推定）

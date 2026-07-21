@@ -1,7 +1,7 @@
 # Build PachiPakuGen Tauri app (dev mode - fast compile)
 # Run this from PowerShell to ensure MSVC link.exe is used
 
-$repoRoot = $PSScriptRoot
+$repoRoot = Split-Path $PSScriptRoot -Parent
 $tauriRoot = Join-Path $repoRoot "src-tauri"
 Push-Location $tauriRoot
 

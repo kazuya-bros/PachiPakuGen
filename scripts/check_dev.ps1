@@ -1,5 +1,5 @@
 # Check PachiPakuGen Tauri app (dev mode - fast compile check only)
-$repoRoot = $PSScriptRoot
+$repoRoot = Split-Path $PSScriptRoot -Parent
 $tauriRoot = Join-Path $repoRoot "src-tauri"
 Push-Location $tauriRoot
 

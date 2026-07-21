@@ -90,13 +90,81 @@ PachiPakuGenの `src/motionLabPhysics.ts` にある髪房検出と房単位の�
 - Bundled file: `src-tauri/models/rife.onnx`
 - Bundled SHA-256: `0F9F5D969D5221DB40A30CC1C4CA9E66D34A408D8BDF146256121ED0304A25A6`
 - Reproducible exporter: [scripts/export_rife_v492_onnx.py](scripts/export_rife_v492_onnx.py)
-- Provenance and audited input hashes: [docs/rife-model-provenance.md](docs/rife-model-provenance.md)
 
 同梱ONNXは、Practical-RIFEが公開する公式v4.9.2モデルアーカイブの重みと公式実装から、PachiPakuGenの3入力インターフェース（`img0`、`img1`、`timestep`）へ再出力したものです。入力アーカイブ、重み、上流ソースのリビジョンを固定し、再出力スクリプトがハッシュ不一致を拒否します。
 
-上流のサンプリング格子キャッシュをそのままONNX化すると64×64の定数が埋め込まれるため、ONNX出力時の`warp`だけを、実行時サイズから同等のalign-corners格子を作るDirectML互換表現へ変更しています。公式IFNet、v4.9.2重み、ensemble処理、scale listは変更していません。変更内容と検証結果は出所文書に記録しています。
+上流のサンプリング格子キャッシュをそのままONNX化すると64×64の定数が埋め込まれるため、ONNX出力時の`warp`だけを、実行時サイズから同等のalign-corners格子を作るDirectML互換表現へ変更しています。公式IFNet、v4.9.2重み、ensemble処理、scale listは変更していません。
 
 以前同梱していた出所未確定のONNX（SHA-256 `76E4CEF9AB42FA7DD4E8F6E4ABA47462051E3FAA969E4BCA6479784FBAB0AC6F`）はv0.4.0の配布対象から削除しました。
+
+### 4.1 配布ファイル
+
+| File | Purpose | Size | SHA-256 |
+|---|---|---:|---|
+| `src-tauri/models/rife.onnx` | v0.4.0同梱モデル | 21,457,925 bytes | `0f9f5d969d5221db40a30cc1c4ca9e66d34a408d8bdf146256121ed0304a25a6` |
+| `scripts/export_rife_v492_onnx.py` | 再出力用スクリプト | － | `97caf968601bfdbe81614b746b8db26963852596daf730713c532a3fb3e6e8ad` |
+
+ONNXインターフェースは次のとおりです。
+
+- `img0`: float32 `[1, 3, height, width]`
+- `img1`: float32 `[1, 3, height, width]`
+- `timestep`: float32 `[1]`
+- `output`: float32 `[1, 3, height, width]`
+- height／widthは動的、opset 17
+- ensemble有効、scale listは`[8, 4, 2, 1]`
+
+PachiPakuGenは推論前に画像を64の倍数へパディングし、推論後に元の大きさへ戻します。
+
+### 4.2 監査済み入力
+
+| Input | Size | SHA-256 |
+|---|---:|---|
+| 公式v4.9.2 ZIP | 19,816,778 bytes | `f57de4828ae902eec5c1c518bec05edd510f37919b29d5c138cc0d9072b5b63c` |
+| `train_log/flownet.pkl` | 21,349,595 bytes | `ef91580a020abb7ddfbd3a51573dc395cf2c2a9530ff653ef3f8a1fc6845857f` |
+| `train_log/IFNet_HDv3.py` | 5,697 bytes | `fadb25d8fc3fb6bac52c834356b7b9e27422c9d5ebb060afe4790e2b52cb0f7b` |
+| `train_log/RIFE_HDv3.py` | 3,079 bytes | `5041316615eeb28c1101a764896522ba24316b8c8f6cb0d57358254551fd936d` |
+
+再出力スクリプトは、これらのハッシュまたはPractical-RIFEのリビジョンが一致しない場合に処理を中止します。
+
+### 4.3 ONNX出力時の互換変更
+
+公式`model.warplayer.warp`は、初回に使ったサンプリング格子をPython辞書へキャッシュします。通常の64×64トレースでは、その格子が定数としてONNXへ埋め込まれ、入出力の軸だけを動的にしても256×256以上のDirectML推論が失敗しました。
+
+そこで、ONNX出力時に限って`warp`の格子生成を変更しています。
+
+- 2×2の端点格子を実行時テンソルのheight／widthへbilinear resize
+- `align_corners=True`、border padding、flow正規化は上流と同じ
+- IFNet、v4.9.2重み、ensemble処理、scale listは変更しない
+- `Range`や固定64×64格子をDirectMLの主経路へ置かない
+
+これはPachiPakuGenの3入力・動的解像度ONNXへ変換するための変更であり、上流のPyTorchファイルや重みを配布物内で書き換えるものではありません。
+
+### 4.4 再出力手順
+
+Python 3.10.9、PyTorch 2.10.0、ONNX 1.17.0で監査した出力です。公式v4.9.2 ZIPを用意し、必要なら固定リビジョンのPractical-RIFEチェックアウトを渡します。
+
+```powershell
+python -m pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128
+python -m pip install onnx==1.17.0 onnxruntime==1.20.1 numpy
+python .\scripts\export_rife_v492_onnx.py `
+  --archive C:\path\to\Practical-RIFE-v4.9.2.zip `
+  --repo-dir C:\path\to\Practical-RIFE `
+  --output .\src-tauri\models\rife.onnx `
+  --verify-ort
+```
+
+`--repo-dir`を省略すると、一時ディレクトリへ公式リポジトリをcloneし、監査済みリビジョンをcheckoutします。
+
+### 4.5 検証結果
+
+- `onnx.checker.check_model`合格
+- ONNX Runtime CPUで64／256／512pxの動的入力を確認
+- 同じDirectMLセッションで64／256／512／1280pxを切り替え、有限値の正しい出力形状を確認
+- 256pxのプロファイルで動的格子のResize、Add、全GridSampleがDirectML上で実行
+- Rustアプリと同じセッション生成・素体合成・差分再抽出経路で64／256／512／1280px、各3フレームを生成
+- 64pxでは、最初の公式重み再出力版と全3フレームがピクセル単位で一致（最大差0）
+
+正式配布前には、アプリの実画像を使った64／256／512／1280px推論とSTEP 6の回帰確認を、リリース前チェックリストに従って再実施します。
 
 ## 5. JavaScript・Rust・Python依存関係
 
