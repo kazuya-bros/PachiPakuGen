@@ -327,18 +327,23 @@ fn parse_draw_order(value: &Value) -> Option<Vec<String>> {
 
 /// layer-order.json（{"drawOrder": ["hair_back", ...]}）を読む。無ければ空。
 /// SpriTalk書き出し完了後は単体ファイルが消え、spritalk-motion-profile.jsonの
-/// layerOrder.drawOrderへ統合されているためそちらも見る
+/// layerOrder.drawOrderへ統合されているためそちらも見る。
+/// 再保存でprofileから落ちた壊れた成果物向けに、base_partsの原本も見る。
 fn read_layer_draw_order(root: &Path, warnings: &mut Vec<String>) -> Vec<String> {
     let standalone = fs::read(root.join("layer-order.json"))
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .and_then(|value| parse_draw_order(&value));
-    let parsed = standalone.or_else(|| {
-        fs::read(root.join("spritalk-motion-profile.json"))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .and_then(|value| value.get("layerOrder").and_then(parse_draw_order))
-    });
+    let parsed = standalone
+        .or_else(|| {
+            fs::read(root.join("spritalk-motion-profile.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|value| value.get("layerOrder").and_then(parse_draw_order))
+        })
+        .or_else(|| {
+            read_workspace_base_layer_order_document(root).and_then(|value| parse_draw_order(&value))
+        });
     match parsed {
         Some(order) if !order.is_empty() => order,
         _ => {
@@ -502,29 +507,67 @@ fn load_spritalk_motion_profile_inner(
 
 /// SpriTalkへ渡す成果物をspritalk-motion-profile.json 1本にまとめるため、
 /// 併存していたlayer-order.json（描画順）とREADME.txt（案内文）の内容を
-/// layerOrder/readmeフィールドへ吸収し、元の2ファイルは削除する
+/// layerOrder/readmeフィールドへ吸収し、元の2ファイルは削除する。
+///
+/// フロントは再保存のたびに layerOrder/readme 無しの新規JSONを渡すため、
+/// 単体ファイルが既に消えている場合は既存profileの同フィールドを引き継ぐ。
+/// それも無い壊れた成果物向けに、ワークスペースの base_parts/layer-order.json
+/// からも復旧する。
 fn fold_companion_files_into_profile(root: &Path, mut profile: Value) -> Value {
     let layer_order_path = root.join("layer-order.json");
-    if let Some(layer_order) = fs::read(&layer_order_path)
+    let readme_path = root.join("README.txt");
+    let existing_profile = fs::read(root.join("spritalk-motion-profile.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+
+    let layer_order = fs::read(&layer_order_path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-    {
+        .or_else(|| {
+            existing_profile
+                .as_ref()
+                .and_then(|value| value.get("layerOrder").cloned())
+        })
+        .or_else(|| read_workspace_base_layer_order_document(root));
+    if let Some(layer_order) = layer_order {
         if let Some(map) = profile.as_object_mut() {
             map.insert("layerOrder".to_string(), layer_order);
         }
     }
-    let readme_path = root.join("README.txt");
-    if let Ok(readme) = fs::read_to_string(&readme_path) {
+
+    let readme = fs::read_to_string(&readme_path).ok().or_else(|| {
+        existing_profile
+            .as_ref()
+            .and_then(|value| value.get("readme").and_then(Value::as_str).map(str::to_owned))
+    });
+    if let Some(readme) = readme {
         if let Some(map) = profile.as_object_mut() {
             map.insert("readme".to_string(), Value::String(readme));
         }
     }
+
     for path in [layer_order_path, readme_path] {
         if path.is_file() {
             let _ = fs::remove_file(path);
         }
     }
     profile
+}
+
+/// 04_spritalk_parts から見て、STEP4が残した base_parts/layer-order.json を読む。
+fn read_workspace_base_layer_order_document(root: &Path) -> Option<Value> {
+    let workspace = workspace_root_of(root)?;
+    [
+        workspace
+            .join("03_see_through")
+            .join("base_parts")
+            .join("layer-order.json"),
+        workspace.join("base_parts").join("layer-order.json"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    .and_then(|path| fs::read(path).ok())
+    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
 }
 
 fn save_spritalk_motion_profile_inner(
@@ -1556,6 +1599,119 @@ mod tests {
         assert!(parts.warnings.is_empty());
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resaving_spritalk_profile_preserves_previously_folded_layer_order_and_readme() {
+        let root = std::env::temp_dir().join(format!(
+            "pachipakugen_profile_resave_preserve_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("layer-order.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "formatVersion": 1,
+                "drawOrder": ["arm_r", "body", "arm_r_overlay_patch_hand", "arm_l", "hair"],
+                "linkedParts": {
+                    "arm_r_overlay_patch_hand": { "parent": "arm_r" }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(root.join("README.txt"), "keep me\n").unwrap();
+
+        save_spritalk_motion_profile_inner(
+            &root.to_string_lossy(),
+            serde_json::json!({ "schema": "spritalk.motionProfile.v2", "motionScale": 1 }),
+        )
+        .expect("first save folds companions");
+        assert!(!root.join("layer-order.json").is_file());
+
+        // フロントは再保存時に layerOrder/readme 無しの新規JSONを渡す
+        let resaved = save_spritalk_motion_profile_inner(
+            &root.to_string_lossy(),
+            serde_json::json!({
+                "schema": "spritalk.motionProfile.v2",
+                "motionScale": 1.2,
+                "physics": { "arm": { "behindBody": false } }
+            }),
+        )
+        .expect("second save must preserve folded fields");
+
+        assert_eq!(resaved.profile["motionScale"], serde_json::json!(1.2));
+        assert_eq!(
+            resaved.profile["layerOrder"]["drawOrder"],
+            serde_json::json!(["arm_r", "body", "arm_r_overlay_patch_hand", "arm_l", "hair"])
+        );
+        assert_eq!(
+            resaved.profile["layerOrder"]["linkedParts"]["arm_r_overlay_patch_hand"]["parent"],
+            serde_json::json!("arm_r")
+        );
+        assert_eq!(resaved.profile["readme"], serde_json::json!("keep me\n"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_and_resave_recover_layer_order_from_workspace_base_parts() {
+        let workspace = std::env::temp_dir().join(format!(
+            "pachipakugen_layer_order_base_recover_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let parts_dir = workspace.join("04_spritalk_parts");
+        let base_dir = workspace.join("03_see_through").join("base_parts");
+        fs::create_dir_all(&parts_dir).unwrap();
+        fs::create_dir_all(&base_dir).unwrap();
+        write_test_project(&workspace, 7);
+        DynamicImage::new_rgba8(2, 2)
+            .save(parts_dir.join("body.png"))
+            .unwrap();
+        fs::write(
+            base_dir.join("layer-order.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "formatVersion": 1,
+                "drawOrder": ["arm_r", "body", "arm_r_overlay_patch_hand", "hair"]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        // 再保存で落ちた壊れたprofile（layerOrder無し）
+        fs::write(
+            parts_dir.join("spritalk-motion-profile.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": "spritalk.motionProfile.v2",
+                "motionScale": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let parts = load_motion_lab_parts_inner(&parts_dir.to_string_lossy()).expect("load");
+        assert_eq!(
+            parts.layer_order,
+            vec!["arm_r", "body", "arm_r_overlay_patch_hand", "hair"]
+        );
+        assert!(parts.warnings.is_empty());
+
+        let saved = save_spritalk_motion_profile_inner(
+            &parts_dir.to_string_lossy(),
+            serde_json::json!({ "schema": "spritalk.motionProfile.v2", "motionScale": 0.9 }),
+        )
+        .expect("resave heals profile");
+        assert_eq!(
+            saved.profile["layerOrder"]["drawOrder"],
+            serde_json::json!(["arm_r", "body", "arm_r_overlay_patch_hand", "hair"])
+        );
+
+        let _ = fs::remove_dir_all(workspace);
     }
 
     fn encoded_test_frame(r: u8) -> String {
