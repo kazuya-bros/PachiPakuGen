@@ -65,6 +65,8 @@ pub fn run() {
             commands::expression::preview_codex_composite,
             commands::expression::generate_codex_rife_outputs,
             commands::expression::save_codex_base_parts,
+            commands::expression::save_base_editor_state,
+            commands::expression::load_base_editor_state,
             commands::expression::adjust_codex_extracted_parts_batch,
             commands::expression::generate_expression_set,
             commands::motion_lab::load_motion_lab_parts,

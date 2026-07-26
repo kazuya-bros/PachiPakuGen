@@ -7,7 +7,7 @@ import {
   resolveMotionLabChestWarpRegion,
 } from "../src/motionLab/chestWarp.ts";
 
-test("chest guide selects the local warp center without becoming a draw layer", () => {
+test("chest cutout guide is used as-is for the warp center", () => {
   const region = resolveMotionLabChestWarpRegion(
     1000,
     800,
@@ -16,12 +16,22 @@ test("chest guide selects the local warp center without becoming a draw layer", 
   );
   assert.equal(region.centerX, 500);
   assert.equal(region.centerY, 410);
+  assert.ok(region.radiusX >= 220 * 0.42);
+  assert.ok(region.radiusY >= 120 * 0.42);
 });
 
-test("body bounds provide a restrained fallback when chest.png is absent", () => {
+test("low-painted cutouts are NOT relocated to an estimated bust position", () => {
+  const body = { x: 390, y: 214, w: 548, h: 1066 };
+  const lowGuide = { x: 403, y: 785, w: 420, h: 327 };
+  const region = resolveMotionLabChestWarpRegion(1280, 1280, body, lowGuide);
+  assert.equal(region.centerX, 403 + 420 * 0.5);
+  assert.equal(region.centerY, 785 + 327 * 0.5);
+});
+
+test("body bounds provide a fallback only when chest.png is absent", () => {
   const region = resolveMotionLabChestWarpRegion(1000, 800, { x: 200, y: 80, w: 600, h: 700 });
   assert.equal(region.centerX, 500);
-  assert.equal(region.centerY, 430);
+  assert.equal(region.centerY, 80 + 700 * 0.42);
   const bounds = motionLabChestWarpBounds(1000, 800, region);
   assert.ok(bounds.x > 0 && bounds.y > 0);
   assert.ok(bounds.x + bounds.w < 1000 && bounds.y + bounds.h < 800);

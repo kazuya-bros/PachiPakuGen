@@ -237,7 +237,7 @@ function applyManifest(state: MotionLabSettings, manifest: MotionLabManifest): M
     if (typeof physics.armSwayAmp === "number") next.armSwayAmp = clamp(physics.armSwayAmp, 0, 3);
     if (typeof physics.armPivotRatio === "number") next.armPivotRatio = clamp(physics.armPivotRatio, 0, 0.6);
     if (typeof physics.liftEnabled === "boolean") next.effects.lift = physics.liftEnabled;
-    if (typeof physics.chestMax === "number") next.chestMax = clamp(physics.chestMax, 0, 8);
+    if (typeof physics.chestMax === "number") next.chestMax = clamp(physics.chestMax, 0, 12);
     if (typeof physics.hairBackScale === "number") next.hairBackScale = clamp(physics.hairBackScale, 0, 1.5);
     if (typeof physics.earTwitch === "boolean") next.effects.earTwitch = physics.earTwitch;
     if (physics.earTwitchMode === "bounce" || physics.earTwitchMode === "tilt" || physics.earTwitchMode === "double") {
@@ -349,7 +349,7 @@ export function motionLabSettingsReducer(
         hairWaveStrength: clamp(Number(((template?.hairWaveStrength ?? 1) * scale).toFixed(3)), 0, 2),
         pyokoBounce: clamp(Number(((template?.pyokoBounce ?? 3) * scale).toFixed(2)), 0, 7),
         armMaxAngle: clamp(Number(((template?.armMaxAngle ?? MOTION_LAB_ARM_DEFAULTS.maxAngle) * scale).toFixed(3)), 0, 0.3),
-        chestMax: clamp(Number(((template?.chestMax ?? MOTION_LAB_CHEST_DEFAULTS.max) * scale).toFixed(1)), 0, 8),
+        chestMax: clamp(Number(((template?.chestMax ?? MOTION_LAB_CHEST_DEFAULTS.max) * scale).toFixed(1)), 0, 12),
         parallaxScale: clamp(Number(((template?.parallax ?? 1) * scale).toFixed(3)), 0, 1.5),
       };
     }

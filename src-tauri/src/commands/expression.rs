@@ -361,6 +361,58 @@ pub async fn save_codex_base_parts(
         .map_err(|error| AppError::General(format!("Task join error: {error}")))?
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaseEditorLayerPatch {
+    pub id: String,
+    pub name: String,
+    pub source_layer: String,
+    pub mask_png: String,
+    pub cut_source: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaseEditorPersistedState {
+    pub format_version: u32,
+    pub layer_mapping: HashMap<String, String>,
+    pub layer_order: Vec<String>,
+    pub enabled_layers: HashMap<String, bool>,
+    pub layer_opacities: HashMap<String, f32>,
+    pub layer_patches: Vec<BaseEditorLayerPatch>,
+    #[serde(default)]
+    pub chest_mask_png: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveBaseEditorStateRequest {
+    pub job_path: String,
+    pub state: BaseEditorPersistedState,
+}
+
+#[tauri::command]
+pub async fn save_base_editor_state(
+    request: SaveBaseEditorStateRequest,
+) -> Result<String, AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        save_base_editor_state_inner(&request.job_path, &request.state)
+    })
+    .await
+    .map_err(|error| AppError::General(format!("Task join error: {error}")))?
+}
+
+#[tauri::command]
+pub async fn load_base_editor_state(
+    job_path: String,
+) -> Result<Option<BaseEditorPersistedState>, AppError> {
+    tauri::async_runtime::spawn_blocking(move || load_base_editor_state_inner(&job_path))
+        .await
+        .map_err(|error| AppError::General(format!("Task join error: {error}")))?
+}
+
 #[tauri::command]
 pub async fn adjust_codex_extracted_parts_batch(
     request: AdjustCodexExtractedPartsBatchRequest,
@@ -665,6 +717,82 @@ fn save_codex_base_parts_inner(
         base_parts_path: output_dir.to_string_lossy().into_owned(),
         saved_parts,
     })
+}
+
+fn base_editor_state_path(output_dir: &Path) -> PathBuf {
+    output_dir.join("base-editor-state.json")
+}
+
+fn save_base_editor_state_inner(
+    job_path: &str,
+    state: &BaseEditorPersistedState,
+) -> Result<String, AppError> {
+    let job_dir = PathBuf::from(job_path);
+    if !job_dir.is_dir() {
+        return Err(AppError::General(format!(
+            "作業フォルダが見つかりません: {}",
+            job_dir.display()
+        )));
+    }
+    let output_dir = base_parts_dir(&job_dir);
+    fs::create_dir_all(&output_dir)?;
+    let path = base_editor_state_path(&output_dir);
+    let mut document = state.clone();
+    document.format_version = 1;
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&document)
+            .map_err(|error| AppError::General(format!("base-editor-state.json作成失敗: {error}")))?,
+    )?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+fn load_base_editor_state_inner(
+    job_path: &str,
+) -> Result<Option<BaseEditorPersistedState>, AppError> {
+    let job_dir = PathBuf::from(job_path);
+    let output_dir = base_parts_dir(&job_dir);
+    let path = base_editor_state_path(&output_dir);
+    let mut state = if path.is_file() {
+        serde_json::from_slice::<BaseEditorPersistedState>(&fs::read(&path)?).map_err(|error| {
+            AppError::General(format!("base-editor-state.json読込失敗: {error}"))
+        })?
+    } else {
+        return Ok(chest_mask_fallback_state(&output_dir));
+    };
+    if state
+        .chest_mask_png
+        .as_ref()
+        .is_none_or(|value| value.trim().is_empty())
+    {
+        if let Some(mask) = chest_mask_data_url_from_chest_png(&output_dir) {
+            state.chest_mask_png = Some(mask);
+        }
+    }
+    Ok(Some(state))
+}
+
+/// 再編集状態が無い／胸部マスクだけ欠けている場合、互換用chest.pngからガイドを復元する。
+fn chest_mask_fallback_state(output_dir: &Path) -> Option<BaseEditorPersistedState> {
+    let mask = chest_mask_data_url_from_chest_png(output_dir)?;
+    Some(BaseEditorPersistedState {
+        format_version: 1,
+        layer_mapping: HashMap::new(),
+        layer_order: Vec::new(),
+        enabled_layers: HashMap::new(),
+        layer_opacities: HashMap::new(),
+        layer_patches: Vec::new(),
+        chest_mask_png: Some(mask),
+    })
+}
+
+fn chest_mask_data_url_from_chest_png(output_dir: &Path) -> Option<String> {
+    let path = output_dir.join("chest.png");
+    if !path.is_file() {
+        return None;
+    }
+    let image = image::open(path).ok()?;
+    Some(image_utils::image_to_base64_png(&image))
 }
 
 /// Step4のunifiedレイヤー順から導出したグループ描画順（背面→前面）を
@@ -5079,6 +5207,69 @@ mod tests {
             base_parts_dir(&root),
             root.join(WORKSPACE_SEE_THROUGH_DIR).join("base_parts")
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn base_editor_state_roundtrips_and_restores_chest_mask_from_png() {
+        let root = std::env::temp_dir().join(format!(
+            "pachipakugen_base_editor_state_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ));
+        let base_dir = root.join(WORKSPACE_SEE_THROUGH_DIR).join("base_parts");
+        fs::create_dir_all(&base_dir).unwrap();
+
+        let mut mapping = HashMap::new();
+        mapping.insert("handwear-l".into(), "arm_l".into());
+        let mut enabled = HashMap::new();
+        enabled.insert("face".into(), true);
+        let mut opacities = HashMap::new();
+        opacities.insert("face".into(), 0.5);
+        let state = BaseEditorPersistedState {
+            format_version: 1,
+            layer_mapping: mapping,
+            layer_order: vec!["face".into(), "topwear".into()],
+            enabled_layers: enabled,
+            layer_opacities: opacities,
+            layer_patches: vec![BaseEditorLayerPatch {
+                id: "patch_1".into(),
+                name: "handwear-l_patch_1".into(),
+                source_layer: "handwear-l".into(),
+                mask_png: "data:image/png;base64,aaa".into(),
+                cut_source: true,
+                thumbnail: None,
+            }],
+            chest_mask_png: Some("data:image/png;base64,bbb".into()),
+        };
+
+        let saved_path = save_base_editor_state_inner(&root.to_string_lossy(), &state).unwrap();
+        assert!(PathBuf::from(&saved_path).is_file());
+
+        let loaded = load_base_editor_state_inner(&root.to_string_lossy())
+            .unwrap()
+            .expect("saved state");
+        assert_eq!(loaded.layer_order, vec!["face", "topwear"]);
+        assert_eq!(loaded.layer_mapping.get("handwear-l").map(String::as_str), Some("arm_l"));
+        assert_eq!(loaded.layer_patches.len(), 1);
+        assert_eq!(loaded.chest_mask_png.as_deref(), Some("data:image/png;base64,bbb"));
+
+        // 状態ファイルが無くても chest.png から胸部ガイドを復元できる
+        fs::remove_file(base_editor_state_path(&base_dir)).unwrap();
+        DynamicImage::new_rgba8(4, 4)
+            .save(base_dir.join("chest.png"))
+            .unwrap();
+        let fallback = load_base_editor_state_inner(&root.to_string_lossy())
+            .unwrap()
+            .expect("chest fallback");
+        assert!(fallback
+            .chest_mask_png
+            .as_ref()
+            .is_some_and(|value| value.starts_with("data:image/png;base64,")));
+        assert!(fallback.layer_order.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }

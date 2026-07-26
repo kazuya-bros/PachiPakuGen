@@ -20,6 +20,7 @@ import {
 } from "../motionLabPhysics";
 import {
   motionLabChestWarpBounds,
+  motionLabChestWarpVerticalRadius,
   resolveMotionLabChestWarpRegion,
 } from "./chestWarp";
 import {
@@ -347,7 +348,9 @@ export function drawMotionLabChestWarp(
     xWeights[localX] = Math.exp(-0.5 * nx * nx);
   }
   for (let localY = 0; localY < bounds.h; localY += 1) {
-    const ny = (bounds.y + localY - region.centerY) / Math.max(1, region.radiusY);
+    const y = bounds.y + localY;
+    const radiusY = motionLabChestWarpVerticalRadius(region, y);
+    const ny = (y - region.centerY) / radiusY;
     yWeights[localY] = Math.exp(-0.5 * ny * ny);
   }
   for (let localY = 0; localY < bounds.h; localY += 1) {
@@ -1411,18 +1414,24 @@ export function drawMotionLabScene(
   }
 
   // ===== 胸部追従: 体・衣服の局所ワープを駆動する強減衰バネ =====
-  // 独立発振ではなく、呼吸・発話バウンスを含む体のY速度へ控えめに遅れて追従する。
-  // 発話バウンス無効時だけ、ごく弱い撃力と揺らぎを加える。
+  // 主駆動は呼吸に少し遅れた上下（視認できる胸部のやわらかさ）。
+  // 体のY速度追従と発話時の撃力は二次成分。速度追従だけではサブピクセルになり見えない。
   let chestOffsetY = 0;
   if (animateParts && settings.chestMax > 0) {
     const pyokoActive = settings.pyokoBounce > 0;
-    if (speechStarted) ph.chest.v += pyokoActive ? 4 : 8;
+    if (speechStarted) ph.chest.v += pyokoActive ? 6 : 10;
+    const breathLag = Math.sin(ph.breathPhase - 0.5) * settings.chestMax * 0.65;
+    const velocityFollow = clamp(-0.35 * ph.rootVY, -settings.chestMax, settings.chestMax);
     const chestNoise = pyokoActive
       ? 0
       : (loopSeconds > 0
         ? noise1dLoop(ph.noiseT * 0.8 + 13.7, 0.8 * loopSeconds)
-        : noise1d(ph.noiseT * 0.8 + 13.7)) * settings.chestMax * 0.08;
-    const driveY = clamp(-0.16 * ph.rootVY + chestNoise, -settings.chestMax, settings.chestMax);
+        : noise1d(ph.noiseT * 0.8 + 13.7)) * settings.chestMax * 0.12;
+    const driveY = clamp(
+      breathLag + velocityFollow * 0.4 + chestNoise,
+      -settings.chestMax,
+      settings.chestMax,
+    );
     springStep(ph.chest, driveY, MOTION_LAB_CHEST_DEFAULTS.k, MOTION_LAB_CHEST_DEFAULTS.c, dt);
     ph.chest.x = clamp(ph.chest.x, -settings.chestMax, settings.chestMax);
     chestOffsetY = ph.chest.x;

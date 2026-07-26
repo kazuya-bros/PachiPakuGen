@@ -9,6 +9,17 @@ export interface RenderCategoryResult { preview: string; }
 export interface CreateBaseResult { output_path: string; composite_preview: string; base_eye_slot: string; base_mouth_slot: string; file_count: number; }
 export interface ProgressPayload { current: number; total: number; pair_name: string; }
 export interface LayerPatch { id: string; name: string; sourceLayer: string; maskPng: string; cutSource: boolean; thumbnail?: string; }
+
+/** STEP4素体調整の再編集用。base_parts/base-editor-state.json に保存する。 */
+export interface BaseEditorPersistedState {
+  formatVersion: number;
+  layerMapping: Record<string, string>;
+  layerOrder: string[];
+  enabledLayers: Record<string, boolean>;
+  layerOpacities: Record<string, number>;
+  layerPatches: LayerPatch[];
+  chestMaskPng: string | null;
+}
 export type PreviewPan = { x: number; y: number };
 export type WorkspaceStep = 1 | 2 | 3 | 4 | 5 | 6 | 7;
 export type WorkspaceMouthCornerMode = "source" | "up" | "flat" | "down";

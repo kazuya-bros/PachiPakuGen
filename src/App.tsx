@@ -15,6 +15,7 @@ import {
   type CreateBaseResult,
   type ProgressPayload,
   type LayerPatch,
+  type BaseEditorPersistedState,
   type PreviewPan,
   type WorkspaceStep,
   type WorkspaceMouthCornerMode,
@@ -849,7 +850,22 @@ function App() {
         overlapHighlight,
       });
       setBodyPreview(result.preview);
-    } catch (e) { console.error("render error:", e); }
+      return true;
+    } catch (e) {
+      console.error("render error:", e);
+      setError(String(e));
+      return false;
+    }
+  }
+
+  /** create_base後はRust側PSDスロットが空になる。UIに古いpreviewが残っていても再読込が必要。 */
+  async function ensureWorkspaceBaseSlotLoaded(): Promise<boolean> {
+    try {
+      await invoke<MappingPreviewResult>("get_all_layers_preview");
+      return true;
+    } catch {
+      return openWorkspaceBaseAdjustment();
+    }
   }
 
   async function handleLayerToggle(name: string, checked: boolean) {
@@ -918,18 +934,13 @@ function App() {
   async function toggleOverlapHighlight() {
     const next = !overlapHighlightEnabled;
     setOverlapHighlightEnabled(next);
-    const active = [...layerOrderRef.current.filter(name => enabledLayers[name] !== false)].reverse();
-    try {
-      const result = await invoke<RenderCategoryResult>("render_category", {
-        mappingJson: JSON.stringify(layerMapping),
-        target: "body",
-        enabledLayers: active,
-        layerPatches: layerPatchesRef.current,
-        layerOpacities: layerOpacitiesRef.current,
-        overlapHighlight: next,
-      });
-      setBodyPreview(result.preview);
-    } catch (e) { console.error("render error:", e); }
+    await renderBody(
+      layerOrderRef.current,
+      enabledLayersRef.current,
+      layerPatchesRef.current,
+      layerOpacitiesRef.current,
+      next,
+    );
   }
 
   function createDefaultOpacities(order: string[]): Record<string, number> {
@@ -1272,13 +1283,33 @@ function App() {
         chestMaskPng: chestMaskDataUrl,
       });
       await invoke<SaveCodexBasePartsResult>("save_codex_base_parts", { jobPath: workspacePath });
+      // 再編集で並び順・切り出し・胸部範囲・透明度を復元するため、UI状態をdiskへ残す。
+      await invoke<string>("save_base_editor_state", {
+        request: {
+          jobPath: workspacePath,
+          state: buildBaseEditorPersistedState(),
+        },
+      });
+      // STEP4保存ではeyes-openが素体から再生成される。保存済みSTEP5補正を再適用した
+      // 最新のextractedPartsをdiskから読み直し、既定値の下書きで上書きしない。
+      const reloadedJob = await invoke<LoadCodexExpressionJobResult>("load_codex_expression_job", {
+        jobPath: workspacePath,
+      });
+      const refreshedExtractResult = reloadedJob.extractedParts ?? workspaceExtractResult;
+      if (!refreshedExtractResult) {
+        throw new Error("STEP5の差分パーツを再読込できませんでした");
+      }
+      setWorkspaceExtractResult(refreshedExtractResult);
       // 素体画像とlayer-order.jsonが更新された時点で、同じ出力フォルダを参照する
       // 既存のRIFE/Motion Lab結果は古い。再生成されるまで下流を無効化する。
       setWorkspaceRifeResult(null);
       setMotionProfileReady(false);
-      await refreshWorkspaceCompositePreview();
+      const refreshedPreview = await refreshWorkspaceCompositePreview();
       await setWorkspaceStepAfterEdit(5);
-      setWorkspaceInlineEditor("position");
+      // create_baseはRust側slot_layersをクリアする。UIに古い1枚絵previewと
+      // loadResultが残ると、再編集時に透明度・表示切替が効かない。
+      resetWorkspaceBaseEditorState();
+      initializeWorkspacePositionEditor(refreshedExtractResult, refreshedPreview);
       setStatus("素体を作業フォルダに保存しました。差分位置調整へ進めます。");
     } catch (e) {
       await reloadWorkspaceAfterMutationFailure(workspacePath);
@@ -1715,10 +1746,22 @@ function App() {
         if (/^handwear[-_][lr]$/i.test(name)) defaultMapping[name] = /[-_]r$/i.test(name) ? "arm_r" : "arm_l";
       }
       setLoadResult(base.slotLoad);
-      setLayerMapping(defaultMapping);
       const allPreview = await invoke<MappingPreviewResult>("get_all_layers_preview");
       setMappingPreview(allPreview);
-      await openUnifiedBaseEditorWithPreview(allPreview);
+      let savedState: BaseEditorPersistedState | null = null;
+      try {
+        savedState = await invoke<BaseEditorPersistedState | null>("load_base_editor_state", {
+          jobPath: workspace.workPath,
+        });
+      } catch {
+        savedState = null;
+      }
+      if (savedState && (savedState.layerOrder?.length || savedState.chestMaskPng || savedState.layerPatches?.length)) {
+        await applyBaseEditorPersistedState(allPreview, defaultMapping, savedState);
+      } else {
+        setLayerMapping(defaultMapping);
+        await openUnifiedBaseEditorWithPreview(allPreview);
+      }
       return true;
     } catch (cause) {
       setError(String(cause));
@@ -1728,18 +1771,96 @@ function App() {
     }
   }
 
+  function buildBaseEditorPersistedState(): BaseEditorPersistedState {
+    return {
+      formatVersion: 1,
+      layerMapping: { ...layerMapping },
+      layerOrder: [...layerOrderRef.current],
+      enabledLayers: { ...enabledLayersRef.current },
+      layerOpacities: { ...layerOpacitiesRef.current },
+      layerPatches: layerPatchesRef.current.map(patch => ({ ...patch })),
+      chestMaskPng: chestMaskDataUrl,
+    };
+  }
+
+  async function applyBaseEditorPersistedState(
+    preview: MappingPreviewResult,
+    defaultMapping: Record<string, string>,
+    saved: BaseEditorPersistedState,
+  ) {
+    const freeCat = preview.categories.find(c => c.target === "free");
+    const layers = freeCat?.layers ?? preview.categories.flatMap(c => c.layers);
+    const available = new Set(layers.map(layer => layer.name));
+    const patches = (saved.layerPatches ?? []).filter(patch => available.has(patch.sourceLayer));
+    const patchIds = new Set(patches.map(patch => patch.id));
+    const orderFromSaved = (saved.layerOrder ?? []).filter(name => available.has(name) || patchIds.has(name));
+    const missing = layers.map(layer => layer.name).filter(name => !orderFromSaved.includes(name));
+    const order = orderFromSaved.length > 0
+      ? [...orderFromSaved, ...missing]
+      : recommendedUnifiedLayerOrder(layers.map(layer => layer.name));
+    const mapping = { ...defaultMapping };
+    for (const [name, target] of Object.entries(saved.layerMapping ?? {})) {
+      if (available.has(name) && typeof target === "string" && target) {
+        mapping[name] = target;
+      }
+    }
+    const enabled: Record<string, boolean> = {};
+    const opacities: Record<string, number> = {};
+    for (const name of order) {
+      enabled[name] = saved.enabledLayers?.[name] ?? true;
+      const opacity = saved.layerOpacities?.[name];
+      opacities[name] = typeof opacity === "number" ? Math.max(0, Math.min(1, opacity)) : 0.5;
+    }
+    setLayerMapping(mapping);
+    setLayerOrder(order);
+    layerOrderRef.current = order;
+    setLayerPatches(patches);
+    layerPatchesRef.current = patches;
+    setPatchDraftSource("");
+    setSelectedBodyLayer(order[0] ?? "");
+    setEnabledLayers(enabled);
+    enabledLayersRef.current = enabled;
+    setLayerOpacities(opacities);
+    layerOpacitiesRef.current = opacities;
+    setChestMaskDataUrl(saved.chestMaskPng ?? null);
+    await renderBody(order, enabled, patches, opacities);
+    resetZoom();
+    setStatus("Step 4: 前回の素体調整を復元しました");
+  }
+
   async function startInlineBaseEditor() {
     if (!expressionWorkspace) return;
     setError("");
     setWorkspaceInlineEditor("base");
     setWorkspaceEditorPreparing(true);
     try {
-      // 同じセッションでの再編集なら、保存前の並び順や表示状態を維持する。
-      if (!mappingPreview || !bodyPreview || !loadResult) {
+      // 未保存の下書きがある初回編集中はUI状態を維持する。ただしcreate_base後は
+      // Rust側PSDが空でもUIに古いpreviewが残るため、スロット生存を必ず確認する。
+      const hasUiState = !!(mappingPreview && bodyPreview && loadResult);
+      if (!hasUiState) {
         const opened = await openWorkspaceBaseAdjustment();
         if (!opened) {
           setWorkspaceInlineEditor(null);
           return;
+        }
+      } else {
+        const loaded = await ensureWorkspaceBaseSlotLoaded();
+        if (!loaded) {
+          setWorkspaceInlineEditor(null);
+          return;
+        }
+        const rendered = await renderBody(
+          layerOrderRef.current,
+          enabledLayersRef.current,
+          layerPatchesRef.current,
+          layerOpacitiesRef.current,
+        );
+        if (!rendered) {
+          const reopened = await openWorkspaceBaseAdjustment();
+          if (!reopened) {
+            setWorkspaceInlineEditor(null);
+            return;
+          }
         }
       }
       setStatus("素体のレイヤー順・表示・分離を調整します");
@@ -1748,32 +1869,41 @@ function App() {
     }
   }
 
-  async function startInlinePositionEditor() {
-    if (!expressionWorkspace || !workspaceExtractResult || !workspaceCompositePreview?.basePreview) return;
-    setError("");
-    const initialDrafts = createWorkspacePartAdjustmentDrafts(workspaceExtractResult.partAdjustments);
+  function initializeWorkspacePositionEditor(
+    extractResult: ExtractCodexGeneratedPartsResult,
+    preview: PreviewCodexCompositeResult | undefined,
+  ) {
+    const initialDrafts = createWorkspacePartAdjustmentDrafts(extractResult.partAdjustments);
     workspacePartDraftsRef.current = initialDrafts;
     workspacePartEditorBaseline.current = cloneWorkspacePartAdjustmentDrafts(initialDrafts);
     setWorkspacePartDrafts(initialDrafts);
     workspacePartPersistedDuringEditor.current = false;
     setWorkspacePartSaving(false);
+
+    const available = preview?.previews.map(item => item.part) ?? [];
+    const target = available.includes(workspaceAdjustTarget)
+      && WORKSPACE_ADJUST_PART_KEYS.includes(workspaceAdjustTarget)
+      ? workspaceAdjustTarget
+      : (available.includes("eyes-open") ? "eyes-open" : available.find(part => WORKSPACE_ADJUST_PART_KEYS.includes(part)));
+    if (!target) throw new Error("位置調整できる目・口パーツがありません");
+
+    setWorkspaceSelectedPreviewPart(target);
+    setWorkspaceAdjustTarget(target);
+    setWorkspacePartDragMode(true);
+    loadWorkspacePartAdjustmentFields(target);
     setWorkspaceInlineEditor("position");
+  }
+
+  async function startInlinePositionEditor() {
+    if (!expressionWorkspace || !workspaceExtractResult || !workspaceCompositePreview?.basePreview) return;
+    setError("");
     setWorkspaceEditorPreparing(true);
     try {
       // 起動時はbase-onlyで高速復元する。表情サムネイルは編集開始時だけ展開する。
       const preview = workspaceCompositePreview.previews.length === 0
         ? await refreshWorkspaceCompositePreview(expressionWorkspace, false)
         : workspaceCompositePreview;
-      const available = preview?.previews.map(item => item.part) ?? [];
-      const target = available.includes(workspaceAdjustTarget)
-        && WORKSPACE_ADJUST_PART_KEYS.includes(workspaceAdjustTarget)
-        ? workspaceAdjustTarget
-        : (available.includes("eyes-open") ? "eyes-open" : available.find(part => WORKSPACE_ADJUST_PART_KEYS.includes(part)));
-      if (!target) throw new Error("位置調整できる目・口パーツがありません");
-      setWorkspaceSelectedPreviewPart(target);
-      setWorkspaceAdjustTarget(target);
-      setWorkspacePartDragMode(true);
-      loadWorkspacePartAdjustmentFields(target);
+      initializeWorkspacePositionEditor(workspaceExtractResult, preview);
       setStatus("青い枠の目・口をドラッグして位置を調整できます");
     } catch (cause) {
       setError(String(cause));
@@ -3584,7 +3714,7 @@ function App() {
                     <div className="workspace-panel-heading workspace-step-heading">
                       <span>STEP 4 / 7</span>
                       <h3>素体のレイヤー構成を調整</h3>
-                      <p>レイヤー順・表示・腕や獣耳の分離・切り出しを、中央の編集領域でまとめて確認します。データは「編集を開始」を押してから読み込みます。</p>
+                      <p>レイヤー順・表示・腕や獣耳の分離・切り出し・胸部範囲を、中央の編集領域でまとめて確認します。保存済みの調整は再編集時に復元されます。</p>
                       <button className="btn btn-secondary workspace-wide-action" data-action-tone="edit" disabled={workspaceBusy || workspaceOverviewPreviewLoading || workspaceEditorPreparing} onClick={() => void startInlineBaseEditor()}>{workspaceEditorPreparing ? "準備中..." : step4Complete ? "再編集する" : "編集を開始"}</button>
                     </div>
                   </div>

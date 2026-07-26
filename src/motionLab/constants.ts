@@ -126,7 +126,7 @@ export const MOTION_LAB_EFFECT_DEFS: Array<{ key: MotionLabEffectKey; label: str
   { key: "blink", label: "自動まばたき", hint: "2〜10秒間隔で自然に瞬きする" },
   { key: "arm", label: "腕揺れ", hint: "腕の振り子スイング（要arm素材）" },
   { key: "lift", label: "肩の弾み", hint: "体の弾みに少し遅れて肩がぽよん（発話バウンスの二次揺れ・要arm素材）" },
-  { key: "chest", label: "胸部追従", hint: "体・衣服の胸周辺を、呼吸と体の弾みに遅れてやわらかく変形する" },
+  { key: "chest", label: "胸部追従", hint: "胸周辺を呼吸に少し遅れて上下にやわらかく変形する。強さは「胸部追従」スライダーで調整" },
   { key: "earTwitch", label: "獣耳ピコピコ", hint: "獣耳をときどきピコッと動かします。動き方と付け根の位置は詳細調整で設定します（要sway_ear素材）" },
 ];
 
@@ -152,7 +152,7 @@ export const MOTION_LAB_TEMPLATES: Record<string, MotionLabTemplate> = {
     preset: "calm", layerMode: "spring", hairEngine: "spring", hairWaveStrength: 1,
     hairK: 84, hairC: 11, hairWind: 0.004, hairDrive: 0.018, hairBackScale: 0.35,
     breath: 0.85, bodySway: 0.7, pyokoBounce: 1.4, parallax: 0.5, randomGlance: true,
-    strands: false, armSwayAmp: 0.6, armMaxAngle: 0.075, chestMax: 2.5, earTwitch: true,
+    strands: false, armSwayAmp: 0.6, armMaxAngle: 0.075, chestMax: 5, earTwitch: true,
   },
   standard: {
     label: "しなやか",
@@ -161,7 +161,7 @@ export const MOTION_LAB_TEMPLATES: Record<string, MotionLabTemplate> = {
     preset: "normal", layerMode: "mesh", hairEngine: "spring", hairWaveStrength: 1,
     hairK: 72, hairC: 9, hairWind: 0.006, hairDrive: 0.034, hairBackScale: 0.48,
     breath: 1, bodySway: 0.95, pyokoBounce: 2.4, parallax: 0.85, randomGlance: true,
-    strands: true, armSwayAmp: 0.95, armMaxAngle: 0.11, chestMax: 4, earTwitch: true,
+    strands: true, armSwayAmp: 0.95, armMaxAngle: 0.11, chestMax: 7, earTwitch: true,
   },
   // === スプリング式: 風のなびき（小 / 大） ===
   softBreeze: {
@@ -171,7 +171,7 @@ export const MOTION_LAB_TEMPLATES: Record<string, MotionLabTemplate> = {
     preset: "calm", layerMode: "mesh", hairEngine: "spring", hairWaveStrength: 1,
     hairK: 72, hairC: 9, hairWind: 0.008, hairDrive: 0.025, hairBackScale: 0.42,
     breath: 0.82, bodySway: 0.65, pyokoBounce: 1.2, parallax: 0.5, randomGlance: true,
-    strands: true, armSwayAmp: 0.55, armMaxAngle: 0.07, chestMax: 2.5, earTwitch: true,
+    strands: true, armSwayAmp: 0.55, armMaxAngle: 0.07, chestMax: 5, earTwitch: true,
   },
   breeze: {
     label: "なびき",
@@ -180,7 +180,7 @@ export const MOTION_LAB_TEMPLATES: Record<string, MotionLabTemplate> = {
     preset: "normal", layerMode: "mesh", hairEngine: "spring", hairWaveStrength: 1,
     hairK: 70, hairC: 9, hairWind: 0.012, hairDrive: 0.035, hairBackScale: 0.45,
     breath: 0.9, bodySway: 0.8, pyokoBounce: 1.6, parallax: 0.7, randomGlance: true,
-    strands: true, armSwayAmp: 0.75, armMaxAngle: 0.09, chestMax: 3.5, earTwitch: true,
+    strands: true, armSwayAmp: 0.75, armMaxAngle: 0.09, chestMax: 6, earTwitch: true,
   },
   // === ウェーブ式: ゆったり揺れ（小 / 大） ===
   yurari: {
@@ -190,7 +190,7 @@ export const MOTION_LAB_TEMPLATES: Record<string, MotionLabTemplate> = {
     preset: "calm", layerMode: "spring", hairEngine: "wave", hairWaveStrength: 0.8,
     hairK: 72, hairC: 9, hairWind: 0.006, hairDrive: 0.025, hairBackScale: 0.5,
     breath: 0.88, bodySway: 0.7, pyokoBounce: 1.6, parallax: 0.55, randomGlance: true,
-    strands: false, armSwayAmp: 0.6, armMaxAngle: 0.075, chestMax: 2.5, earTwitch: true,
+    strands: false, armSwayAmp: 0.6, armMaxAngle: 0.075, chestMax: 5, earTwitch: true,
   },
   yurayura: {
     label: "ゆらゆら",
@@ -199,7 +199,7 @@ export const MOTION_LAB_TEMPLATES: Record<string, MotionLabTemplate> = {
     preset: "normal", layerMode: "spring", hairEngine: "wave", hairWaveStrength: 0.95,
     hairK: 68, hairC: 8, hairWind: 0.008, hairDrive: 0.04, hairBackScale: 0.62,
     breath: 0.95, bodySway: 1, pyokoBounce: 2.2, parallax: 0.8, randomGlance: true,
-    strands: false, armSwayAmp: 0.9, armMaxAngle: 0.11, chestMax: 3.8, earTwitch: true,
+    strands: false, armSwayAmp: 0.9, armMaxAngle: 0.11, chestMax: 6.5, earTwitch: true,
   },
   // === ウェーブ式: 発話の弾み（小 / 大） ===
   pyokori: {
@@ -209,7 +209,7 @@ export const MOTION_LAB_TEMPLATES: Record<string, MotionLabTemplate> = {
     preset: "normal", layerMode: "mesh", hairEngine: "wave", hairWaveStrength: 0.6,
     hairK: 68, hairC: 8, hairWind: 0.008, hairDrive: 0.03, hairBackScale: 0.4,
     breath: 0.85, bodySway: 0.75, pyokoBounce: 2.6, parallax: 0.65, randomGlance: true,
-    strands: false, armSwayAmp: 0.75, armMaxAngle: 0.09, chestMax: 3.2, earTwitch: true,
+    strands: false, armSwayAmp: 0.75, armMaxAngle: 0.09, chestMax: 6, earTwitch: true,
   },
   purupuru: {
     label: "ぷるぷる",
@@ -218,7 +218,7 @@ export const MOTION_LAB_TEMPLATES: Record<string, MotionLabTemplate> = {
     preset: "lively", layerMode: "mesh", hairEngine: "wave", hairWaveStrength: 0.72,
     hairK: 64, hairC: 8, hairWind: 0.01, hairDrive: 0.04, hairBackScale: 0.5,
     breath: 0.85, bodySway: 0.78, pyokoBounce: 4.2, parallax: 0.9, randomGlance: true,
-    strands: false, armSwayAmp: 1.2, armMaxAngle: 0.135, chestMax: 4.8, earTwitch: true,
+    strands: false, armSwayAmp: 1.2, armMaxAngle: 0.135, chestMax: 8, earTwitch: true,
   },
 };
 
@@ -249,7 +249,7 @@ export const MOTION_LAB_ARM_DEFAULTS = {
   maxAngle: 0.12,
   lift: { coupling: 0.08, bounce: 26, max: 6 },
 };
-export const MOTION_LAB_CHEST_DEFAULTS = { k: 45, c: 12, max: 3.5 };
+export const MOTION_LAB_CHEST_DEFAULTS = { k: 45, c: 12, max: 6 };
 // 自動瞬き（ろてじん氏 PuruPuruPNGTuber参考。animation-lab NS.P.blink と同値）
 export const MOTION_LAB_BLINK_DEFAULTS = {
   centerMs: 190,
