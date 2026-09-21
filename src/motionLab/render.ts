@@ -19,6 +19,7 @@ import {
   updateArmSway,
 } from "../motionLabPhysics";
 import {
+  intersectMotionLabChestWarpBounds,
   motionLabChestWarpBounds,
   motionLabChestWarpVerticalRadius,
   resolveMotionLabChestWarpRegion,
@@ -308,6 +309,24 @@ export function drawMotionLabChestWarp(
     return;
   }
 
+  const contentBounds = alphaBBox(body);
+  const guideBounds = guide ? alphaBBox(guide) : null;
+  const region = resolveMotionLabChestWarpRegion(
+    width,
+    height,
+    contentBounds,
+    guideBounds,
+  );
+  const bounds = intersectMotionLabChestWarpBounds(
+    motionLabChestWarpBounds(width, height, region),
+    contentBounds,
+    offsetY,
+  );
+  if (bounds.w <= 0 || bounds.h <= 0) {
+    drawMotionLabLayer(ctx, body, width, height, transform);
+    return;
+  }
+
   const source = motionLabRasterSource(body, width, height);
   if (!source) {
     drawMotionLabLayer(ctx, body, width, height, transform);
@@ -329,17 +348,6 @@ export function drawMotionLabChestWarp(
   scratchCtx.clearRect(0, 0, width, height);
   scratchCtx.drawImage(body, 0, 0, width, height);
 
-  const region = resolveMotionLabChestWarpRegion(
-    width,
-    height,
-    alphaBBox(body),
-    guide ? alphaBBox(guide) : null,
-  );
-  const bounds = motionLabChestWarpBounds(width, height, region);
-  if (bounds.w <= 0 || bounds.h <= 0) {
-    drawMotionLabLayer(ctx, body, width, height, transform);
-    return;
-  }
   const warped = scratchCtx.getImageData(bounds.x, bounds.y, bounds.w, bounds.h);
   const xWeights = new Float32Array(bounds.w);
   const yWeights = new Float32Array(bounds.h);
@@ -1623,7 +1631,41 @@ export function drawMotionLabScene(
       linkedPartDraws[name] = () => drawArm(linked.image, armOut?.left ?? null, "arm_l");
     } else if (linked.parent === "arm_r") {
       linkedPartDraws[name] = () => drawArm(linked.image, armOut?.right ?? null, "arm_r");
+    } else if (linked.parent === "hair") {
+      linkedPartDraws[name] = () => drawMotionLabLayer(
+        ctx, linked.image, width, height, hairFrontTransform,
+      );
+    } else if (linked.parent === "hair_back") {
+      linkedPartDraws[name] = () => drawMotionLabLayer(
+        ctx, linked.image, width, height, hairBackTransform,
+      );
+    } else if (linked.parent.startsWith("sway_")) {
+      linkedPartDraws[name] = () => drawOneSway(linked.parent, linked.image);
+    } else {
+      linkedPartDraws[name] = () => drawMotionLabChestWarp(
+        ctx,
+        linked.image,
+        images.chest,
+        width,
+        height,
+        bodyTransform,
+        chestOffsetY,
+        runtime,
+      );
     }
+  }
+  const fixedPartDraws: Record<string, () => void> = {};
+  for (const [name, image] of Object.entries(images.fixedParts ?? {})) {
+    fixedPartDraws[name] = () => drawMotionLabChestWarp(
+      ctx,
+      image,
+      images.chest,
+      width,
+      height,
+      bodyTransform,
+      chestOffsetY,
+      runtime,
+    );
   }
 
   // ===== 視線ドリフト＋瞳クリップ（§8.4）: eyewhite < irides < highlight < eye連番 =====
@@ -1855,6 +1897,7 @@ export function drawMotionLabScene(
     arm_r: () => drawArm(images.armR, armOut?.right ?? null, "arm_r"),
     sways: drawSways,
     ...individualSwayDraws,
+    ...fixedPartDraws,
     ...linkedPartDraws,
     eye: drawEyeCluster,
     mouth: drawMouth,

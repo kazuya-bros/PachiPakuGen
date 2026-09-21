@@ -1,4 +1,6 @@
-use crate::commands::parts::{arm_overlay_parent, is_arm_overlay_part_name};
+use crate::commands::parts::{
+    is_body_overlay_part_name, is_linked_overlay_part_name, linked_overlay_parent,
+};
 use crate::commands::workspace::WorkspaceProject;
 use crate::error::AppError;
 use crate::processing::image_utils;
@@ -40,6 +42,7 @@ pub struct MotionLabPartsResult {
     pub chest: Option<String>,
     /// sway_<name>.png（汎用揺れパーツ）。キーはファイル名のstem（例: "sway_ribbon"）
     pub sways: HashMap<String, String>,
+    pub fixed_parts: HashMap<String, String>,
     /// 腕と同じ変形へ追従し、layer-order.json上では独立したz位置を持つ切り出し片。
     pub linked_parts: HashMap<String, MotionLabLinkedPartResult>,
     /// 独立した眉素材。Noneなら旧形式の目フレームが眉を保持する。
@@ -162,6 +165,7 @@ fn load_motion_lab_parts_inner(dir: &str) -> Result<MotionLabPartsResult, AppErr
     let arm_r = read_optional_image_aliases(&root, &["arm_r.png", "arm-r.png", "arm_right.png"])?;
     let chest = read_optional_image_aliases(&root, &["chest.png"])?;
     let sways = read_sway_images(&root)?;
+    let fixed_parts = read_body_overlay_images(&root)?;
     let linked_parts = read_linked_arm_images(&root)?;
     let eyebrow_image =
         open_optional_image_aliases(&root, &["eyebrow.png", "eyebrows.png", "brow.png"])?;
@@ -243,6 +247,7 @@ fn load_motion_lab_parts_inner(dir: &str) -> Result<MotionLabPartsResult, AppErr
         arm_r,
         chest,
         sways,
+        fixed_parts,
         linked_parts,
         eyebrow,
         eyewhite,
@@ -342,7 +347,8 @@ fn read_layer_draw_order(root: &Path, warnings: &mut Vec<String>) -> Vec<String>
                 .and_then(|value| value.get("layerOrder").and_then(parse_draw_order))
         })
         .or_else(|| {
-            read_workspace_base_layer_order_document(root).and_then(|value| parse_draw_order(&value))
+            read_workspace_base_layer_order_document(root)
+                .and_then(|value| parse_draw_order(&value))
         });
     match parsed {
         Some(order) if !order.is_empty() => order,
@@ -389,6 +395,39 @@ fn read_sway_images(root: &Path) -> Result<HashMap<String, String>, AppError> {
     Ok(sways)
 }
 
+fn read_body_overlay_images(root: &Path) -> Result<HashMap<String, String>, AppError> {
+    let mut parts = HashMap::new();
+    if !root.is_dir() {
+        return Ok(parts);
+    }
+    let mut paths = fs::read_dir(root)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+                && path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(is_body_overlay_part_name)
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    for path in paths {
+        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        parts.insert(
+            stem.to_string(),
+            image_utils::image_to_base64_png(&open_image(&path)?),
+        );
+    }
+    Ok(parts)
+}
+
 /// arm_l_overlay_*.png / arm_r_overlay_*.png を親腕つきの独立描画パーツとして収集する。
 /// 旧素材には該当ファイルがないため、空mapのまま従来どおり動作する。
 fn read_linked_arm_images(
@@ -411,7 +450,9 @@ fn read_linked_arm_images(
                 && path
                     .file_stem()
                     .and_then(|stem| stem.to_str())
-                    .map(is_arm_overlay_part_name)
+                    .map(|stem| {
+                        is_linked_overlay_part_name(stem) && !is_body_overlay_part_name(stem)
+                    })
                     .unwrap_or(false)
         })
         .collect::<Vec<_>>();
@@ -420,13 +461,13 @@ fn read_linked_arm_images(
         let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
-        let Some(parent) = arm_overlay_parent(stem) else {
+        let Some(parent) = linked_overlay_parent(stem) else {
             continue;
         };
         linked_parts.insert(
             stem.to_string(),
             MotionLabLinkedPartResult {
-                parent: parent.to_string(),
+                parent,
                 image: image_utils::image_to_base64_png(&open_image(&path)?),
             },
         );
@@ -536,9 +577,12 @@ fn fold_companion_files_into_profile(root: &Path, mut profile: Value) -> Value {
     }
 
     let readme = fs::read_to_string(&readme_path).ok().or_else(|| {
-        existing_profile
-            .as_ref()
-            .and_then(|value| value.get("readme").and_then(Value::as_str).map(str::to_owned))
+        existing_profile.as_ref().and_then(|value| {
+            value
+                .get("readme")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
     });
     if let Some(readme) = readme {
         if let Some(map) = profile.as_object_mut() {
@@ -687,9 +731,7 @@ fn crop_rgba(image: &image::RgbaImage, x: u32, y: u32, w: u32, h: u32) -> Vec<u8
 }
 
 #[tauri::command]
-pub async fn save_motion_loop_frame(
-    request: SaveMotionLoopFrameRequest,
-) -> Result<(), AppError> {
+pub async fn save_motion_loop_frame(request: SaveMotionLoopFrameRequest) -> Result<(), AppError> {
     tauri::async_runtime::spawn_blocking(move || save_motion_loop_frame_inner(&request))
         .await
         .map_err(|error| AppError::General(format!("Task join error: {error}")))?
@@ -746,8 +788,7 @@ fn finalize_motion_loop_export_inner(
     let root = validate_motion_lab_source_dir(&request.source_dir)?;
     let export_dir = root.join(LOOP_EXPORT_DIR);
     let frames_dir = export_dir.join("frames");
-    let frame_path =
-        |index: u32| frames_dir.join(format!("{index:04}.png"));
+    let frame_path = |index: u32| frames_dir.join(format!("{index:04}.png"));
     for index in 0..request.frame_count {
         if !frame_path(index).is_file() {
             return Err(AppError::General(format!(
@@ -779,9 +820,9 @@ fn finalize_motion_loop_export_inner(
             .write_header()
             .map_err(|error| AppError::General(format!("APNGヘッダ書き込みに失敗: {error}")))?;
         // フレーム0は基準画像として全面書き込み（APNGの既定画像を兼ねる）
-        png_writer
-            .write_image_data(&first)
-            .map_err(|error| AppError::General(format!("APNGフレーム0の書き込みに失敗: {error}")))?;
+        png_writer.write_image_data(&first).map_err(|error| {
+            AppError::General(format!("APNGフレーム0の書き込みに失敗: {error}"))
+        })?;
         let mut previous = first;
         for index in 1..request.frame_count {
             let frame = image::open(frame_path(index))
@@ -806,15 +847,17 @@ fn finalize_motion_loop_export_inner(
                 // 実害のない1x1の無変化パッチを書き込む
                 None => (0, 0, 1, 1, frame.get_pixel(0, 0).0.to_vec()),
             };
-            png_writer
-                .reset_frame_position()
-                .map_err(|error| AppError::General(format!("APNGフレーム {index} の位置初期化に失敗: {error}")))?;
+            png_writer.reset_frame_position().map_err(|error| {
+                AppError::General(format!("APNGフレーム {index} の位置初期化に失敗: {error}"))
+            })?;
             png_writer
                 .set_frame_dimension(patch_w, patch_h)
-                .map_err(|error| AppError::General(format!("APNGフレーム {index} のサイズ設定に失敗: {error}")))?;
-            png_writer
-                .set_frame_position(x, y)
-                .map_err(|error| AppError::General(format!("APNGフレーム {index} の位置設定に失敗: {error}")))?;
+                .map_err(|error| {
+                    AppError::General(format!("APNGフレーム {index} のサイズ設定に失敗: {error}"))
+                })?;
+            png_writer.set_frame_position(x, y).map_err(|error| {
+                AppError::General(format!("APNGフレーム {index} の位置設定に失敗: {error}"))
+            })?;
             png_writer.write_image_data(&patch).map_err(|error| {
                 AppError::General(format!("APNGフレーム {index} の書き込みに失敗: {error}"))
             })?;
@@ -1165,6 +1208,12 @@ mod tests {
         RgbaImage::from_pixel(4, 4, Rgba([7, 7, 7, 255]))
             .save(root.join("arm_r_overlay_patch_sleeve.png"))
             .unwrap();
+        RgbaImage::from_pixel(4, 4, Rgba([8, 8, 8, 255]))
+            .save(root.join("body_overlay_patch_collar.png"))
+            .unwrap();
+        RgbaImage::from_pixel(4, 4, Rgba([9, 9, 9, 255]))
+            .save(root.join("linked_overlay_hair__layer_0_headwear.png"))
+            .unwrap();
         RgbaImage::from_pixel(4, 4, Rgba([250, 250, 250, 255]))
             .save(root.join("eyewhite.png"))
             .unwrap();
@@ -1186,7 +1235,9 @@ mod tests {
         assert_eq!(result.sways.len(), 2);
         assert!(result.sways.contains_key("sway_ribbon"));
         assert!(result.sways.contains_key("sway_necktie"));
-        assert_eq!(result.linked_parts.len(), 2);
+        assert_eq!(result.linked_parts.len(), 3);
+        assert_eq!(result.fixed_parts.len(), 1);
+        assert!(result.fixed_parts.contains_key("body_overlay_patch_collar"));
         assert_eq!(
             result
                 .linked_parts
@@ -1204,6 +1255,13 @@ mod tests {
                 .get("arm_r_overlay_patch_sleeve")
                 .map(|part| part.parent.as_str()),
             Some("arm_r")
+        );
+        assert_eq!(
+            result
+                .linked_parts
+                .get("linked_overlay_hair__layer_0_headwear")
+                .map(|part| part.parent.as_str()),
+            Some("hair")
         );
         assert!(result.eyewhite.is_some());
         assert!(result.eyebrow.is_some());
@@ -1473,9 +1531,8 @@ mod tests {
         .unwrap();
 
         let manifest = serde_json::json!({ "schema": "pachipakugen.motionPreview.v1" });
-        let saved =
-            save_motion_lab_manifest_inner(&parts_dir.to_string_lossy(), manifest.clone())
-                .expect("save manifest");
+        let saved = save_motion_lab_manifest_inner(&parts_dir.to_string_lossy(), manifest.clone())
+            .expect("save manifest");
 
         assert_eq!(
             PathBuf::from(&saved.path),
@@ -1487,8 +1544,8 @@ mod tests {
             "旧配置の残骸は削除される"
         );
 
-        let loaded = load_motion_lab_manifest_inner(&parts_dir.to_string_lossy())
-            .expect("load manifest");
+        let loaded =
+            load_motion_lab_manifest_inner(&parts_dir.to_string_lossy()).expect("load manifest");
         assert_eq!(loaded.manifest, manifest);
 
         let _ = fs::remove_dir_all(root);
@@ -1511,7 +1568,10 @@ mod tests {
         let saved = save_motion_lab_manifest_inner(&root.to_string_lossy(), manifest)
             .expect("save manifest");
 
-        assert_eq!(PathBuf::from(&saved.path), root.join("motion-preview-manifest.json"));
+        assert_eq!(
+            PathBuf::from(&saved.path),
+            root.join("motion-preview-manifest.json")
+        );
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1535,7 +1595,11 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        fs::write(root.join("README.txt"), "PachiPakuGen assets for SpriTalk\n").unwrap();
+        fs::write(
+            root.join("README.txt"),
+            "PachiPakuGen assets for SpriTalk\n",
+        )
+        .unwrap();
 
         let profile = serde_json::json!({ "schema": "spritalk.motionProfile.v2" });
         let saved = save_spritalk_motion_profile_inner(&root.to_string_lossy(), profile)
@@ -1549,7 +1613,10 @@ mod tests {
             saved.profile["readme"],
             serde_json::json!("PachiPakuGen assets for SpriTalk\n")
         );
-        assert!(!root.join("layer-order.json").is_file(), "統合元は削除される");
+        assert!(
+            !root.join("layer-order.json").is_file(),
+            "統合元は削除される"
+        );
         assert!(!root.join("README.txt").is_file(), "統合元は削除される");
 
         // SpriTalkへ渡すフォルダに残るファイルはspritalk-motion-profile.jsonのみ
@@ -1718,7 +1785,10 @@ mod tests {
         let image = image::RgbaImage::from_pixel(4, 6, image::Rgba([r, 40, 60, 200]));
         let mut bytes = Vec::new();
         DynamicImage::ImageRgba8(image)
-            .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
             .unwrap();
         STANDARD.encode(bytes)
     }
@@ -1739,7 +1809,10 @@ mod tests {
             save_motion_loop_frame_inner(&SaveMotionLoopFrameRequest {
                 source_dir: root.to_string_lossy().into_owned(),
                 frame_index: index,
-                png_base64: format!("data:image/png;base64,{}", encoded_test_frame(index as u8 * 80)),
+                png_base64: format!(
+                    "data:image/png;base64,{}",
+                    encoded_test_frame(index as u8 * 80)
+                ),
             })
             .unwrap();
         }
@@ -1757,7 +1830,8 @@ mod tests {
         assert!(apng_path.is_file());
         assert!(result.frames_dir.is_some());
         // APNGとして正しい構造か（acTLのフレーム数・無限ループ）をデコーダで検証
-        let decoder = png::Decoder::new(std::io::BufReader::new(fs::File::open(&apng_path).unwrap()));
+        let decoder =
+            png::Decoder::new(std::io::BufReader::new(fs::File::open(&apng_path).unwrap()));
         let reader = decoder.read_info().unwrap();
         let animation = reader
             .info()
@@ -1797,7 +1871,8 @@ mod tests {
             .animation_control
             .expect("acTL chunk must exist")
             .num_frames;
-        let apply_current_frame = |reader: &mut png::Reader<std::io::BufReader<fs::File>>, canvas: &mut RgbaImage| {
+        let apply_current_frame = |reader: &mut png::Reader<std::io::BufReader<fs::File>>,
+                                   canvas: &mut RgbaImage| {
             let mut buf = vec![0u8; reader.output_buffer_size().unwrap()];
             reader.next_frame(&mut buf).unwrap();
             let fctl = *reader.info().frame_control.as_ref().unwrap();
@@ -1874,7 +1949,10 @@ mod tests {
         for (index, image) in expected.iter().enumerate() {
             let mut bytes = Vec::new();
             image::DynamicImage::ImageRgba8(image.clone())
-                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+                .write_to(
+                    &mut std::io::Cursor::new(&mut bytes),
+                    image::ImageFormat::Png,
+                )
                 .unwrap();
             save_motion_loop_frame_inner(&SaveMotionLoopFrameRequest {
                 source_dir: source_dir.clone(),
@@ -1935,7 +2013,10 @@ mod tests {
             let image = RgbaImage::from_pixel(10, 8, Rgba(*color));
             let mut bytes = Vec::new();
             image::DynamicImage::ImageRgba8(image)
-                .write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+                .write_to(
+                    &mut std::io::Cursor::new(&mut bytes),
+                    image::ImageFormat::Png,
+                )
                 .unwrap();
             save_motion_loop_frame_inner(&SaveMotionLoopFrameRequest {
                 source_dir: source_dir.clone(),
@@ -1970,8 +2051,13 @@ mod tests {
             let expected = colors[decoded_frames];
             // 中心付近のピクセルで支配色を確認（256色量子化・透過二値化を経ても
             // 完全不透明の単色フレームなら色は保たれるはず）
-            let center = ((frame.height as usize / 2) * frame.width as usize + frame.width as usize / 2) * 4;
-            assert_eq!(&frame.buffer[center..center + 3], &expected[..3], "frame {decoded_frames} color mismatch");
+            let center =
+                ((frame.height as usize / 2) * frame.width as usize + frame.width as usize / 2) * 4;
+            assert_eq!(
+                &frame.buffer[center..center + 3],
+                &expected[..3],
+                "frame {decoded_frames} color mismatch"
+            );
             decoded_frames += 1;
         }
         assert_eq!(decoded_frames, 3);

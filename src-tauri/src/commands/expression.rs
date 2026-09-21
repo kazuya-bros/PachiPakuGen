@@ -1,5 +1,5 @@
 use crate::commands::parts::{
-    arm_overlay_parent, get_mapping_preview_inner, is_arm_overlay_part_name, load_slot_inner,
+    get_mapping_preview_inner, is_linked_overlay_part_name, linked_overlay_parent, load_slot_inner,
     MappingPreviewResult, ProgressPayload, SlotLoadResult,
 };
 use crate::commands::see_through;
@@ -741,8 +741,9 @@ fn save_base_editor_state_inner(
     document.format_version = 1;
     fs::write(
         &path,
-        serde_json::to_vec_pretty(&document)
-            .map_err(|error| AppError::General(format!("base-editor-state.json作成失敗: {error}")))?,
+        serde_json::to_vec_pretty(&document).map_err(|error| {
+            AppError::General(format!("base-editor-state.json作成失敗: {error}"))
+        })?,
     )?;
     Ok(path.to_string_lossy().into_owned())
 }
@@ -827,7 +828,7 @@ fn layer_order_document(group_order: &[String]) -> serde_json::Value {
 
     let mut linked_parts = serde_json::Map::new();
     for part_name in group_order {
-        let Some(parent) = arm_overlay_parent(part_name) else {
+        let Some(parent) = linked_overlay_parent(part_name) else {
             continue;
         };
         linked_parts.insert(part_name.clone(), serde_json::json!({ "parent": parent }));
@@ -1229,7 +1230,7 @@ fn current_base_parts(app: &AppHandle) -> Option<HashMap<String, DynamicImage>> 
 }
 
 fn is_dynamic_base_part_name(name: &str) -> bool {
-    name.starts_with("sway_") || is_arm_overlay_part_name(name)
+    name.starts_with("sway_") || is_linked_overlay_part_name(name)
 }
 
 fn save_base_parts(
@@ -2643,7 +2644,7 @@ fn materialize_spritalk_static_assets(
     }
     fs::write(
         output_root.join("README.txt"),
-        "PachiPakuGen assets for SpriTalk\nUse the image assets in this folder with the layer-import flow supported by your SpriTalk version.\nRequired: body.png\nOptional: hair.png, hair_back.png, arm_l.png, arm_r.png, chest.png, sway_*.png, arm_l_overlay_*.png, arm_r_overlay_*.png\nDynamic eyes: eyebrow.png, eyewhite.png, irides.png, highlight.png (optional)\nLayer linkage and draw order: layer-order.json (folded into spritalk-motion-profile.json's layerOrder field once STEP7 export runs)\nAnimation folders: eye, mouth_a, mouth_i, mouth_u, mouth_e, mouth_o\nNote: spritalk-motion-profile.json schema v2 is used by PachiPakuGen live view and reserved for future SpriTalk integration; current SpriTalk does not import it. Once STEP7 export runs, this README and layer-order.json are removed and folded into spritalk-motion-profile.json (readme/layerOrder fields) so this folder's only PachiPakuGen-authored metadata file is spritalk-motion-profile.json.\n",
+        "PachiPakuGen assets for SpriTalk\nUse the image assets in this folder with the layer-import flow supported by your SpriTalk version.\nRequired: body.png\nOptional: hair.png, hair_back.png, arm_l.png, arm_r.png, chest.png, sway_*.png, body_overlay_*.png, arm_l_overlay_*.png, arm_r_overlay_*.png, linked_overlay_*.png\nDynamic eyes: eyebrow.png, eyewhite.png, irides.png, highlight.png (optional)\nLayer linkage and draw order: layer-order.json (folded into spritalk-motion-profile.json's layerOrder field once STEP7 export runs)\nAnimation folders: eye, mouth_a, mouth_i, mouth_u, mouth_e, mouth_o\nNote: spritalk-motion-profile.json schema v2 is used by PachiPakuGen live view and SpriTalk integration. Once STEP7 export runs, this README and layer-order.json are removed and folded into spritalk-motion-profile.json (readme/layerOrder fields) so this folder's only PachiPakuGen-authored metadata file is spritalk-motion-profile.json.\n",
     )?;
     Ok(copied)
 }
@@ -4372,11 +4373,17 @@ mod tests {
         // staticAssets/directoriesはファイル名・フォルダ名のみで、区切り文字（パス）を含まない
         for entry in manifest["staticAssets"].as_array().unwrap() {
             let value = entry.as_str().unwrap();
-            assert!(!value.contains('\\') && !value.contains('/'), "{value} looks like a path");
+            assert!(
+                !value.contains('\\') && !value.contains('/'),
+                "{value} looks like a path"
+            );
         }
         for entry in manifest["directories"].as_array().unwrap() {
             let value = entry.as_str().unwrap();
-            assert!(!value.contains('\\') && !value.contains('/'), "{value} looks like a path");
+            assert!(
+                !value.contains('\\') && !value.contains('/'),
+                "{value} looks like a path"
+            );
         }
     }
 
@@ -4392,12 +4399,19 @@ mod tests {
         let output_root = root.join(WORKSPACE_SPRITALK_PARTS_DIR);
         fs::create_dir_all(&output_root).unwrap();
         // 移行前の旧配置（output_root直下）に残骸が残っているケースを再現
-        fs::write(output_root.join("manifest.json"), b"{\"mode\":\"codex-rife-output\"}").unwrap();
+        fs::write(
+            output_root.join("manifest.json"),
+            b"{\"mode\":\"codex-rife-output\"}",
+        )
+        .unwrap();
 
         let manifest = build_codex_rife_manifest(8, vec!["body.png".into()], vec!["eye".into()]);
         write_codex_rife_manifest(&root, &output_root, &manifest).unwrap();
 
-        assert!(root.join("manifest.json").is_file(), "job直下に書かれること");
+        assert!(
+            root.join("manifest.json").is_file(),
+            "job直下に書かれること"
+        );
         assert!(
             !output_root.join("manifest.json").is_file(),
             "SpriTalk受け渡しフォルダに残骸が残らないこと"
@@ -4416,7 +4430,9 @@ mod tests {
         // → 歪み比1.124で許容内
         assert!(generated_part_size_is_auto_fittable(1792, 2392, 1024, 1536));
         // 縦横逆転（歪み比>2）はブロック
-        assert!(!generated_part_size_is_auto_fittable(1792, 2392, 1536, 1024));
+        assert!(!generated_part_size_is_auto_fittable(
+            1792, 2392, 1536, 1024
+        ));
         // 正方形 vs 3:4級（歪み比1.33）もブロック
         assert!(!generated_part_size_is_auto_fittable(1024, 1024, 768, 1024));
         // ゼロサイズは安全側で拒否
@@ -4524,6 +4540,8 @@ mod tests {
         let order: Vec<String> = [
             "arm_l",
             "body",
+            "body_overlay_patch_collar",
+            "linked_overlay_hair__layer_0_headwear",
             "arm_l_overlay_patch_fingers",
             "arm_r_overlay_patch_sleeve",
             "hair",
@@ -4543,6 +4561,14 @@ mod tests {
         assert_eq!(
             document["linkedParts"]["arm_r_overlay_patch_sleeve"]["parent"],
             "arm_r"
+        );
+        assert_eq!(
+            document["linkedParts"]["body_overlay_patch_collar"]["parent"],
+            "body"
+        );
+        assert_eq!(
+            document["linkedParts"]["linked_overlay_hair__layer_0_headwear"]["parent"],
+            "hair"
         );
 
         let legacy = layer_order_document(&["body".into(), "hair".into()]);
@@ -4574,6 +4600,10 @@ mod tests {
             DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, Rgba([4, 5, 6, 255]))),
         );
         parts.insert(
+            "body_overlay_patch_collar".into(),
+            DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, Rgba([16, 17, 18, 255]))),
+        );
+        parts.insert(
             "eyewhite".into(),
             DynamicImage::ImageRgba8(RgbaImage::from_pixel(2, 2, Rgba([7, 8, 9, 255]))),
         );
@@ -4591,8 +4621,10 @@ mod tests {
 
         assert!(!base_dir.join("arm_l_overlay_stale.png").exists());
         assert!(base_dir.join("arm_l_overlay_patch_fingers.png").is_file());
+        assert!(base_dir.join("body_overlay_patch_collar.png").is_file());
         assert!(loaded.contains_key("body"));
         assert!(loaded.contains_key("arm_l_overlay_patch_fingers"));
+        assert!(loaded.contains_key("body_overlay_patch_collar"));
         assert!(loaded.contains_key("eyewhite"));
         assert!(loaded.contains_key("irides"));
         assert!(loaded.contains_key("eyebrow"));
@@ -5253,9 +5285,15 @@ mod tests {
             .unwrap()
             .expect("saved state");
         assert_eq!(loaded.layer_order, vec!["face", "topwear"]);
-        assert_eq!(loaded.layer_mapping.get("handwear-l").map(String::as_str), Some("arm_l"));
+        assert_eq!(
+            loaded.layer_mapping.get("handwear-l").map(String::as_str),
+            Some("arm_l")
+        );
         assert_eq!(loaded.layer_patches.len(), 1);
-        assert_eq!(loaded.chest_mask_png.as_deref(), Some("data:image/png;base64,bbb"));
+        assert_eq!(
+            loaded.chest_mask_png.as_deref(),
+            Some("data:image/png;base64,bbb")
+        );
 
         // 状態ファイルが無くても chest.png から胸部ガイドを復元できる
         fs::remove_file(base_editor_state_path(&base_dir)).unwrap();

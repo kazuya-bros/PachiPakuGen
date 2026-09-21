@@ -98,3 +98,36 @@ export function motionLabChestWarpBounds(
   const y1 = Math.min(height, Math.ceil(region.centerY + region.radiusY * 3));
   return { x: x0, y: y0, w: Math.max(0, x1 - x0), h: Math.max(0, y1 - y0) };
 }
+
+/**
+ * 胸ワープ範囲を、実際に不透明画素が存在する範囲へ絞る。
+ *
+ * STEP4の順序保持スライスは1280px全面の透過PNGとして出力されるため、
+ * 胸と無関係な鼻・顔・首レイヤーまでガイド全域を走査すると、レイヤー数に
+ * 比例してMotion Labのフレームレートが落ちる。変位分の余白を残して交差を
+ * 取れば、見た目と継ぎ目を維持したまま透明画素の計算だけを除去できる。
+ */
+export function intersectMotionLabChestWarpBounds(
+  warpBounds: MotionLabRasterBounds,
+  contentBounds: MotionLabRasterBounds,
+  offsetY: number,
+): MotionLabRasterBounds {
+  const edgeMargin = 2;
+  const verticalMargin = Math.ceil(Math.abs(offsetY)) + edgeMargin;
+  const contentX0 = Math.floor(contentBounds.x) - edgeMargin;
+  const contentY0 = Math.floor(contentBounds.y) - verticalMargin;
+  const contentX1 = Math.ceil(contentBounds.x + contentBounds.w) + edgeMargin;
+  const contentY1 = Math.ceil(contentBounds.y + contentBounds.h) + verticalMargin;
+  const warpX1 = warpBounds.x + warpBounds.w;
+  const warpY1 = warpBounds.y + warpBounds.h;
+  const x0 = Math.max(warpBounds.x, contentX0);
+  const y0 = Math.max(warpBounds.y, contentY0);
+  const x1 = Math.min(warpX1, contentX1);
+  const y1 = Math.min(warpY1, contentY1);
+  return {
+    x: x0,
+    y: y0,
+    w: Math.max(0, x1 - x0),
+    h: Math.max(0, y1 - y0),
+  };
+}

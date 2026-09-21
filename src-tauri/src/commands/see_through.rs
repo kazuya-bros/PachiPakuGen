@@ -2215,7 +2215,11 @@ fn patch_layer_probe(
         ));
     }
     let patched = normalized
-        .replacen(PROBE_ARG_ANCHOR, &format!("{PROBE_ARG_ANCHOR}{PROBE_ARG_LINE}"), 1)
+        .replacen(
+            PROBE_ARG_ANCHOR,
+            &format!("{PROBE_ARG_ANCHOR}{PROBE_ARG_LINE}"),
+            1,
+        )
         .replacen(exit_anchor, &format!("{exit_block}\n{exit_anchor}"), 1);
     Ok(patched)
 }
@@ -3588,9 +3592,12 @@ UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet')";
     #[test]
     fn layer_probe_patch_is_idempotent_for_both_scripts() {
         let standard = "    parser.add_argument('--save_to_psd', action='store_true')\n    parser.add_argument('--tblr_split', action='store_true')\n\n        print('running layerdiff...')\n        apply_layerdiff(srcp)\n\n        print('running marigold...')\n        apply_marigold(srcp)\n";
-        let patched =
-            patch_layer_probe(standard, STANDARD_PROBE_EXIT_ANCHOR, STANDARD_PROBE_EXIT_BLOCK)
-                .unwrap();
+        let patched = patch_layer_probe(
+            standard,
+            STANDARD_PROBE_EXIT_ANCHOR,
+            STANDARD_PROBE_EXIT_BLOCK,
+        )
+        .unwrap();
         assert!(patched.contains("--layer_probe"));
         assert!(patched.contains("continue"));
         // 早期終了はmarigold実行より前に入る
@@ -3599,15 +3606,22 @@ UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet')";
                 < patched.find("print('running marigold...')").unwrap()
         );
         assert_eq!(
-            patch_layer_probe(&patched, STANDARD_PROBE_EXIT_ANCHOR, STANDARD_PROBE_EXIT_BLOCK)
-                .unwrap(),
+            patch_layer_probe(
+                &patched,
+                STANDARD_PROBE_EXIT_ANCHOR,
+                STANDARD_PROBE_EXIT_BLOCK
+            )
+            .unwrap(),
             patched
         );
 
         let quantized = "    parser.add_argument('--save_to_psd', action='store_true')\n    parser.add_argument('--num_inference_steps', type=int, default=30)\n\n    run_layerdiff(pipeline, srcp, save_dir, seed, num_inference_steps, resolution)\n\n    # --- Marigold ---\n    print('Building Marigold depth pipeline...')\n";
-        let patched =
-            patch_layer_probe(quantized, QUANTIZED_PROBE_EXIT_ANCHOR, QUANTIZED_PROBE_EXIT_BLOCK)
-                .unwrap();
+        let patched = patch_layer_probe(
+            quantized,
+            QUANTIZED_PROBE_EXIT_ANCHOR,
+            QUANTIZED_PROBE_EXIT_BLOCK,
+        )
+        .unwrap();
         assert!(patched.contains("--layer_probe"));
         assert!(patched.contains("sys.exit(0)"));
         assert!(
@@ -3615,8 +3629,12 @@ UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet')";
                 < patched.find("# --- Marigold ---").unwrap()
         );
         assert_eq!(
-            patch_layer_probe(&patched, QUANTIZED_PROBE_EXIT_ANCHOR, QUANTIZED_PROBE_EXIT_BLOCK)
-                .unwrap(),
+            patch_layer_probe(
+                &patched,
+                QUANTIZED_PROBE_EXIT_ANCHOR,
+                QUANTIZED_PROBE_EXIT_BLOCK
+            )
+            .unwrap(),
             patched
         );
     }
@@ -3625,15 +3643,20 @@ UNetFrameConditionModel.from_pretrained(pretrained, subfolder='unet')";
     fn layer_probe_patch_fails_closed_on_upstream_change_or_partial_apply() {
         // アンカー欠如（公式スクリプト構造の変更）
         let changed = "print('nothing here')\n";
-        assert!(
-            patch_layer_probe(changed, STANDARD_PROBE_EXIT_ANCHOR, STANDARD_PROBE_EXIT_BLOCK)
-                .is_err()
-        );
+        assert!(patch_layer_probe(
+            changed,
+            STANDARD_PROBE_EXIT_ANCHOR,
+            STANDARD_PROBE_EXIT_BLOCK
+        )
+        .is_err());
         // argparse行だけ存在する部分適用
         let partial = "    parser.add_argument('--save_to_psd', action='store_true')\n    parser.add_argument('--layer_probe', action='store_true', help='PachiPakuGen: stop after the layerdiff stage')\n\n        print('running marigold...')\n";
-        let error =
-            patch_layer_probe(partial, STANDARD_PROBE_EXIT_ANCHOR, STANDARD_PROBE_EXIT_BLOCK)
-                .unwrap_err();
+        let error = patch_layer_probe(
+            partial,
+            STANDARD_PROBE_EXIT_ANCHOR,
+            STANDARD_PROBE_EXIT_BLOCK,
+        )
+        .unwrap_err();
         assert!(error.to_string().contains("部分適用"));
     }
 

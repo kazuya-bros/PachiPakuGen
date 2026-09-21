@@ -263,6 +263,12 @@ async function decodeMotionLabImages(parts: MotionLabPartsResult): Promise<Motio
       await loadMotionLabImage(source),
     ] as const),
   );
+  const fixedPartEntries = await Promise.all(
+    Object.entries(parts.fixedParts ?? {}).map(async ([name, source]) => [
+      name,
+      await loadMotionLabImage(source),
+    ] as const),
+  );
   const linkedPartEntries = await Promise.all(
     Object.entries(parts.linkedParts ?? {}).map(async ([name, linked]) => [
       name,
@@ -278,6 +284,7 @@ async function decodeMotionLabImages(parts: MotionLabPartsResult): Promise<Motio
     armR: parts.armR ? await loadMotionLabImage(parts.armR) : null,
     chest: parts.chest ? await loadMotionLabImage(parts.chest) : null,
     sways: Object.fromEntries(swayEntries),
+    fixedParts: Object.fromEntries(fixedPartEntries),
     linkedParts: Object.fromEntries(linkedPartEntries),
     eyebrow: parts.eyebrow ? await loadMotionLabImage(parts.eyebrow) : null,
     eyewhite: parts.eyewhite ? await loadMotionLabImage(parts.eyewhite) : null,

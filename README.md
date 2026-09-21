@@ -2,7 +2,7 @@
 
 [SpriTalk](https://kazuyabros.booth.pm/items/8102679) 向けの表情・モーション素材を、1枚の立ち絵から作るWindowsデスクトップアプリです。
 
-PachiPakuGen v0.4.0は、表情差分の準備、[See-Through](https://github.com/shitagaki-lab/see-through)によるレイヤー分解、素体と差分パーツの補正、RIFEフレーム補完、モーション調整、マイク連動のライブ表示までを、1つの作業フォルダと7つのSTEPにまとめます。
+PachiPakuGen v0.4.1は、表情差分の準備、[See-Through](https://github.com/shitagaki-lab/see-through)によるレイヤー分解、素体と差分パーツの補正、RIFEフレーム補完、モーション調整、マイク連動のライブ表示までを、1つの作業フォルダと7つのSTEPにまとめます。
 
 > [!IMPORTANT]
 > v0.4.0はv0.3系から制作フローを全面刷新しています。以前のREADMEにあった「素体出力／まばたき／口パク」の個別モードやSAM3前提の手順は、現行の7STEP制作フローには当てはまりません。
@@ -107,7 +107,7 @@ Hugging Faceのモデルは匿名でも取得できますが、レート制限�
 
 ## インストール
 
-1. [GitHub Releases](https://github.com/kazuya-bros/PachiPakuGen/releases)からv0.4.0のNSISインストーラーを取得します。
+1. [GitHub Releases](https://github.com/kazuya-bros/PachiPakuGen/releases)からv0.4.1のNSISインストーラーを取得します。
 2. インストーラーを実行します。
 3. 新規制作を行う場合は、STEP 3でSee-Throughのランタイムとモデルを準備します。
 

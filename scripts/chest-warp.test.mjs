@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  intersectMotionLabChestWarpBounds,
   motionLabChestWarpBounds,
   motionLabChestWarpSourceY,
   resolveMotionLabChestWarpRegion,
@@ -42,4 +43,21 @@ test("Gaussian warp moves the center and fixes the outer boundary", () => {
   assert.equal(motionLabChestWarpSourceY(100, 100, region, 4), 96);
   const outer = motionLabChestWarpSourceY(160, 100, region, 4);
   assert.ok(Math.abs(outer - 100) < 0.05);
+});
+
+test("transparent full-canvas overlays only warp where content intersects the chest", () => {
+  const warp = { x: 95, y: 618, w: 1001, h: 633 };
+  const patch = { x: 395, y: 676, w: 109, h: 304 };
+  const bounds = intersectMotionLabChestWarpBounds(warp, patch, 5);
+  assert.deepEqual(bounds, { x: 393, y: 669, w: 113, h: 318 });
+  assert.ok(bounds.w * bounds.h < warp.w * warp.h * 0.06);
+});
+
+test("overlays outside the chest skip raster warping entirely", () => {
+  const warp = { x: 95, y: 618, w: 1001, h: 633 };
+  const nose = { x: 594, y: 524, w: 29, h: 26 };
+  assert.deepEqual(
+    intersectMotionLabChestWarpBounds(warp, nose, 5),
+    { x: 592, y: 618, w: 33, h: 0 },
+  );
 });

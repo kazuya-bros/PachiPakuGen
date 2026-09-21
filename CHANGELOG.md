@@ -2,6 +2,25 @@
 
 このプロジェクトの主要な変更を記録します。形式は[Keep a Changelog](https://keepachangelog.com/ja/1.1.0/)を参考にし、バージョン番号は[Semantic Versioning](https://semver.org/lang/ja/)に従います。
 
+## [0.4.1] - 2026-09-21
+
+### Changed
+
+- STEP 4で作成したレイヤー順を、STEP 5の補正結果とSTEP 7のライブ表示・書き出しまで保持するよう変更
+- 身体・髪・後ろ髪などの固定・連動オーバーレイを、独立した描画パーツとして扱えるよう変更
+- 胸部ワープの対象範囲を実際の不透明画素の範囲へ絞り、透明な全面キャンバスを持つオーバーレイの処理を軽量化
+
+### Fixed
+
+- topwear由来の袖・襟などの切り出し片が、STEP 5でbodyへ潰れて前後関係を失う問題を修正
+- ぼかし付きマスクを元画像から切り出した際、再合成境界に透明な線が出る問題を修正
+- 胸部と無関係なレイヤーまで胸部ワープしてしまう問題を修正
+
+### Tests
+
+- 胸部ワープの交差範囲と無関係レイヤーのスキップに回帰テストを追加
+- レイヤー順、固定オーバーレイ、アルファ再合成のRustテストを追加
+
 ## [0.4.0] - 2026-07-21
 
 ### Added
@@ -70,6 +89,7 @@
 
 - 初期公開版。
 
+[0.4.1]: https://github.com/kazuya-bros/PachiPakuGen/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/kazuya-bros/PachiPakuGen/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/kazuya-bros/PachiPakuGen/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/kazuya-bros/PachiPakuGen/releases/tag/v0.2.0

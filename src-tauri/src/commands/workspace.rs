@@ -422,7 +422,8 @@ fn read_extracted_generated_part_fingerprints(root: &Path) -> Option<BTreeMap<St
     // extract_codex_generated_parts_inner（expression.rs）と同じ解決規則を使う。
     // ここだけ別のパスを組み立てると、書き込み先と食い違って読み取りが常に失敗し、
     // 完了済みワークスペースの再開が毎回STEP3へ巻き戻ってしまう
-    let manifest_path = crate::commands::expression::extracted_parts_dir(root).join("manifest.json");
+    let manifest_path =
+        crate::commands::expression::extracted_parts_dir(root).join("manifest.json");
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(manifest_path).ok()?).ok()?;
     let fingerprints = manifest.get("generatedPartFingerprints")?.as_object()?;

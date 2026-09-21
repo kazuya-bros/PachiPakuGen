@@ -25,6 +25,7 @@ export interface MotionLabPartsResult {
   armR: string | null;
   chest: string | null;
   sways: Record<string, string>;
+  fixedParts: Record<string, string>;
   /** 腕と同じ変形へ追従し、描画順だけを独立させた切り出しパーツ */
   linkedParts: Record<string, MotionLabLinkedPartResult>;
   /** Independent eyebrow overlay. Null means legacy eye frames still own the brows. */
@@ -53,6 +54,7 @@ export interface MotionLabImageSet {
   armR: HTMLImageElement | null;
   chest: HTMLImageElement | null;
   sways: Record<string, HTMLImageElement>;
+  fixedParts: Record<string, HTMLImageElement>;
   /** linkedPartsの画像デコード後。parentの腕と同じ変形で描画する */
   linkedParts: Record<string, { parent: string; image: HTMLImageElement }>;
   /** Independent eyebrow overlay; absent for legacy baked-eye assets. */
