@@ -757,6 +757,17 @@
   margin-top: 16px;
 }
 
+.workspace-step-action-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.workspace-step-action-stack .workspace-wide-action {
+  margin-top: 0;
+}
+
 .workspace-wide-action {
   display: inline-flex;
   width: 100%;

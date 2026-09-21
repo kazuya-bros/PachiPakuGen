@@ -1771,6 +1771,55 @@ function App() {
     }
   }
 
+  async function importWorkspaceBasePsd() {
+    const workspace = expressionWorkspace;
+    if (!workspace || workspaceBusy) return;
+    const selected = await open({
+      multiple: false,
+      directory: false,
+      title: "補正済みPSDを選択",
+      filters: [{ name: "Photoshop PSD", extensions: ["psd"] }],
+    });
+    const psdPath = typeof selected === "string" ? selected : null;
+    if (!psdPath) return;
+    if (!window.confirm("補正済みPSDを読み込むと、現在の素体・差分位置・RIFE結果を無効化してSTEP 4からやり直します。続行しますか？")) {
+      return;
+    }
+
+    setError("");
+    setWorkspaceBusy(true);
+    try {
+      // コピー前にPSDとして読み込めることを確認し、壊れたファイルで
+      // 作業フォルダのsource.psdだけが置き換わる事故を避ける。
+      await invoke<SlotLoadResult>("load_slot", { path: psdPath });
+      await invoke<string>("cache_codex_source_see_through", {
+        jobPath: workspace.workPath,
+        psdPath,
+      });
+      // cache_codex_source_see_throughは安全側にSTEP3へ戻すため、表情抽出済みの
+      // 作業を維持しつつ、素体編集から再開できるSTEP4へ戻す。
+      await invoke<ExpressionWorkspaceResult>("regress_expression_workspace_step", {
+        workPath: workspace.workPath,
+        currentStep: 4,
+      });
+      const reloaded = await loadExpressionWorkspaceAtPath(workspace.workPath, "resume");
+      if (!reloaded || activeWorkspacePath.current !== workspace.workPath) return;
+      setWorkspaceStep(4);
+      setWorkspaceInlineEditor(null);
+      setWorkspaceCompositePreview(null);
+      setWorkspaceRifeResult(null);
+      setMotionProfileReady(false);
+      resetWorkspaceBaseEditorState();
+      setStatus("補正済みPSDを読み込みました。素体調整をやり直してください");
+      await openWorkspaceBaseAdjustment(reloaded, workspaceFiles.source);
+    } catch (cause) {
+      await reloadWorkspaceAfterMutationFailure(workspace.workPath);
+      setError(`補正済みPSDを読み込めませんでした: ${String(cause)}`);
+    } finally {
+      setWorkspaceBusy(false);
+    }
+  }
+
   function buildBaseEditorPersistedState(): BaseEditorPersistedState {
     return {
       formatVersion: 1,
@@ -3715,7 +3764,10 @@ function App() {
                       <span>STEP 4 / 7</span>
                       <h3>素体のレイヤー構成を調整</h3>
                       <p>レイヤー順・表示・腕や獣耳の分離・切り出し・胸部範囲を、中央の編集領域でまとめて確認します。保存済みの調整は再編集時に復元されます。</p>
-                      <button className="btn btn-secondary workspace-wide-action" data-action-tone="edit" disabled={workspaceBusy || workspaceOverviewPreviewLoading || workspaceEditorPreparing} onClick={() => void startInlineBaseEditor()}>{workspaceEditorPreparing ? "準備中..." : step4Complete ? "再編集する" : "編集を開始"}</button>
+                      <div className="workspace-step-action-stack">
+                        <button className="btn btn-secondary workspace-wide-action" data-action-tone="edit" disabled={workspaceBusy || workspaceOverviewPreviewLoading || workspaceEditorPreparing} onClick={() => void startInlineBaseEditor()}>{workspaceEditorPreparing ? "準備中..." : step4Complete ? "再編集する" : "編集を開始"}</button>
+                        <button className="btn btn-secondary workspace-wide-action" data-action-tone="edit" disabled={workspaceBusy || workspaceOverviewPreviewLoading || workspaceEditorPreparing} onClick={() => void importWorkspaceBasePsd()}>補正済みPSDを読み込む</button>
+                      </div>
                     </div>
                   </div>
                   <div className={`workspace-status-card${step4Complete ? " complete" : ""}`}>
